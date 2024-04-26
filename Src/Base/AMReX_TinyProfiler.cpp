@@ -409,6 +409,7 @@ TinyProfiler::DeregisterArena (std::map<std::string, MemStat>& memstats) noexcep
     }
 }
 
+// TODO(bwibking): add Caliper JSON format output
 void
 TinyProfiler::PrintStats (std::map<std::string,Stats>& regstats, double dt_max)
 {
