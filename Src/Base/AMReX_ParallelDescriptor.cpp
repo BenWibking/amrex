@@ -1524,13 +1524,19 @@ Initialize ()
 #if defined(OMPI_HAVE_MPI_EXT_ROCM) && OMPI_HAVE_MPI_EXT_ROCM
     use_gpu_aware_mpi = (bool) MPIX_Query_rocm_support();
 #elif defined(MPICH) && defined(MPIX_GPU_SUPPORT_HIP)
-    use_gpu_aware_mpi = (bool) MPIX_Query_hip_support();
+    int is_supported = 0;
+    if (MPIX_GPU_query_support(MPIX_GPU_SUPPORT_HIP, &is_supported) == MPI_SUCCESS) {
+        use_gpu_aware_mpi = (bool) is_supported;
+    }
 #endif
 
 #elif defined(AMREX_USE_SYCL)
 
 #if defined(MPICH) && defined(MPIX_GPU_SUPPORT_ZE)
-    use_gpu_aware_mpi = (bool) MPIX_Query_ze_support();
+    int is_supported = 0;
+    if (MPIX_GPU_query_support(MPIX_GPU_SUPPORT_ZE, &is_supported) == MPI_SUCCESS) {
+        use_gpu_aware_mpi = (bool) is_supported;
+    }
 #endif
 
 #endif
