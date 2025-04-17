@@ -570,6 +570,10 @@ Long ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, Cell
                            });
         }
 
+        // synchronize all AMReX GPU streams before reading back reduction result
+#ifdef AMREX_USE_GPU
+        Gpu::streamSynchronizeAll();
+#endif
         nparticles = static_cast<Long>(amrex::get<0>(reduce_data.value(reduce_op)));
     }
     else {
