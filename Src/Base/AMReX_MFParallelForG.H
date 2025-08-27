@@ -82,6 +82,9 @@ ParallelFor (MF const& mf, IntVect const& nghost, int ncomp, IntVect const&, boo
 
 #if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
 
+        if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+            amrex::Gpu::KernelInfo::startKernel("ParallelFor_MF", nblocks, MT, 0, Gpu::gpuStream(), __FILE__, __LINE__);
+        }
         amrex::launch_global<MT>
             <<<nblocks, MT, 0, Gpu::gpuStream()>>>
             ([=] AMREX_GPU_DEVICE () noexcept
@@ -105,6 +108,11 @@ ParallelFor (MF const& mf, IntVect const& nghost, int ncomp, IntVect const&, boo
                      parfor_mf_detail::call_f(f, ibox, i, j, k, ncomp);
                  }
              });
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+        if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+            amrex::Gpu::KernelInfo::endKernel();
+        }
+#endif
     }
     AMREX_GPU_ERROR_CHECK();
 }

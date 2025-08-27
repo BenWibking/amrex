@@ -393,6 +393,9 @@ public:
                 Dim1 blockIdx {gh.blockIdx()};
                 Dim1 threadIdx{gh.threadIdx()};
 #else
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+                amrex::Gpu::KernelInfo::startKernel("Reduce_eval", nblocks_ec, AMREX_GPU_MAX_THREADS, 0, stream, __FILE__, __LINE__);
+            }
             amrex::launch_global<AMREX_GPU_MAX_THREADS>
                 <<<nblocks_ec, AMREX_GPU_MAX_THREADS, 0, stream>>>
                 ([=] AMREX_GPU_DEVICE () noexcept
@@ -421,6 +424,9 @@ public:
                 Reduce::detail::for_each_parallel<0, ReduceTuple, Ps...>(dst, r);
 #endif
             });
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+                amrex::Gpu::KernelInfo::endKernel();
+            }
         }
     }
 

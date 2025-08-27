@@ -683,6 +683,9 @@ T PrefixSum (N n, FIN const& fin, FOUT const& fout, TYPE, RetSum a_ret_sum = ret
 
     T* totalsum_p = (a_ret_sum) ? (T*)(The_Pinned_Arena()->alloc(sizeof(T))) : nullptr;
 
+    if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+        amrex::Gpu::KernelInfo::startKernel("PrefixSum_rocprim", nblocks, nthreads, sm, stream, __FILE__, __LINE__);
+    }
     amrex::launch_global<nthreads> <<<nblocks, nthreads, sm, stream>>> (
     [=] AMREX_GPU_DEVICE () noexcept
     {
@@ -772,6 +775,9 @@ T PrefixSum (N n, FIN const& fin, FOUT const& fout, TYPE, RetSum a_ret_sum = ret
             if (offset < iend) { fout(offset, data[i]); }
         }
     });
+    if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+        amrex::Gpu::KernelInfo::endKernel();
+    }
 
     Gpu::streamSynchronize();
     AMREX_GPU_ERROR_CHECK();
@@ -821,6 +827,9 @@ T PrefixSum (N n, FIN const& fin, FOUT const& fout, TYPE, RetSum a_ret_sum = ret
 
     T* totalsum_p = (a_ret_sum) ? (T*)(The_Pinned_Arena()->alloc(sizeof(T))) : nullptr;
 
+    if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+        amrex::Gpu::KernelInfo::startKernel("PrefixSum_cub", nblocks, nthreads, sm, stream, __FILE__, __LINE__);
+    }
     amrex::launch_global<nthreads> <<<nblocks, nthreads, sm, stream>>> (
     [=] AMREX_GPU_DEVICE () noexcept
     {
@@ -911,6 +920,9 @@ T PrefixSum (N n, FIN const& fin, FOUT const& fout, TYPE, RetSum a_ret_sum = ret
             if (offset < iend) { fout(offset, data[i]); }
         }
     });
+    if (amrex::Gpu::KernelInfo::isProfilingEnabled()) {
+        amrex::Gpu::KernelInfo::endKernel();
+    }
 
     Gpu::streamSynchronize();
     AMREX_GPU_ERROR_CHECK();

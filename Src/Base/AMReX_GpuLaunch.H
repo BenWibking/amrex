@@ -33,14 +33,46 @@
 
 #ifdef AMREX_USE_CUDA
 #  define AMREX_LAUNCH_KERNEL(MT, blocks, threads, sharedMem, stream, ... ) \
-        amrex::launch_global<MT><<<blocks, threads, sharedMem, stream>>>(__VA_ARGS__)
+        do { \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::startKernel("AMREX_LAUNCH_KERNEL", blocks, threads, sharedMem, stream, __FILE__, __LINE__); \
+            } \
+            amrex::launch_global<MT><<<blocks, threads, sharedMem, stream>>>(__VA_ARGS__); \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::endKernel(); \
+            } \
+        } while(0)
 #  define AMREX_LAUNCH_KERNEL_NOBOUND(blocks, threads, sharedMem, stream, ... ) \
-        amrex::launch_global    <<<blocks, threads, sharedMem, stream>>>(__VA_ARGS__)
+        do { \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::startKernel("AMREX_LAUNCH_KERNEL_NOBOUND", blocks, threads, sharedMem, stream, __FILE__, __LINE__); \
+            } \
+            amrex::launch_global    <<<blocks, threads, sharedMem, stream>>>(__VA_ARGS__); \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::endKernel(); \
+            } \
+        } while(0)
 #elif defined(AMREX_USE_HIP)
 #  define AMREX_LAUNCH_KERNEL(MT, blocks, threads, sharedMem, stream, ... ) \
-        hipLaunchKernelGGL(launch_global<MT>, blocks, threads, sharedMem, stream, __VA_ARGS__)
+        do { \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::startKernel("AMREX_LAUNCH_KERNEL", blocks, threads, sharedMem, stream, __FILE__, __LINE__); \
+            } \
+            hipLaunchKernelGGL(launch_global<MT>, blocks, threads, sharedMem, stream, __VA_ARGS__); \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::endKernel(); \
+            } \
+        } while(0)
 #  define AMREX_LAUNCH_KERNEL_NOBOUND(blocks, threads, sharedMem, stream, ... ) \
-        hipLaunchKernelGGL(launch_global    , blocks, threads, sharedMem, stream, __VA_ARGS__)
+        do { \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::startKernel("AMREX_LAUNCH_KERNEL_NOBOUND", blocks, threads, sharedMem, stream, __FILE__, __LINE__); \
+            } \
+            hipLaunchKernelGGL(launch_global    , blocks, threads, sharedMem, stream, __VA_ARGS__); \
+            if (amrex::Gpu::KernelInfo::isProfilingEnabled()) { \
+                amrex::Gpu::KernelInfo::endKernel(); \
+            } \
+        } while(0)
 #endif
 
 
