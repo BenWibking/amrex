@@ -3,6 +3,10 @@
 
 #include <AMReX_GpuKernelInfo.H>
 #include <AMReX_Print.H>
+#ifdef AMREX_USE_GPU
+#include <AMReX_GpuTypes.H>
+#include <AMReX_GpuControl.H>
+#endif
 #include <iostream>
 #include <iomanip>
 
@@ -11,8 +15,8 @@ namespace amrex::Gpu {
 bool KernelInfo::s_profiling_enabled = false;
 
 #ifdef AMREX_USE_GPU
-void KernelInfo::startKernel(const char* name, dim3 numBlocks, dim3 numThreads, 
-                            std::size_t sharedMem, gpuStream_t stream, 
+void KernelInfo::startKernel(const char* name, amrex::dim3 numBlocks, amrex::dim3 numThreads, 
+                            std::size_t sharedMem, amrex::gpuStream_t stream, 
                             const char* file, int line)
 {
     if (s_profiling_enabled) {
@@ -31,7 +35,7 @@ void KernelInfo::startKernel(const char* name, dim3 numBlocks, dim3 numThreads,
 }
 
 void KernelInfo::startKernel(const char* name, int numBlocks, int numThreads, 
-                            std::size_t sharedMem, gpuStream_t stream, 
+                            std::size_t sharedMem, amrex::gpuStream_t stream, 
                             const char* file, int line)
 {
     if (s_profiling_enabled) {

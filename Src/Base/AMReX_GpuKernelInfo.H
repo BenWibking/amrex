@@ -5,8 +5,10 @@
 
 // Forward declarations for GPU types
 #ifdef AMREX_USE_GPU
-#include <AMReX_GpuTypes.H>
-#include <AMReX_GpuControl.H>
+namespace amrex {
+    struct dim3;
+    struct gpuStream_t;
+}
 #endif
 
 namespace amrex::Gpu {
@@ -22,11 +24,11 @@ public:
     static void setProfilingEnabled(bool enabled) { s_profiling_enabled = enabled; }
     
 #ifdef AMREX_USE_GPU
-    static void startKernel(const char* name, dim3 numBlocks, dim3 numThreads, 
-                          std::size_t sharedMem, gpuStream_t stream, 
+    static void startKernel(const char* name, amrex::dim3 numBlocks, amrex::dim3 numThreads, 
+                          std::size_t sharedMem, amrex::gpuStream_t stream, 
                           const char* file, int line);
     static void startKernel(const char* name, int numBlocks, int numThreads, 
-                          std::size_t sharedMem, gpuStream_t stream, 
+                          std::size_t sharedMem, amrex::gpuStream_t stream, 
                           const char* file, int line);
 #else
     static void startKernel(const char* name, int numBlocks, int numThreads, 
