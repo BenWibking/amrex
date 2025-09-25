@@ -37,27 +37,27 @@ void yafluxreg_fineadd (Box const& bx, Array4<T> const& d, Array4<T const> const
                         T dtdx, int nc, int dirside, Dim3 const& rr) noexcept
 {
     const auto lo = amrex::lbound(bx);
+    const auto hi = amrex::ubound(bx);
 
+    // Accumulate fine-flux contributions deterministically to retain bitwise reproducibility.
     switch (dirside) {
     case 0 :
     {
         for (int n = 0; n < nc; ++n) {
-            const int i = lo.x;
-            const int ii = (i+1)*rr.x;
-            T* AMREX_RESTRICT dp = &(d(i,0,0,n));
-            T tmp = -dtdx*f(ii,0,0,n);
-            HostDevice::Atomic::Add(dp, tmp);
+            for (int i = lo.x; i <= hi.x; ++i) {
+                const int ii = (i+1)*rr.x;
+                d(i,0,0,n) += -dtdx * f(ii,0,0,n);
+            }
         }
         break;
     }
     default:
     {
         for (int n = 0; n < nc; ++n) {
-            const int i = lo.x;
-            const int ii = i*rr.x;
-            T* AMREX_RESTRICT dp = &(d(i,0,0,n));
-            T tmp = dtdx*f(ii,0,0,n);
-            HostDevice::Atomic::Add(dp, tmp);
+            for (int i = lo.x; i <= hi.x; ++i) {
+                const int ii = i*rr.x;
+                d(i,0,0,n) += dtdx * f(ii,0,0,n);
+            }
         }
     }
     }

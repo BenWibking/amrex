@@ -52,18 +52,20 @@ void yafluxreg_fineadd (Box const& bx, Array4<T> const& d, Array4<T const> const
     const auto lo = amrex::lbound(bx);
     const auto hi = amrex::ubound(bx);
 
+    // Accumulate fine-flux contributions deterministically to retain bitwise reproducibility.
     switch (dirside) {
     case 0 :
     {
         for (int n = 0; n < nc; ++n) {
             for (int j = lo.y; j <= hi.y; ++j) {
-                const int i = lo.x;
-                const int ii = (i+1)*rr.x;
-                T* AMREX_RESTRICT dp = &(d(i,j,0,n));
-                for (int joff = 0; joff < rr.y; ++joff) {
-                    const int jj =      j*rr.y  + joff;
-                    T tmp = -dtdx*f(ii,jj,0,n);
-                    HostDevice::Atomic::Add(dp, tmp);
+                for (int i = lo.x; i <= hi.x; ++i) {
+                    const int ii = (i+1)*rr.x;
+                    T sum = T(0);
+                    for (int joff = 0; joff < rr.y; ++joff) {
+                        const int jj = j*rr.y + joff;
+                        sum -= dtdx * f(ii,jj,0,n);
+                    }
+                    d(i,j,0,n) += sum;
                 }
             }
         }
@@ -73,13 +75,14 @@ void yafluxreg_fineadd (Box const& bx, Array4<T> const& d, Array4<T const> const
     {
         for (int n = 0; n < nc; ++n) {
             for (int j = lo.y; j <= hi.y; ++j) {
-                const int i = lo.x;
-                const int ii = i*rr.x;
-                T* AMREX_RESTRICT dp = &(d(i,j,0,n));
-                for (int joff = 0; joff < rr.y; ++joff) {
-                    const int jj =      j*rr.y  + joff;
-                    T tmp = dtdx*f(ii,jj,0,n);
-                    HostDevice::Atomic::Add(dp, tmp);
+                for (int i = lo.x; i <= hi.x; ++i) {
+                    const int ii = i*rr.x;
+                    T sum = T(0);
+                    for (int joff = 0; joff < rr.y; ++joff) {
+                        const int jj = j*rr.y + joff;
+                        sum += dtdx * f(ii,jj,0,n);
+                    }
+                    d(i,j,0,n) += sum;
                 }
             }
         }
@@ -88,14 +91,15 @@ void yafluxreg_fineadd (Box const& bx, Array4<T> const& d, Array4<T const> const
     case 2 :
     {
         for (int n = 0; n < nc; ++n) {
-            for (int i = lo.x; i <= hi.x; ++i) {
-                const int j = lo.y;
-                const int jj = (j+1)*rr.y;
-                T* AMREX_RESTRICT dp = &(d(i,j,0,n));
-                for (int ioff = 0; ioff < rr.x; ++ioff) {
-                    const int ii =      i*rr.x  + ioff;
-                    T tmp = -dtdx*f(ii,jj,0,n);
-                    HostDevice::Atomic::Add(dp, tmp);
+            for (int j = lo.y; j <= hi.y; ++j) {
+                for (int i = lo.x; i <= hi.x; ++i) {
+                    const int jj = (j+1)*rr.y;
+                    T sum = T(0);
+                    for (int ioff = 0; ioff < rr.x; ++ioff) {
+                        const int ii = i*rr.x + ioff;
+                        sum -= dtdx * f(ii,jj,0,n);
+                    }
+                    d(i,j,0,n) += sum;
                 }
             }
         }
@@ -104,14 +108,15 @@ void yafluxreg_fineadd (Box const& bx, Array4<T> const& d, Array4<T const> const
     default:
     {
         for (int n = 0; n < nc; ++n) {
-            for (int i = lo.x; i <= hi.x; ++i) {
-                const int j = lo.y;
-                const int jj = j*rr.y;
-                T* AMREX_RESTRICT dp = &(d(i,j,0,n));
-                for (int ioff = 0; ioff < rr.x; ++ioff) {
-                    const int ii =      i*rr.x  + ioff;
-                    T tmp = dtdx*f(ii,jj,0,n);
-                    HostDevice::Atomic::Add(dp, tmp);
+            for (int j = lo.y; j <= hi.y; ++j) {
+                for (int i = lo.x; i <= hi.x; ++i) {
+                    const int jj = j*rr.y;
+                    T sum = T(0);
+                    for (int ioff = 0; ioff < rr.x; ++ioff) {
+                        const int ii = i*rr.x + ioff;
+                        sum += dtdx * f(ii,jj,0,n);
+                    }
+                    d(i,j,0,n) += sum;
                 }
             }
         }
