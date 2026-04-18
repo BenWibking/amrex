@@ -357,8 +357,8 @@ packIODataGpu (Vector<int>& idata, Vector<ParticleReal>& rdata, const PC& pc, in
     const Long rChunkSize = AMREX_SPACEDIM + num_output_real;
     rdata.resize(np*rChunkSize);
 
-    Gpu::DeviceVector<int> write_int_comp_d(write_int_comp.size());
-    Gpu::DeviceVector<int> write_real_comp_d(write_real_comp.size());
+    Gpu::PinnedVector<int> write_int_comp_d(write_int_comp.size());
+    Gpu::PinnedVector<int> write_real_comp_d(write_real_comp.size());
     Gpu::copyAsync(Gpu::hostToDevice, write_int_comp.begin(), write_int_comp.end(),
                    write_int_comp_d.begin());
     Gpu::copyAsync(Gpu::hostToDevice, write_real_comp.begin(), write_real_comp.end(),
