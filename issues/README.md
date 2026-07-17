@@ -1,6 +1,6 @@
 # AMReX particle issue inventory
 
-This index lists the classified particle issues in this directory. The Quokka
+This index lists the categorized particle issues in this directory. The Quokka
 impact column preserves the confidence level from each linked report; see the
 report's **Quokka impact classification** section for the full justification.
 Source links and line numbers refer to the current checkout and may move as the
