@@ -133,7 +133,7 @@ else()
    #
    # List of subdirectories to search for CMakeLists.
    #
-   set( AMREX_TESTS_SUBDIRS Amr ArrayND AsyncOut Base CallNoinline CLZ CommType CTOParFor DeviceGlobal
+   set( AMREX_TESTS_SUBDIRS Amr ArrayND AsyncOut Base CallNoinline CommType CTOParFor DeviceGlobal
                             Enum GpuParallelReduce HeatEquation MultiBlock MultiPeriod ParmParse Parser Parser2
                             ParserUserFn Reducer ReduceToPlaneGuards ReduceToPlanePatchy Reinit RoundoffDomain SIMD
                             SmallMatrix SumBoundary TOML)
@@ -158,7 +158,8 @@ else()
       list(APPEND AMREX_TESTS_SUBDIRS HDF5Benchmark)
    endif ()
 
-   if (AMReX_FORTRAN_INTERFACES)
+   # The Fortran interface tests do not work on GPU, so only build them on CPU.
+   if (AMReX_FORTRAN_INTERFACES AND AMReX_GPU_BACKEND STREQUAL NONE)
       list(APPEND AMREX_TESTS_SUBDIRS FortranInterface)
    endif ()
 
