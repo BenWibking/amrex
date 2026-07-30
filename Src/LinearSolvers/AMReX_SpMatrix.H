@@ -30,6 +30,9 @@ namespace amrex {
  * Sparse matrix container built on top of CSR partitions (GPU-aware).
  */
 
+template <typename T, template<typename> class Allocator>
+struct SpGEMMHelper;
+
 //! GPU-ready non-owning CSR data container
 template <typename T>
 struct ParCsr {
@@ -293,6 +296,9 @@ public:
 
     template <typename U, template<typename> class M> friend
     SpMatrix<U,M> transpose (SpMatrix<U,M> const& A, AlgPartition col_partition);
+
+    template <typename U, template<typename> class M> friend
+    struct SpGEMMHelper;
 
     template <typename U> friend class AMG;
 

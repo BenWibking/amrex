@@ -912,6 +912,50 @@ Distributions", R. A. James, 1977, Journal of Computational Physics, 25,
                 const Vector<MultiFab const*>& a_rhs,
                  Real a_tol_rel, Real a_tol_abs);
 
+Sparse-Matrix Algebraic Multigrid
+=================================
+
+When ``AMReX_LINEAR_SOLVERS`` is enabled, :cpp:`amrex::AMG<T>` provides a
+classical algebraic multigrid preconditioner for distributed
+:cpp:`amrex::SpMatrix<T>` matrices.  The current implementation is intended
+for square, nonsingular scalar elliptic matrices with one positive diagonal
+entry per row and predominantly non-positive off-diagonal entries.  It uses
+PMIS C/F coarsening, direct interpolation, L1-Jacobi smoothing, and Galerkin
+coarse operators.  It does not use aggregation and does not require HYPRE at
+runtime.
+
+The matrix must outlive the AMG object and must not be modified after
+:cpp:`setup`:
+
+.. code-block:: c++
+
+   amrex::SpMatrix<amrex::Real> A(partition, nonzeros_per_row);
+   // Fill A, using global column indices, and sort it if necessary.
+
+   amrex::AMG<amrex::Real> amg(A);
+   amg.setup();
+
+   amrex::AlgVector<amrex::Real> x(partition);
+   amrex::AlgVector<amrex::Real> b(partition);
+   x.setVal(0.0);
+   amg.solve(x, b, 1.e-10, 0.0, 100);
+
+:cpp:`apply(z,r)` applies one fixed, zero-initialized V(1,1)-cycle and is
+suitable for use as a right preconditioner with :cpp:`GMRES_MV`:
+
+.. code-block:: c++
+
+   amrex::GMRES_MV<amrex::Real> gmres(&A);
+   gmres.setPrecond(
+       [&amg] (auto& z, auto const& r) { amg.apply(z, r); });
+   gmres.solve(x, b, 1.e-10, 0.0);
+
+The initial correctness-oriented MPI setup replicates graph fields and the
+right operand of sparse matrix products.  This keeps CPU and GPU execution
+deterministic, but setup memory and communication do not yet scale to large
+rank counts.  V-cycle matrix-vector communication continues to use the
+ordinary sparse-matrix halo exchange.
+
 
 GMRES
 =====
