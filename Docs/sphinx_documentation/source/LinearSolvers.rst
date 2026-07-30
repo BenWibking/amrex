@@ -925,7 +925,8 @@ coarse operators.  It does not use aggregation and does not require HYPRE at
 runtime.
 
 The matrix must outlive the AMG object and must not be modified after
-:cpp:`setup`:
+:cpp:`setup`.  Its row and column partitions must be identical, and every row
+must contain exactly one positive diagonal entry:
 
 .. code-block:: c++
 
@@ -940,6 +941,13 @@ The matrix must outlive the AMG object and must not be modified after
    x.setVal(0.0);
    amg.solve(x, b, 1.e-10, 0.0, 100);
 
+The default options use a strength threshold of ``0.25``, at most 25 levels,
+a dense coarse solve for at most 9 unknowns, and one L1-Jacobi sweep before
+and after coarse-grid correction.  The first implementation supports only
+this V(1,1) cycle.  Use :cpp:`AMG<T>::Options` to change the strength
+threshold, hierarchy limits, or deterministic PMIS seed before calling
+:cpp:`setup`.
+
 :cpp:`apply(z,r)` applies one fixed, zero-initialized V(1,1)-cycle and is
 suitable for use as a right preconditioner with :cpp:`GMRES_MV`:
 
@@ -950,11 +958,21 @@ suitable for use as a right preconditioner with :cpp:`GMRES_MV`:
        [&amg] (auto& z, auto const& r) { amg.apply(z, r); });
    gmres.solve(x, b, 1.e-10, 0.0);
 
-The initial correctness-oriented MPI setup replicates graph fields and the
-right operand of sparse matrix products.  This keeps CPU and GPU execution
-deterministic, but setup memory and communication do not yet scale to large
-rank counts.  V-cycle matrix-vector communication continues to use the
-ordinary sparse-matrix halo exchange.
+Hierarchy statistics and recent timings are available after setup or a solve:
+
+.. code-block:: c++
+
+   amg.printDiagnostics();
+   auto const& info = amg.diagnostics();
+   amrex::Print() << "operator complexity = "
+                  << info.operator_complexity << '\n';
+
+MPI hierarchy setup exchanges only referenced strength-graph fields through a
+typed sparse halo.  Sparse matrix products import only the remote rows of the
+right operand referenced by local rows.  The final matrix and right-hand side
+are replicated only after the hierarchy reaches the dense coarse threshold of
+at most nine unknowns.  V-cycle matrix-vector products use the ordinary
+sparse-matrix halo exchange.
 
 
 GMRES

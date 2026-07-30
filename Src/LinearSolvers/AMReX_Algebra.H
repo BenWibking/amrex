@@ -2,9 +2,11 @@
 #define AMREX_ALGEBRA_H_
 
 #include <AMReX_AlgPartition.H>
+#include <AMReX_AlgHaloExchange.H>
 #include <AMReX_AlgVector.H>
 #include <AMReX_AlgVecUtil.H>
 #include <AMReX_AMG.H>
+#include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_SpMatrix.H>
 #include <AMReX_SpGEMM.H>
 #include <AMReX_SpMatUtil.H>

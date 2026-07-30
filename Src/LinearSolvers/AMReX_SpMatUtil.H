@@ -52,6 +52,9 @@ SpMatrix<T,Allocator> transpose (SpMatrix<T,Allocator> const& A,
     AT.m_row_begin = col_partition[ParallelDescriptor::MyProc()];
     AT.m_row_end   = col_partition[ParallelDescriptor::MyProc()+1];
     AT.m_partition = std::move(col_partition);
+    AT.m_col_partition = A.m_partition;
+    AT.m_col_begin = AT.m_col_partition[ParallelDescriptor::MyProc()];
+    AT.m_col_end   = AT.m_col_partition[ParallelDescriptor::MyProc()+1];
     AT.m_nnz       = A.m_csr.nnz;
 
     // transpose the diagonal part

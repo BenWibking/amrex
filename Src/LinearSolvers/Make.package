@@ -5,12 +5,14 @@ CEXE_headers += AMReX_GMRES_MV.H
 CEXE_headers += AMReX_Smoother_MV.H
 
 CEXE_headers += AMReX_Algebra.H
+CEXE_headers += AMReX_AlgHaloExchange.H
 CEXE_headers += AMReX_AlgPartition.H
 CEXE_sources += AMReX_AlgPartition.cpp
 CEXE_headers += AMReX_AlgVector.H
 CEXE_headers += AMReX_AlgVecUtil.H
 CEXE_headers += AMReX_AMG.H
 CEXE_headers += AMReX_CSR.H
+CEXE_headers += AMReX_L1JacobiSmoother.H
 CEXE_headers += AMReX_SpGEMM.H
 CEXE_headers += AMReX_SpMatrix.H
 CEXE_headers += AMReX_SpMatUtil.H

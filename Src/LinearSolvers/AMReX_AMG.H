@@ -2,16 +2,20 @@
 #define AMREX_AMG_H_
 #include <AMReX_Config.H>
 
+#include <AMReX_AlgHaloExchange.H>
 #include <AMReX_AlgVecUtil.H>
+#include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_LUSolver.H>
 #include <AMReX_Math.H>
 #include <AMReX_ParallelContext.H>
 #include <AMReX_ParallelReduce.H>
+#include <AMReX_Print.H>
 #include <AMReX_Reduce.H>
 #include <AMReX_Scan.H>
 #include <AMReX_SpGEMM.H>
 #include <AMReX_SpMatUtil.H>
 #include <AMReX_SpMV.H>
+#include <AMReX_Utility.H>
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +25,9 @@
 #include <utility>
 
 namespace amrex {
+
+template <typename T>
+struct AMGTestAccess;
 
 /**
  * \file AMReX_AMG.H
@@ -62,6 +69,30 @@ public:
         int post_sweeps = 1;
         //! Seed used by the deterministic PMIS priority hash.
         int priority_seed = 0;
+    };
+
+    //! Persistent hierarchy information for one level.
+    struct LevelDiagnostics {
+        //! Global number of rows on this level.
+        Long rows = 0;
+        //! Global number of nonzeros in the level operator.
+        Long nonzeros = 0;
+        //! Global number of interpolation nonzeros below this level.
+        Long interpolation_nonzeros = 0;
+        //! Ratio of next-level rows to this level's rows.
+        double coarse_fraction = 0.0;
+    };
+
+    //! Setup, hierarchy-complexity, storage, and recent solve diagnostics.
+    struct Diagnostics {
+        Vector<LevelDiagnostics> levels;
+        double grid_complexity = 0.0;
+        double operator_complexity = 0.0;
+        double interpolation_complexity = 0.0;
+        double setup_seconds = 0.0;
+        double last_apply_seconds = 0.0;
+        double last_solve_seconds = 0.0;
+        Long hierarchy_storage_bytes = 0;
     };
 
     /**
@@ -127,7 +158,19 @@ public:
         return m_last_residual_norm;
     }
 
+    //! Return hierarchy, storage, and timing diagnostics.
+    [[nodiscard]] Diagnostics const& diagnostics () const noexcept
+    {
+        return m_diagnostics;
+    }
+
+    //! Print hierarchy, complexity, storage, and timing diagnostics.
+    void printDiagnostics () const;
+
 private:
+    template <typename U>
+    friend struct AMGTestAccess;
+
     using matrix_type = SpMatrix<T>;
     using csr_type = typename matrix_type::csr_type;
     using helper_type = SpGEMMHelper<T,DefaultAllocator>;
@@ -156,6 +199,10 @@ private:
         csr_type strength_rows;
         //! Compact incoming strength graph.
         csr_type strength_transpose_rows;
+        //! Local-or-ghost slots corresponding to outgoing graph columns.
+        Gpu::DeviceVector<Long> strength_col_slots;
+        //! Local-or-ghost slots corresponding to incoming graph columns.
+        Gpu::DeviceVector<Long> strength_transpose_col_slots;
 
         //! Distributed numerical representation of the strength graph.
         std::unique_ptr<matrix_type> S;
@@ -172,9 +219,11 @@ private:
         Gpu::DeviceVector<Long> coarse_id;
         //! Distribution of points on the next coarser level.
         AlgPartition coarse_partition;
+        //! Typed sparse exchange plan shared by setup graph fields.
+        std::unique_ptr<AlgHaloExchange> halo;
 
-        //! L1-Jacobi denominator for every local row.
-        AlgVector<T> l1_norm;
+        //! L1-Jacobi smoother and cached absolute row sums.
+        std::unique_ptr<L1JacobiSmoother<T>> smoother;
         //! Level right-hand-side workspace.
         AlgVector<T> rhs;
         //! Level correction workspace.
@@ -197,6 +246,8 @@ private:
     void build_next_level (Level& level);
     //! Gather, pad, and factor the globally coarsest matrix.
     void factor_coarse_matrix ();
+    //! Recompute hierarchy complexity and persistent-storage diagnostics.
+    void update_diagnostics (double setup_seconds);
     /**
      * \brief Apply a recursive V(1,1)-cycle beginning at level \p ilev.
      *
@@ -247,18 +298,6 @@ private:
     gather_device_to_host (U const* local, AlgPartition const& partition);
 
     /**
-     * \brief Gather and replicate a distributed field in device memory.
-     *
-     * \tparam U Field value type with an AMReX MPI type mapping.
-     * \param local Local device field.
-     * \param partition Distribution of \p local across ranks.
-     * \return Replicated global field in device-accessible memory.
-     */
-    template <typename U>
-    static Gpu::DeviceVector<U>
-    gather_device_field (U const* local, AlgPartition const& partition);
-
-    /**
      * \brief Build the global coarse partition from one local point count.
      *
      * \param local_coarse_size Number of coarse points owned by this rank.
@@ -291,17 +330,19 @@ private:
      *
      * \param lhs First global vertex ID.
      * \param rhs Second global vertex ID.
-     * \param influence Replicated incoming-strength degree array.
+     * \param lhs_influence Incoming-strength degree of \p lhs.
+     * \param rhs_influence Incoming-strength degree of \p rhs.
      * \param seed User-supplied priority seed.
      * \return `true` when \p lhs has higher deterministic priority.
      */
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     static bool has_higher_priority (Long lhs, Long rhs,
-                                     Long const* influence,
+                                     Long lhs_influence,
+                                     Long rhs_influence,
                                      int seed) noexcept
     {
-        if (influence[lhs] != influence[rhs]) {
-            return influence[lhs] > influence[rhs];
+        if (lhs_influence != rhs_influence) {
+            return lhs_influence > rhs_influence;
         }
         auto const hl = priority_hash(lhs, seed);
         auto const hr = priority_hash(rhs, seed);
@@ -316,6 +357,7 @@ private:
     bool m_is_setup = false;
     int m_last_iterations = 0;
     T m_last_residual_norm = std::numeric_limits<T>::infinity();
+    Diagnostics m_diagnostics;
 };
 
 template <typename T>
@@ -379,22 +421,6 @@ AMG<T>::gather_device_to_host (U const* local,
 }
 
 template <typename T>
-template <typename U>
-Gpu::DeviceVector<U>
-AMG<T>::gather_device_field (U const* local,
-                             AlgPartition const& partition)
-{
-    auto host = gather_device_to_host(local, partition);
-    Gpu::DeviceVector<U> result(host.size());
-    if (!host.empty()) {
-        Gpu::copyAsync(Gpu::hostToDevice, host.begin(), host.end(),
-                       result.begin());
-        Gpu::streamSynchronize();
-    }
-    return result;
-}
-
-template <typename T>
 AlgPartition AMG<T>::make_coarse_partition (Long local_coarse_size)
 {
     int const nprocs = ParallelDescriptor::NProcs();
@@ -419,13 +445,18 @@ template <typename T>
 void AMG<T>::initialize_level (Level& level)
 {
     auto const partition = level.A->partition();
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        level.A->columnPartition().empty()
+        || level.A->columnPartition() == partition,
+        "AMG setup requires identical row and column partitions");
     Long const global_rows = level.A->numGlobalRows();
     Long const local_rows = level.A->numLocalRows();
 
     auto host_rows = helper_type::copy_local_global_csr(*level.A);
     level.rows = copy_to_device(host_rows);
 
-    level.l1_norm.define(partition);
+    level.smoother =
+        std::make_unique<L1JacobiSmoother<T>>(*level.A);
     level.rhs.define(partition);
     level.correction.define(partition);
     level.residual.define(partition);
@@ -434,7 +465,8 @@ void AMG<T>::initialize_level (Level& level)
     auto const* AMREX_RESTRICT row = level.rows.row_offset.data();
     auto const* AMREX_RESTRICT col = level.rows.col_index.data();
     auto const* AMREX_RESTRICT val = level.rows.mat.data();
-    auto* AMREX_RESTRICT l1 = level.l1_norm.data();
+    auto const* AMREX_RESTRICT l1 =
+        level.smoother->denominator().data();
     auto const row_begin = level.A->globalRowBegin();
 
     int failures = Reduce::Sum<int>(
@@ -444,23 +476,20 @@ void AMG<T>::initialize_level (Level& level)
             Long const global_row = i + row_begin;
             int diagonal_count = 0;
             T diagonal = T(0);
-            T row_l1 = T(0);
             int bad_column = 0;
             for (Long p = row[i]; p < row[i+1]; ++p) {
                 auto const j = col[p];
                 auto const a = val[p];
                 bad_column += (j < 0 || j >= global_rows);
-                row_l1 += amrex::Math::abs(a);
                 if (j == global_row) {
                     ++diagonal_count;
                     diagonal = a;
                 }
             }
-            l1[i] = row_l1;
             return bad_column
                 + (diagonal_count != 1)
                 + (diagonal <= T(0))
-                + (row_l1 <= T(0));
+                + (l1[i] <= T(0));
         });
     ParallelAllReduce::Sum(failures, ParallelContext::CommunicatorSub());
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -547,12 +576,50 @@ void AMG<T>::build_strength (Level& level)
 
     duplicateCSR(Gpu::deviceToDevice, level.strength_rows, graph);
     level.S = std::make_unique<matrix_type>(
-        level.A->partition(), std::move(graph));
+        level.A->partition(), level.A->partition(), std::move(graph));
     level.ST = std::make_unique<matrix_type>(
         transpose(*level.S, level.A->partition()));
 
+    auto host_strength = helper_type::copy_local_global_csr(*level.S);
     auto host_transpose = helper_type::copy_local_global_csr(*level.ST);
     level.strength_transpose_rows = copy_to_device(host_transpose);
+
+    Vector<Long> requested_ids;
+    requested_ids.reserve(
+        static_cast<std::size_t>(host_strength.nnz
+                                 + host_transpose.nnz));
+    requested_ids.insert(requested_ids.end(),
+                         host_strength.col_index.begin(),
+                         host_strength.col_index.end());
+    requested_ids.insert(requested_ids.end(),
+                         host_transpose.col_index.begin(),
+                         host_transpose.col_index.end());
+    level.halo = std::make_unique<AlgHaloExchange>(
+        level.A->partition(), std::move(requested_ids));
+
+    Gpu::PinnedVector<Long> strength_slots(host_strength.nnz);
+    for (Long p = 0; p < host_strength.nnz; ++p) {
+        strength_slots[p] =
+            level.halo->localOrGhostIndex(host_strength.col_index[p]);
+    }
+    Gpu::PinnedVector<Long> transpose_slots(host_transpose.nnz);
+    for (Long p = 0; p < host_transpose.nnz; ++p) {
+        transpose_slots[p] =
+            level.halo->localOrGhostIndex(host_transpose.col_index[p]);
+    }
+    level.strength_col_slots.resize(host_strength.nnz);
+    level.strength_transpose_col_slots.resize(host_transpose.nnz);
+    if (host_strength.nnz > 0) {
+        Gpu::copyAsync(Gpu::hostToDevice, strength_slots.begin(),
+                       strength_slots.end(),
+                       level.strength_col_slots.begin());
+    }
+    if (host_transpose.nnz > 0) {
+        Gpu::copyAsync(Gpu::hostToDevice, transpose_slots.begin(),
+                       transpose_slots.end(),
+                       level.strength_transpose_col_slots.begin());
+    }
+    Gpu::streamSynchronize();
 }
 
 template <typename T>
@@ -560,7 +627,6 @@ void AMG<T>::split_pmis (Level& level)
 {
     Long const nlocal = level.A->numLocalRows();
     Long const row_begin = level.A->globalRowBegin();
-    auto const partition = level.A->partition();
 
     level.cf_marker.resize(nlocal);
     auto* AMREX_RESTRICT marker = level.cf_marker.data();
@@ -575,9 +641,8 @@ void AMG<T>::split_pmis (Level& level)
         pinfluence[i] = strow[i+1] - strow[i];
     });
 
-    auto global_influence = gather_device_field(
-        influence.data(), partition);
-    auto const* AMREX_RESTRICT all_influence = global_influence.data();
+    auto halo_influence = level.halo->exchange(influence.data());
+    auto const* AMREX_RESTRICT all_influence = halo_influence.data();
 
     Gpu::DeviceVector<Long> active(nlocal);
     Gpu::DeviceVector<Long> next_active(nlocal);
@@ -598,14 +663,18 @@ void AMG<T>::split_pmis (Level& level)
         level.strength_rows.col_index.data();
     auto const* AMREX_RESTRICT stcol =
         level.strength_transpose_rows.col_index.data();
+    auto const* AMREX_RESTRICT sslot =
+        level.strength_col_slots.data();
+    auto const* AMREX_RESTRICT stslot =
+        level.strength_transpose_col_slots.data();
     int const seed = m_options.priority_seed;
 
     Long global_active_count = active_count;
     ParallelAllReduce::Sum(global_active_count,
                            ParallelContext::CommunicatorSub());
     while (global_active_count > 0) {
-        auto global_marker = gather_device_field(marker, partition);
-        auto const* AMREX_RESTRICT all_marker = global_marker.data();
+        auto halo_marker = level.halo->exchange(marker);
+        auto const* AMREX_RESTRICT all_marker = halo_marker.data();
 
         ParallelFor(nlocal, [=] AMREX_GPU_DEVICE (Long i) noexcept
         {
@@ -619,16 +688,22 @@ void AMG<T>::split_pmis (Level& level)
             bool selected = true;
             for (Long p = srow[i]; p < srow[i+1] && selected; ++p) {
                 Long const j = scol[p];
-                if (all_marker[j] == undecided
-                    && has_higher_priority(j, gid, all_influence, seed))
+                Long const slot = sslot[p];
+                if (all_marker[slot] == undecided
+                    && has_higher_priority(
+                        j, gid, all_influence[slot],
+                        all_influence[i], seed))
                 {
                     selected = false;
                 }
             }
             for (Long p = strow[i]; p < strow[i+1] && selected; ++p) {
                 Long const j = stcol[p];
-                if (all_marker[j] == undecided
-                    && has_higher_priority(j, gid, all_influence, seed))
+                Long const slot = stslot[p];
+                if (all_marker[slot] == undecided
+                    && has_higher_priority(
+                        j, gid, all_influence[slot],
+                        all_influence[i], seed))
                 {
                     selected = false;
                 }
@@ -636,8 +711,8 @@ void AMG<T>::split_pmis (Level& level)
             is_candidate[i] = selected ? 1 : 0;
         });
 
-        auto global_candidate = gather_device_field(
-            candidate.data(), partition);
+        auto global_candidate =
+            level.halo->exchange(candidate.data());
         auto const* AMREX_RESTRICT all_candidate =
             global_candidate.data();
 
@@ -653,7 +728,8 @@ void AMG<T>::split_pmis (Level& level)
             for (Long p = srow[i];
                  p < srow[i+1] && !depends_on_new_coarse; ++p)
             {
-                depends_on_new_coarse = all_candidate[scol[p]] != 0;
+                depends_on_new_coarse =
+                    all_candidate[sslot[p]] != 0;
             }
             if (depends_on_new_coarse) {
                 marker[i] = fine;
@@ -681,34 +757,26 @@ void AMG<T>::split_pmis (Level& level)
                                ParallelContext::CommunicatorSub());
     }
 
-    auto global_marker = gather_device_field(marker, partition);
-    auto const* AMREX_RESTRICT all_marker = global_marker.data();
-    int invariant_failures = Reduce::Sum<int>(
+    auto halo_marker = level.halo->exchange(marker);
+    auto const* AMREX_RESTRICT all_marker = halo_marker.data();
+    int coverage_failures = Reduce::Sum<int>(
         nlocal, [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
         {
-            int failed = 0;
             if (marker[i] == coarse) {
-                for (Long p = srow[i]; p < srow[i+1]; ++p) {
-                    failed += (all_marker[scol[p]] == coarse);
-                }
-                for (Long p = strow[i]; p < strow[i+1]; ++p) {
-                    failed += (all_marker[stcol[p]] == coarse);
-                }
-            } else {
-                bool covered = false;
-                for (Long p = srow[i]; p < srow[i+1] && !covered; ++p) {
-                    covered = all_marker[scol[p]] == coarse;
-                }
-                failed += !covered;
+                return 0;
             }
-            return failed;
+            bool covered = false;
+            for (Long p = srow[i]; p < srow[i+1] && !covered; ++p) {
+                covered = all_marker[sslot[p]] == coarse;
+            }
+            return covered ? 0 : 1;
         });
-    ParallelAllReduce::Sum(invariant_failures,
+    ParallelAllReduce::Sum(coverage_failures,
                            ParallelContext::CommunicatorSub());
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        invariant_failures == 0,
-        "AMG PMIS failed coarse independence or fine-point interpolation "
-        "coverage for the supplied strength graph");
+        coverage_failures == 0,
+        "AMG PMIS left a fine point without a strongly influencing "
+        "coarse neighbor");
 
     Gpu::DeviceVector<Long> coarse_scan(nlocal);
     auto* AMREX_RESTRICT scan = coarse_scan.data();
@@ -741,15 +809,15 @@ void AMG<T>::build_interpolation (Level& level)
     Long const nrows = level.A->numLocalRows();
     Long const row_begin = level.A->globalRowBegin();
     auto const partition = level.A->partition();
-    auto global_marker = gather_device_field(
-        level.cf_marker.data(), partition);
-    auto global_coarse_id = gather_device_field(
-        level.coarse_id.data(), partition);
+    auto halo_marker =
+        level.halo->exchange(level.cf_marker.data());
+    auto halo_coarse_id =
+        level.halo->exchange(level.coarse_id.data());
 
     auto const* AMREX_RESTRICT marker = level.cf_marker.data();
-    auto const* AMREX_RESTRICT all_marker = global_marker.data();
+    auto const* AMREX_RESTRICT all_marker = halo_marker.data();
     auto const* AMREX_RESTRICT all_coarse_id =
-        global_coarse_id.data();
+        halo_coarse_id.data();
     auto const* AMREX_RESTRICT arow = level.rows.row_offset.data();
     auto const* AMREX_RESTRICT acol = level.rows.col_index.data();
     auto const* AMREX_RESTRICT aval = level.rows.mat.data();
@@ -757,6 +825,8 @@ void AMG<T>::build_interpolation (Level& level)
         level.strength_rows.row_offset.data();
     auto const* AMREX_RESTRICT scol =
         level.strength_rows.col_index.data();
+    auto const* AMREX_RESTRICT sslot =
+        level.strength_col_slots.data();
 
     Gpu::DeviceVector<Long> counts(nrows);
     auto* AMREX_RESTRICT pcounts = counts.data();
@@ -767,7 +837,7 @@ void AMG<T>::build_interpolation (Level& level)
         } else {
             Long count = 0;
             for (Long p = srow[i]; p < srow[i+1]; ++p) {
-                count += all_marker[scol[p]] == coarse;
+                count += all_marker[sslot[p]] == coarse;
             }
             pcounts[i] = count;
         }
@@ -807,7 +877,7 @@ void AMG<T>::build_interpolation (Level& level)
         [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
         {
             if (marker[i] == coarse) {
-                pcol[prow[i]] = all_coarse_id[i + row_begin];
+                pcol[prow[i]] = all_coarse_id[i];
                 pval[prow[i]] = T(1);
                 return 0;
             }
@@ -831,7 +901,8 @@ void AMG<T>::build_interpolation (Level& level)
             T coarse_positive_sum = T(0);
             for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
                 Long const j = scol[sp];
-                if (all_marker[j] != coarse) {
+                Long const slot = sslot[sp];
+                if (all_marker[slot] != coarse) {
                     continue;
                 }
                 T a = T(0);
@@ -858,7 +929,8 @@ void AMG<T>::build_interpolation (Level& level)
             Long out = prow[i];
             for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
                 Long const j = scol[sp];
-                if (all_marker[j] != coarse) {
+                Long const slot = sslot[sp];
+                if (all_marker[slot] != coarse) {
                     continue;
                 }
                 T a = T(0);
@@ -868,12 +940,11 @@ void AMG<T>::build_interpolation (Level& level)
                         break;
                     }
                 }
-                pcol[out] = all_coarse_id[j];
+                pcol[out] = all_coarse_id[slot];
                 pval[out] = (a < T(0)) ? -alpha*a : -beta*a;
                 ++out;
             }
-            return (diagonal == T(0))
-                || (!need_negative && negative_sum != T(0));
+            return diagonal == T(0);
         });
     ParallelAllReduce::Sum(invalid_scales,
                            ParallelContext::CommunicatorSub());
@@ -891,7 +962,7 @@ void AMG<T>::build_interpolation (Level& level)
     Gpu::streamSynchronize();
 
     level.P = std::make_unique<matrix_type>(
-        partition, std::move(interpolation));
+        partition, level.coarse_partition, std::move(interpolation));
     level.R = std::make_unique<matrix_type>(
         transpose(*level.P, level.coarse_partition));
 }
@@ -946,8 +1017,141 @@ void AMG<T>::factor_coarse_matrix ()
 }
 
 template <typename T>
+void AMG<T>::update_diagnostics (double setup_seconds)
+{
+    auto global_sum = [] (Long local) -> Long
+    {
+        ParallelAllReduce::Sum(
+            local, ParallelContext::CommunicatorSub());
+        return local;
+    };
+    auto csr_bytes = [] (csr_type const& csr) -> Long
+    {
+        return static_cast<Long>(
+            csr.mat.size()*sizeof(T)
+            + csr.col_index.size()*sizeof(Long)
+            + csr.row_offset.size()*sizeof(Long));
+    };
+    auto matrix_bytes = [] (matrix_type const& matrix) -> Long
+    {
+        return matrix.numLocalNonZeros()
+                *static_cast<Long>(sizeof(T)+sizeof(Long))
+            +(matrix.numLocalRows()+1)*static_cast<Long>(sizeof(Long));
+    };
+
+    m_diagnostics = Diagnostics{};
+    m_diagnostics.levels.resize(m_levels.size());
+    Long total_rows = 0;
+    Long total_nonzeros = 0;
+    Long total_interpolation_nonzeros = 0;
+    Long local_storage = static_cast<Long>(sizeof(m_coarse_solver));
+
+    for (int ilev = 0; ilev < static_cast<int>(m_levels.size());
+         ++ilev)
+    {
+        auto const& level = *m_levels[ilev];
+        auto& info = m_diagnostics.levels[ilev];
+        info.rows = level.A->numGlobalRows();
+        info.nonzeros = global_sum(level.A->numLocalNonZeros());
+        total_rows += info.rows;
+        total_nonzeros += info.nonzeros;
+        if (level.P) {
+            info.interpolation_nonzeros =
+                global_sum(level.P->numLocalNonZeros());
+            total_interpolation_nonzeros +=
+                info.interpolation_nonzeros;
+        }
+        if (ilev+1 < static_cast<int>(m_levels.size())) {
+            info.coarse_fraction =
+                static_cast<double>(
+                    m_levels[ilev+1]->A->numGlobalRows())
+                / static_cast<double>(info.rows);
+        }
+
+        if (level.owned_A) {
+            local_storage += matrix_bytes(*level.owned_A);
+        }
+        if (level.S) {
+            local_storage += matrix_bytes(*level.S);
+        }
+        if (level.ST) {
+            local_storage += matrix_bytes(*level.ST);
+        }
+        if (level.P) {
+            local_storage += matrix_bytes(*level.P);
+        }
+        if (level.R) {
+            local_storage += matrix_bytes(*level.R);
+        }
+        local_storage += csr_bytes(level.rows)
+            + csr_bytes(level.strength_rows)
+            + csr_bytes(level.strength_transpose_rows)
+            + static_cast<Long>(
+                (level.strength_col_slots.size()
+                 +level.strength_transpose_col_slots.size())
+                *sizeof(Long))
+            + static_cast<Long>(level.cf_marker.size()*sizeof(int))
+            + static_cast<Long>(level.coarse_id.size()*sizeof(Long))
+            + 4*level.A->numLocalRows()*static_cast<Long>(sizeof(T));
+        if (level.smoother) {
+            local_storage += level.A->numLocalRows()
+                *static_cast<Long>(sizeof(T));
+        }
+        if (level.halo) {
+            local_storage +=
+                static_cast<Long>(level.halo->estimatedBytes());
+        }
+    }
+
+    auto const fine_rows =
+        static_cast<double>(m_diagnostics.levels.front().rows);
+    auto const fine_nonzeros =
+        static_cast<double>(m_diagnostics.levels.front().nonzeros);
+    m_diagnostics.grid_complexity =
+        static_cast<double>(total_rows)/fine_rows;
+    m_diagnostics.operator_complexity =
+        static_cast<double>(total_nonzeros)/fine_nonzeros;
+    m_diagnostics.interpolation_complexity =
+        static_cast<double>(total_interpolation_nonzeros)/fine_rows;
+    m_diagnostics.hierarchy_storage_bytes =
+        global_sum(local_storage);
+    ParallelAllReduce::Max(
+        setup_seconds, ParallelContext::CommunicatorSub());
+    m_diagnostics.setup_seconds = setup_seconds;
+}
+
+template <typename T>
+void AMG<T>::printDiagnostics () const
+{
+    auto os = amrex::Print();
+    os << "AMG hierarchy: levels=" << m_diagnostics.levels.size()
+       << ", grid complexity=" << m_diagnostics.grid_complexity
+       << ", operator complexity=" << m_diagnostics.operator_complexity
+       << ", interpolation complexity="
+       << m_diagnostics.interpolation_complexity
+       << ", setup=" << m_diagnostics.setup_seconds << " s"
+       << ", last apply=" << m_diagnostics.last_apply_seconds << " s"
+       << ", last solve=" << m_diagnostics.last_solve_seconds << " s"
+       << ", persistent storage="
+       << m_diagnostics.hierarchy_storage_bytes << " bytes\n";
+    for (int ilev = 0;
+         ilev < static_cast<int>(m_diagnostics.levels.size()); ++ilev)
+    {
+        auto const& info = m_diagnostics.levels[ilev];
+        os << "  level " << ilev << ": rows=" << info.rows
+           << ", nnz=" << info.nonzeros;
+        if (ilev+1 < static_cast<int>(m_diagnostics.levels.size())) {
+            os << ", P nnz=" << info.interpolation_nonzeros
+               << ", coarse/fine=" << info.coarse_fraction;
+        }
+        os << '\n';
+    }
+}
+
+template <typename T>
 void AMG<T>::setup ()
 {
+    double const setup_start = amrex::second();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_options.strong_threshold > T(0)
         && m_options.strong_threshold <= T(1),
@@ -993,6 +1197,7 @@ void AMG<T>::setup ()
 
     factor_coarse_matrix();
     m_is_setup = true;
+    update_diagnostics(amrex::second()-setup_start);
 }
 
 template <typename T>
@@ -1033,16 +1238,11 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
         return;
     }
 
-    auto const* AMREX_RESTRICT pb = b.data();
-    auto const* AMREX_RESTRICT pd = level.l1_norm.data();
-    auto* AMREX_RESTRICT px = x.data();
     Long const nrows = x.numLocalRows();
-    ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
-    {
-        px[i] = pb[i]/pd[i];
-    });
+    level.smoother->sweep(x, b, level.work, true);
 
     SpMV(level.work, *level.A, x);
+    auto const* AMREX_RESTRICT pb = b.data();
     auto const* AMREX_RESTRICT pax = level.work.data();
     auto* AMREX_RESTRICT pres = level.residual.data();
     ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
@@ -1058,18 +1258,14 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
     SpMV(level.work, *level.P, next.correction);
     x.plusAsync(level.work);
 
-    SpMV(level.work, *level.A, x);
-    pax = level.work.data();
-    ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
-    {
-        px[i] += (pb[i] - pax[i])/pd[i];
-    });
+    level.smoother->sweep(x, b, level.work, false);
     Gpu::streamSynchronize();
 }
 
 template <typename T>
 void AMG<T>::apply (AlgVector<T>& z, AlgVector<T> const& r)
 {
+    double const apply_start = amrex::second();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_is_setup, "AMG::setup must be called before AMG::apply");
     AMREX_ALWAYS_ASSERT(z.partition() == m_fine_matrix.partition());
@@ -1078,6 +1274,8 @@ void AMG<T>::apply (AlgVector<T>& z, AlgVector<T> const& r)
     root.rhs.copyAsync(r);
     z.setValAsync(T(0));
     vcycle(0, z, root.rhs);
+    m_diagnostics.last_apply_seconds =
+        amrex::second()-apply_start;
 }
 
 template <typename T>
@@ -1085,6 +1283,7 @@ void AMG<T>::solve (AlgVector<T>& x, AlgVector<T> const& b,
                     T relative_tolerance, T absolute_tolerance,
                     int maximum_iterations)
 {
+    double const solve_start = amrex::second();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_is_setup, "AMG::setup must be called before AMG::solve");
     AMREX_ALWAYS_ASSERT(relative_tolerance >= T(0));
@@ -1111,6 +1310,8 @@ void AMG<T>::solve (AlgVector<T>& x, AlgVector<T> const& b,
         m_last_residual_norm = root.residual.norm2();
         ++m_last_iterations;
     }
+    m_diagnostics.last_solve_seconds =
+        amrex::second()-solve_start;
 }
 
 }

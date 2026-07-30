@@ -38,12 +38,14 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        AMReX_GMRES_MV.H
        AMReX_Smoother_MV.H
        AMReX_Algebra.H
+       AMReX_AlgHaloExchange.H
        AMReX_AlgPartition.H
        AMReX_AlgPartition.cpp
        AMReX_AlgVector.H
        AMReX_AlgVecUtil.H
        AMReX_AMG.H
        AMReX_CSR.H
+       AMReX_L1JacobiSmoother.H
        AMReX_SpGEMM.H
        AMReX_SpMatrix.H
        AMReX_SpMatUtil.H

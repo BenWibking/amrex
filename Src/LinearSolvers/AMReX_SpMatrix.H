@@ -92,6 +92,17 @@ public:
     SpMatrix (AlgPartition partition, int nnz_per_row);
 
     /**
+     * \brief Construct a rectangular sparse matrix with explicit row and
+     * column partitions and a fixed number of nonzeros per row.
+     *
+     * \param row_partition Distribution of matrix rows.
+     * \param col_partition Distribution of matrix columns.
+     * \param nnz_per_row Number of nonzeros per row.
+     */
+    SpMatrix (AlgPartition row_partition, AlgPartition col_partition,
+              int nnz_per_row);
+
+    /**
      * \brief Construct a sparse matrix from a given Partition and CSR
      *
      * The input CSR represents the portion of the matrix local to this
@@ -102,6 +113,17 @@ public:
      * \param csr CSR represents of the matrix local to this process.
      */
     SpMatrix (AlgPartition partition, csr_type csr);
+
+    /**
+     * \brief Construct a rectangular sparse matrix from explicit row and
+     * column partitions and local CSR storage.
+     *
+     * \param row_partition Distribution of matrix rows.
+     * \param col_partition Distribution of matrix columns.
+     * \param csr Local CSR rows with global column indices.
+     */
+    SpMatrix (AlgPartition row_partition, AlgPartition col_partition,
+              csr_type csr);
 
     SpMatrix (SpMatrix const&) = delete;
     SpMatrix& operator= (SpMatrix const&) = delete;
@@ -126,6 +148,17 @@ public:
      * \param nnz_per_row Number of nonzeros per row.
      */
     void define (AlgPartition partition, int nnz_per_row);
+
+    /**
+     * \brief Define a rectangular matrix with explicit row and column
+     * partitions and fixed row connectivity.
+     *
+     * \param row_partition Distribution of matrix rows.
+     * \param col_partition Distribution of matrix columns.
+     * \param nnz_per_row Number of nonzeros per row.
+     */
+    void define (AlgPartition row_partition, AlgPartition col_partition,
+                 int nnz_per_row);
 
     /**
      * \brief Define a default-constructed matrix from given CSR arrays.
@@ -725,10 +758,38 @@ SpMatrix<T,Allocator>::SpMatrix (AlgPartition partition, int nnz_per_row)
 }
 
 template <typename T, template<typename> class Allocator>
+SpMatrix<T,Allocator>::SpMatrix (AlgPartition row_partition,
+                                 AlgPartition col_partition,
+                                 int nnz_per_row)
+    : m_partition(std::move(row_partition)),
+      m_col_partition(std::move(col_partition)),
+      m_row_begin(m_partition[ParallelDescriptor::MyProc()]),
+      m_row_end(m_partition[ParallelDescriptor::MyProc()+1]),
+      m_col_begin(m_col_partition[ParallelDescriptor::MyProc()]),
+      m_col_end(m_col_partition[ParallelDescriptor::MyProc()+1])
+{
+    define_doit(nnz_per_row);
+}
+
+template <typename T, template<typename> class Allocator>
 SpMatrix<T,Allocator>::SpMatrix (AlgPartition partition, csr_type csr)
     : m_partition(std::move(partition)),
       m_row_begin(m_partition[ParallelDescriptor::MyProc()]),
       m_row_end(m_partition[ParallelDescriptor::MyProc()+1]),
+      m_nnz(csr.nnz),
+      m_csr(std::move(csr))
+{}
+
+template <typename T, template<typename> class Allocator>
+SpMatrix<T,Allocator>::SpMatrix (AlgPartition row_partition,
+                                 AlgPartition col_partition,
+                                 csr_type csr)
+    : m_partition(std::move(row_partition)),
+      m_col_partition(std::move(col_partition)),
+      m_row_begin(m_partition[ParallelDescriptor::MyProc()]),
+      m_row_end(m_partition[ParallelDescriptor::MyProc()+1]),
+      m_col_begin(m_col_partition[ParallelDescriptor::MyProc()]),
+      m_col_end(m_col_partition[ParallelDescriptor::MyProc()+1]),
       m_nnz(csr.nnz),
       m_csr(std::move(csr))
 {}
@@ -739,6 +800,20 @@ void SpMatrix<T,Allocator>::define (AlgPartition partition, int nnz_per_row)
     m_partition = std::move(partition);
     m_row_begin = m_partition[ParallelDescriptor::MyProc()];
     m_row_end = m_partition[ParallelDescriptor::MyProc()+1];
+    define_doit(nnz_per_row);
+}
+
+template <typename T, template<typename> class Allocator>
+void SpMatrix<T,Allocator>::define (AlgPartition row_partition,
+                                    AlgPartition col_partition,
+                                    int nnz_per_row)
+{
+    m_partition = std::move(row_partition);
+    m_col_partition = std::move(col_partition);
+    m_row_begin = m_partition[ParallelDescriptor::MyProc()];
+    m_row_end = m_partition[ParallelDescriptor::MyProc()+1];
+    m_col_begin = m_col_partition[ParallelDescriptor::MyProc()];
+    m_col_end = m_col_partition[ParallelDescriptor::MyProc()+1];
     define_doit(nnz_per_row);
 }
 
@@ -1067,7 +1142,7 @@ void SpMatrix<T,Allocator>::startComm_mv (AlgVector<T,AllocT> const& x)
 #ifndef AMREX_USE_MPI
     amrex::ignore_unused(x);
 #else
-    if (this->partition().numActiveProcs() <= 1) { return; }
+    if (ParallelContext::NProcsSub() <= 1) { return; }
 
     this->prepare_comm_mv(x.partition());
 
@@ -1113,12 +1188,10 @@ void SpMatrix<T,Allocator>::startComm_mv (AlgVector<T,AllocT> const& x)
 template <typename T, template<typename> class Allocator>
 void SpMatrix<T,Allocator>::finishComm_mv (AlgVector<T,AllocT>& y)
 {
-    if (this->numLocalRows() == 0) { return; }
-
 #ifndef AMREX_USE_MPI
     amrex::ignore_unused(y);
 #else
-    if (this->partition().numActiveProcs() <= 1) { return; }
+    if (ParallelContext::NProcsSub() <= 1) { return; }
 
     if ( ! m_comm_mv.recv_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_mv.recv_reqs.size());
@@ -1148,7 +1221,7 @@ template <typename T, template<typename> class Allocator>
 void SpMatrix<T,Allocator>::startComm_tr (AlgPartition const& col_partition)
 {
 #ifdef AMREX_USE_MPI
-    if (this->partition().numActiveProcs() <= 1) { return; }
+    if (ParallelContext::NProcsSub() <= 1) { return; }
 
     this->split_csr(col_partition);
 
@@ -1358,7 +1431,7 @@ template <typename T, template<typename> class Allocator>
 void SpMatrix<T,Allocator>::finishComm_tr (SpMatrix<T,Allocator>& AT)
 {
 #ifdef AMREX_USE_MPI
-    if (this->partition().numActiveProcs() <= 1) { return; }
+    if (ParallelContext::NProcsSub() <= 1) { return; }
 
     if (! m_comm_tr.recv_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_tr.recv_reqs.size());
@@ -1405,9 +1478,11 @@ void SpMatrix<T,Allocator>::split_csr (AlgPartition const& col_partition)
         return;
     }
 
-    AMREX_ALWAYS_ASSERT(m_col_partition.empty());
-
-    m_col_partition = col_partition;
+    if (m_col_partition.empty()) {
+        m_col_partition = col_partition;
+    } else {
+        AMREX_ALWAYS_ASSERT(m_col_partition == col_partition);
+    }
     m_col_begin = col_partition[ParallelDescriptor::MyProc()];
     m_col_end   = col_partition[ParallelDescriptor::MyProc()+1];
 
