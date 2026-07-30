@@ -25,16 +25,37 @@ namespace amrex {
  * interface.
  */
 
+/**
+ * \brief Internal host-staging and device-product operations used by
+ * \ref SpGEMM.
+ *
+ * \tparam T Floating-point matrix scalar type.
+ * \tparam Allocator Storage allocator used by the distributed matrices.
+ */
 template <typename T, template <typename> class Allocator>
 struct SpGEMMHelper
 {
+    //! Distributed sparse-matrix type operated on by this helper.
     using matrix_type = SpMatrix<T,Allocator>;
+    //! Device-accessible CSR storage used by \ref matrix_type.
     using csr_type = typename matrix_type::csr_type;
+    //! CSR storage backed by pinned host vectors.
     using host_csr_type = CSR<T,Gpu::PinnedVector>;
 
+    //! Matrix-allocator vector type for temporary values of type \p U.
     template <typename U>
     using container_type = typename matrix_type::template container_type<U>;
 
+    /**
+     * \brief Reconstruct the locally owned rows of \p A with global column
+     * indices.
+     *
+     * Split local and remote CSR blocks are merged and sorted into canonical
+     * pinned-host CSR storage.
+     *
+     * \param A Distributed source matrix.
+     * \return Local rows of \p A in pinned host memory.
+     */
     static host_csr_type copy_local_global_csr (matrix_type const& A)
     {
         host_csr_type hlocal;
@@ -108,6 +129,15 @@ struct SpGEMMHelper
         return result;
     }
 
+    /**
+     * \brief Replicate all global rows of \p B in pinned host memory.
+     *
+     * In MPI builds, row lengths, values, and global column indices are
+     * gathered onto every rank. This is the correctness-first setup path.
+     *
+     * \param B Distributed right operand.
+     * \return Complete global CSR representation of \p B.
+     */
     static host_csr_type gather_global_rows (matrix_type const& B)
     {
         auto local = copy_local_global_csr(B);
@@ -184,6 +214,17 @@ struct SpGEMMHelper
 #endif
     }
 
+    /**
+     * \brief Form a local CSR product with portable device kernels.
+     *
+     * The method expands all scalar products, sorts each product row, and
+     * reduces entries with identical columns.
+     *
+     * \param hA Locally owned rows of the left operand.
+     * \param hB Complete global rows of the right operand.
+     * \param ncols Global number of product columns.
+     * \return Device-accessible local CSR rows of the product.
+     */
     static csr_type multiply (host_csr_type const& hA,
                               host_csr_type const& hB,
                               Long ncols)
@@ -329,6 +370,13 @@ struct SpGEMMHelper
     }
 
 private:
+    /**
+     * \brief Copy arbitrary CSR storage into pinned host CSR storage.
+     *
+     * \tparam V Source CSR vector template.
+     * \param dst Destination in pinned host memory.
+     * \param src Source CSR.
+     */
     template <template<typename> class V>
     static void copy_to_host (host_csr_type& dst, CSR<T,V> const& src)
     {
@@ -350,6 +398,12 @@ private:
 #endif
     }
 
+    /**
+     * \brief Copy pinned-host CSR storage into matrix-allocator storage.
+     *
+     * \param dst Destination CSR.
+     * \param src Source CSR in pinned host memory.
+     */
     static void copy_to_device (csr_type& dst, host_csr_type const& src)
     {
         dst.resize(src.nrows(), src.nnz);
@@ -378,6 +432,10 @@ private:
  *          partition.
  * \param B Right operand.
  * \param col_partition Column partition of the product.
+ * \return Distributed sparse matrix containing \f$AB\f$.
+ *
+ * \tparam T Floating-point matrix scalar type.
+ * \tparam Allocator Storage allocator shared by the operands and product.
  */
 template <typename T, template <typename> class Allocator>
 SpMatrix<T,Allocator>

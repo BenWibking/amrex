@@ -17,6 +17,11 @@ using namespace amrex;
 
 namespace {
 
+/**
+ * \brief Fill \p exact with the manufactured periodic solution.
+ *
+ * \param exact Distributed vector populated on its owning device.
+ */
 void
 fill_exact (AlgVector<Real>& exact)
 {
@@ -35,6 +40,14 @@ fill_exact (AlgVector<Real>& exact)
     });
 }
 
+/**
+ * \brief Recompute the unpreconditioned Euclidean residual norm.
+ *
+ * \param A Sparse system matrix.
+ * \param x Candidate solution.
+ * \param b Right-hand side.
+ * \return \f$\lVert b-Ax\rVert_2\f$.
+ */
 Real
 true_residual (SpMatrix<Real> const& A, AlgVector<Real> const& x,
                AlgVector<Real> const& b)
@@ -46,6 +59,13 @@ true_residual (SpMatrix<Real> const& A, AlgVector<Real> const& x,
 }
 
 #ifdef AMREX_USE_HYPRE
+/**
+ * \brief Evaluate the manufactured solution using HYPRE's scalar type.
+ *
+ * \param gid Global row index.
+ * \param n Global number of rows.
+ * \return Manufactured solution at \p gid.
+ */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 HYPRE_Real
 hypre_exact_value (Long gid, Long n) noexcept
@@ -59,6 +79,16 @@ hypre_exact_value (Long gid, Long n) noexcept
         + HYPRE_Real(0.125)*std::cos(HYPRE_Real(3.0)*phase);
 }
 
+/**
+ * \brief Assemble and solve the manufactured system with matched BoomerAMG
+ * controls.
+ *
+ * \param partition Distribution of matrix rows and vector entries.
+ * \param tolerance Relative BoomerAMG stopping tolerance.
+ * \param maximum_iterations Maximum number of BoomerAMG cycles.
+ * \param iterations Receives the number of completed BoomerAMG cycles.
+ * \return Distributed BoomerAMG solution.
+ */
 AlgVector<Real>
 solve_with_boomeramg (AlgPartition const& partition, Real tolerance,
                       int maximum_iterations, int& iterations)
@@ -204,6 +234,14 @@ solve_with_boomeramg (AlgPartition const& partition, Real tolerance,
 
 }
 
+/**
+ * \brief Exercise hierarchy setup, V-cycle application, stationary solution,
+ * GMRES preconditioning, and optional BoomerAMG parity.
+ *
+ * \param argc Command-line argument count.
+ * \param argv Command-line argument vector.
+ * \return Zero after all assertions pass.
+ */
 int
 main (int argc, char* argv[])
 {

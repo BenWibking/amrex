@@ -5,6 +5,13 @@
 
 using namespace amrex;
 
+/**
+ * \brief Verify rectangular distributed SpGEMM through matrix action.
+ *
+ * \param argc Command-line argument count.
+ * \param argv Command-line argument vector.
+ * \return Zero after the product-action assertion passes.
+ */
 int
 main (int argc, char* argv[])
 {
