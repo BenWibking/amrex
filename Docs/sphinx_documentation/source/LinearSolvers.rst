@@ -943,12 +943,18 @@ must contain exactly one positive diagonal entry:
    x.setVal(0.0);
    amg.solve(x, b, 1.e-10, 0.0, 100);
 
-The default options use a strength threshold of ``0.25``, untruncated
-interpolation, at most 25 levels, a dense coarse solve for at most 9 unknowns,
-and one L1-Jacobi sweep before and after coarse-grid correction.  The first
-implementation supports only this V(1,1) cycle.  Use
-:cpp:`AMG<T>::Options` to change the strength threshold, hierarchy limits, or
-deterministic PMIS seed before calling :cpp:`setup`.
+The default options match the BoomerAMG GPU profile with a strength threshold
+of ``0.25``, a maximum row sum of ``0.9``, and at most four interpolation
+entries per row.  Interpolation truncation retains the largest-magnitude
+entries and adjusts them to preserve the original row sum; set
+``max_interp_elements`` to zero to disable the cap.  The hierarchy has at most
+25 levels, uses a dense coarse solve for at most 9 unknowns, and applies one
+L1-Jacobi sweep before and after coarse-grid correction.  If PMIS does not
+reduce a larger level, or the level limit is reached first, that terminal
+level instead receives one zero-initialized L1-Jacobi sweep, matching
+BoomerAMG's setup termination behavior.  The first implementation supports
+only this V(1,1) cycle.  Use :cpp:`AMG<T>::Options` to change these controls or
+the deterministic PMIS seed before calling :cpp:`setup`.
 
 :cpp:`apply(z,r)` applies one fixed, zero-initialized V(1,1)-cycle and is
 suitable for use as a right preconditioner with :cpp:`GMRES_MV`:

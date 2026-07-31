@@ -35,8 +35,8 @@ struct AMGTestAccess;
  * A deliberately narrow classical algebraic multigrid implementation for
  * scalar elliptic matrices. It uses classical strength, deterministic PMIS
  * C/F splitting, matrix-based Extended+i interpolation, Galerkin coarsening,
- * L1-Jacobi smoothing, and a dense solve on the last (at most nine point)
- * level.
+ * L1-Jacobi smoothing, and either a dense solve on a last level of at most
+ * nine points or a terminal L1-Jacobi sweep when coarsening stops early.
  */
 /**
  * \brief Classical algebraic multigrid preconditioner for scalar elliptic
@@ -45,7 +45,7 @@ struct AMGTestAccess;
  * The hierarchy uses sign-based strength of connection, deterministic PMIS
  * C/F splitting, matrix-based Extended+i interpolation, transpose
  * restriction, Galerkin coarse operators, L1-Jacobi smoothing, and a dense
- * coarse solve.
+ * coarse solve when the terminal level has at most nine points.
  *
  * \tparam T Floating-point matrix and vector scalar type.
  */
@@ -61,6 +61,10 @@ public:
     struct Options {
         //! Classical strength-of-connection threshold in the interval (0,1].
         T strong_threshold = T(0.25);
+        //! Row-sum threshold above which every off-diagonal entry is weak.
+        T max_row_sum = T(0.9);
+        //! Maximum interpolation entries per row; zero disables the cap.
+        int max_interp_elements = 4;
         //! Maximum number of hierarchy levels, including the finest level.
         int max_levels = 25;
         //! Largest global level factored by the dense coarse solver.
@@ -252,6 +256,20 @@ private:
      * product.
      */
     void build_interpolation (Level& level);
+    /**
+     * \brief Retain the largest interpolation entries and preserve row sums.
+     *
+     * Entries are ranked by decreasing magnitude, with global column ID as a
+     * deterministic tie breaker. Each retained row is rescaled to the
+     * original row sum. If the retained entries cancel exactly, the row-sum
+     * correction is added to the first retained entry.
+     *
+     * \param source Sorted, duplicate-free interpolation rows.
+     * \param max_elements Maximum entries retained in each row.
+     * \return Truncated interpolation rows in sorted CSR form.
+     */
+    static csr_type truncate_interpolation (csr_type const& source,
+                                             int max_elements);
     //! Form and append the Galerkin coarse matrix below \p level.
     void build_next_level (Level& level);
     //! Gather, pad, and factor the globally coarsest matrix.
@@ -364,6 +382,8 @@ private:
     Vector<std::unique_ptr<Level>> m_levels;
     LUSolver<dense_coarse_size,T> m_coarse_solver;
     Long m_coarse_active_size = 0;
+    //! Whether the terminal level is small enough for the dense coarse solve.
+    bool m_use_dense_coarse_solve = true;
     bool m_is_setup = false;
     int m_last_iterations = 0;
     T m_last_residual_norm = std::numeric_limits<T>::infinity();
@@ -517,6 +537,7 @@ void AMG<T>::build_strength (Level& level)
     auto const* AMREX_RESTRICT acol = level.rows.col_index.data();
     auto const* AMREX_RESTRICT aval = level.rows.mat.data();
     T const theta = m_options.strong_threshold;
+    T const max_row_sum = m_options.max_row_sum;
 
     Gpu::DeviceVector<Long> counts(nrows);
     auto* AMREX_RESTRICT pcounts = counts.data();
@@ -524,13 +545,20 @@ void AMG<T>::build_strength (Level& level)
     {
         auto const global_row = i + row_begin;
         T row_max = T(0);
+        T diagonal = T(0);
+        T row_sum = T(0);
         for (Long p = arow[i]; p < arow[i+1]; ++p) {
-            if (acol[p] != global_row) {
+            row_sum += aval[p];
+            if (acol[p] == global_row) {
+                diagonal = aval[p];
+            } else {
                 row_max = amrex::max(row_max, -aval[p]);
             }
         }
         Long count = 0;
-        if (row_max > T(0)) {
+        bool const all_weak = max_row_sum < T(1)
+            && Math::abs(row_sum) > Math::abs(diagonal)*max_row_sum;
+        if (!all_weak && row_max > T(0)) {
             T const threshold = theta*row_max;
             for (Long p = arow[i]; p < arow[i+1]; ++p) {
                 count += (acol[p] != global_row && -aval[p] >= threshold);
@@ -565,13 +593,20 @@ void AMG<T>::build_strength (Level& level)
         }
         auto const global_row = i + row_begin;
         T row_max = T(0);
+        T diagonal = T(0);
+        T row_sum = T(0);
         for (Long p = arow[i]; p < arow[i+1]; ++p) {
-            if (acol[p] != global_row) {
+            row_sum += aval[p];
+            if (acol[p] == global_row) {
+                diagonal = aval[p];
+            } else {
                 row_max = amrex::max(row_max, -aval[p]);
             }
         }
         Long out = grow[i];
-        if (row_max > T(0)) {
+        bool const all_weak = max_row_sum < T(1)
+            && Math::abs(row_sum) > Math::abs(diagonal)*max_row_sum;
+        if (!all_weak && row_max > T(0)) {
             T const threshold = theta*row_max;
             for (Long p = arow[i]; p < arow[i+1]; ++p) {
                 if (acol[p] != global_row && -aval[p] >= threshold) {
@@ -811,6 +846,90 @@ void AMG<T>::split_pmis (Level& level)
             ? coarse_begin + scan[i] : Long(-1);
     });
     Gpu::streamSynchronize();
+}
+
+template <typename T>
+auto AMG<T>::truncate_interpolation (csr_type const& source,
+                                     int max_elements) -> csr_type
+{
+    AMREX_ALWAYS_ASSERT(max_elements > 0);
+    Long const nrows = source.nrows();
+    auto const* AMREX_RESTRICT source_row = source.row_offset.data();
+    auto const* AMREX_RESTRICT source_col = source.col_index.data();
+    auto const* AMREX_RESTRICT source_val = source.mat.data();
+
+    Gpu::DeviceVector<Long> entry_rank(source.nnz);
+    Gpu::DeviceVector<Long> retained_counts(nrows);
+    auto* AMREX_RESTRICT ranks = entry_rank.data();
+    auto* AMREX_RESTRICT counts = retained_counts.data();
+    ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
+    {
+        Long retained = 0;
+        for (Long p = source_row[i]; p < source_row[i+1]; ++p) {
+            T const magnitude = Math::abs(source_val[p]);
+            Long rank = 0;
+            for (Long q = source_row[i]; q < source_row[i+1]; ++q) {
+                T const other_magnitude = Math::abs(source_val[q]);
+                rank += other_magnitude > magnitude
+                    || (other_magnitude == magnitude
+                        && source_col[q] < source_col[p]);
+            }
+            ranks[p] = rank;
+            retained += rank < max_elements;
+        }
+        counts[i] = retained;
+    });
+
+    csr_type result;
+    result.row_offset.resize(nrows+1);
+    auto* AMREX_RESTRICT result_row = result.row_offset.data();
+    Long const retained_nnz = Scan::PrefixSum<Long>(
+        nrows,
+        [=] AMREX_GPU_DEVICE (Long i) noexcept -> Long {
+            return counts[i];
+        },
+        [=] AMREX_GPU_DEVICE (Long i, Long offset) noexcept {
+            result_row[i] = offset;
+        },
+        Scan::Type::exclusive, Scan::retSum);
+    result.nnz = retained_nnz;
+    result.mat.resize(retained_nnz);
+    result.col_index.resize(retained_nnz);
+    auto* AMREX_RESTRICT result_val = result.mat.data();
+    auto* AMREX_RESTRICT result_col = result.col_index.data();
+
+    ParallelFor(nrows+1, [=] AMREX_GPU_DEVICE (Long i) noexcept
+    {
+        if (i == nrows) {
+            result_row[nrows] = retained_nnz;
+            return;
+        }
+
+        T original_sum = T(0);
+        T retained_sum = T(0);
+        for (Long p = source_row[i]; p < source_row[i+1]; ++p) {
+            original_sum += source_val[p];
+            if (ranks[p] < max_elements) {
+                retained_sum += source_val[p];
+            }
+        }
+        T const scale = retained_sum != T(0)
+            ? original_sum/retained_sum : T(1);
+        T const correction = retained_sum == T(0)
+            ? original_sum : T(0);
+
+        Long out = result_row[i];
+        for (Long p = source_row[i]; p < source_row[i+1]; ++p) {
+            if (ranks[p] < max_elements) {
+                result_col[out] = source_col[p];
+                result_val[out] = scale*source_val[p]
+                    + (out == result_row[i] ? correction : T(0));
+                ++out;
+            }
+        }
+    });
+    Gpu::streamSynchronize();
+    return result;
 }
 
 template <typename T>
@@ -1078,9 +1197,17 @@ void AMG<T>::build_interpolation (Level& level)
         partition, partition, std::move(scaled_ff));
     matrix_type strong_fc_matrix(
         partition, level.coarse_partition, std::move(strong_fc));
-    level.P = std::make_unique<matrix_type>(
-        SpGEMM(scaled_ff_matrix, strong_fc_matrix,
-               level.coarse_partition));
+    auto interpolation = SpGEMM(
+        scaled_ff_matrix, strong_fc_matrix, level.coarse_partition);
+    if (m_options.max_interp_elements > 0) {
+        AMREX_ALWAYS_ASSERT(!interpolation.m_split);
+        auto truncated = truncate_interpolation(
+            interpolation.m_csr, m_options.max_interp_elements);
+        level.P = std::make_unique<matrix_type>(
+            partition, level.coarse_partition, std::move(truncated));
+    } else {
+        level.P = std::make_unique<matrix_type>(std::move(interpolation));
+    }
     level.R = std::make_unique<matrix_type>(
         transpose(*level.P, level.coarse_partition));
 }
@@ -1275,6 +1402,13 @@ void AMG<T>::setup ()
         && m_options.strong_threshold <= T(1),
         "AMG strong_threshold must be in (0,1]");
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        m_options.max_row_sum > T(0)
+        && m_options.max_row_sum <= T(1),
+        "AMG max_row_sum must be in (0,1]");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        m_options.max_interp_elements >= 0,
+        "AMG max_interp_elements must be nonnegative");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_options.max_levels > 0,
         "AMG max_levels must be positive");
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -1286,6 +1420,8 @@ void AMG<T>::setup ()
         "The first AMG implementation supports only V(1,1)");
 
     m_is_setup = false;
+    m_use_dense_coarse_solve = true;
+    m_coarse_active_size = 0;
     m_levels.clear();
     auto fine_level = std::make_unique<Level>();
     fine_level->A = &m_fine_matrix;
@@ -1298,22 +1434,29 @@ void AMG<T>::setup ()
         if (fine_size <= m_options.max_coarse_size) {
             break;
         }
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-            ilev+1 < m_options.max_levels,
-            "AMG reached max_levels before the dense coarse threshold");
+        if (ilev+1 >= m_options.max_levels) {
+            m_use_dense_coarse_solve = false;
+            break;
+        }
 
         build_strength(level);
         split_pmis(level);
         Long const coarse_size =
             level.coarse_partition.numGlobalRows();
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-            coarse_size > 0 && coarse_size < fine_size,
-            "AMG PMIS did not reduce the global problem size");
+            coarse_size > 0 && coarse_size <= fine_size,
+            "AMG PMIS produced an invalid global coarse size");
+        if (coarse_size == fine_size) {
+            m_use_dense_coarse_solve = false;
+            break;
+        }
         build_interpolation(level);
         build_next_level(level);
     }
 
-    factor_coarse_matrix();
+    if (m_use_dense_coarse_solve) {
+        factor_coarse_matrix();
+    }
     m_is_setup = true;
     update_diagnostics(amrex::second()-setup_start);
 }
@@ -1352,7 +1495,11 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
 {
     auto& level = *m_levels[ilev];
     if (ilev+1 == static_cast<int>(m_levels.size())) {
-        solve_coarse(x, b);
+        if (m_use_dense_coarse_solve) {
+            solve_coarse(x, b);
+        } else {
+            level.smoother->sweep(x, b, level.work, true);
+        }
         return;
     }
 

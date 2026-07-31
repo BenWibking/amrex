@@ -29,7 +29,19 @@ struct AMGTestAccess
 {
     using amg_type = AMG<T>;
     using level_type = typename amg_type::Level;
+    using csr_type = typename amg_type::csr_type;
     using host_csr_type = typename amg_type::host_csr_type;
+
+    static host_csr_type truncate_interpolation (
+        host_csr_type const& source, int max_elements)
+    {
+        csr_type device_source = amg_type::copy_to_device(source);
+        csr_type device_result = amg_type::truncate_interpolation(
+            device_source, max_elements);
+        host_csr_type result;
+        duplicateCSR(Gpu::deviceToHost, result, device_result);
+        return result;
+    }
 
     static level_type& prepare_strength (amg_type& amg)
     {
@@ -410,6 +422,71 @@ test_strength_threshold ()
     }
 }
 
+/** Verify BoomerAMG's default diagonally dominant all-weak-row rule. */
+void
+test_strength_max_row_sum ()
+{
+    auto A = make_square_matrix(
+        3, [] (Long row) -> Entries
+        {
+            if (row == 0) {
+                return {{0, Real(4)}, {1, Real(-0.2)},
+                        {2, Real(-0.1)}};
+            }
+            return {{row, Real(4)}, {0, Real(-1)}};
+        });
+
+    AMG<Real> default_amg(A);
+    AMGTestAccess<Real>::prepare_strength(default_amg);
+    auto default_graph =
+        AMGTestAccess<Real>::local_strength(default_amg);
+    Long const begin = A.globalRowBegin();
+    if (begin == 0 && A.numLocalRows() > 0) {
+        AMREX_ALWAYS_ASSERT(
+            default_graph.row_offset[1]-default_graph.row_offset[0] == 0);
+    }
+
+    AMG<Real>::Options options;
+    options.max_row_sum = Real(1);
+    AMG<Real> disabled_amg(A, options);
+    AMGTestAccess<Real>::prepare_strength(disabled_amg);
+    auto disabled_graph =
+        AMGTestAccess<Real>::local_strength(disabled_amg);
+    if (begin == 0 && A.numLocalRows() > 0) {
+        Vector<Long> columns;
+        for (Long p = disabled_graph.row_offset[0];
+             p < disabled_graph.row_offset[1]; ++p)
+        {
+            columns.push_back(disabled_graph.col_index[p]);
+        }
+        AMREX_ALWAYS_ASSERT(columns == Vector<Long>({1,2}));
+    }
+}
+
+/** Verify that an all-weak graph terminates with one L1-Jacobi sweep. */
+void
+test_all_weak_terminal_level ()
+{
+    auto A = make_square_matrix(
+        10, [] (Long row) -> Entries
+        {
+            return {{row, Real(2)}};
+        });
+    AMG<Real> amg(A);
+    amg.setup();
+    AMREX_ALWAYS_ASSERT(amg.numLevels() == 1);
+
+    AlgVector<Real> b(A.partition());
+    AlgVector<Real> x(A.partition());
+    b.setVal(Real(1));
+    amg.apply(x, b);
+    auto local_x = copy_to_host(x);
+    for (Real const value : local_x) {
+        AMREX_ALWAYS_ASSERT(
+            std::abs(value-Real(0.5)) < unit_tolerance());
+    }
+}
+
 void
 test_distributed_transpose_trailing_empty_row ()
 {
@@ -601,6 +678,83 @@ test_extended_plus_i_interpolation ()
                 std::abs(rows.mat[p]-value) < unit_tolerance());
         }
     }
+}
+
+/** Verify four-entry interpolation truncation and row-sum preservation. */
+void
+test_interpolation_truncation ()
+{
+    auto A = make_square_matrix(
+        6, [] (Long row) -> Entries
+        {
+            Entries result{{row, row == 0 ? Real(15) : Real(1)}};
+            if (row == 0) {
+                for (Long column = 1; column < 6; ++column) {
+                    result.emplace_back(column, -Real(column));
+                }
+            }
+            return result;
+        });
+    Vector<int> markers{
+        AMGTestAccess<Real>::fine_marker(),
+        AMGTestAccess<Real>::coarse_marker(),
+        AMGTestAccess<Real>::coarse_marker(),
+        AMGTestAccess<Real>::coarse_marker(),
+        AMGTestAccess<Real>::coarse_marker(),
+        AMGTestAccess<Real>::coarse_marker()};
+
+    AMG<Real>::Options options;
+    options.strong_threshold = Real(0.2);
+    AMG<Real> amg(A, options);
+    AMGTestAccess<Real>::prepare_interpolation(amg, markers);
+    auto rows =
+        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+            AMGTestAccess<Real>::interpolation(amg));
+
+    Long const begin = A.globalRowBegin();
+    if (begin == 0 && A.numLocalRows() > 0) {
+        AMREX_ALWAYS_ASSERT(rows.row_offset[1]-rows.row_offset[0] == 4);
+        Real row_sum = Real(0);
+        for (Long p = rows.row_offset[0]; p < rows.row_offset[1]; ++p) {
+            Long const retained_weight = rows.col_index[p]+1;
+            AMREX_ALWAYS_ASSERT(rows.col_index[p] >= 1);
+            AMREX_ALWAYS_ASSERT(rows.col_index[p] <= 4);
+            AMREX_ALWAYS_ASSERT(
+                std::abs(rows.mat[p]-Real(retained_weight)/Real(14))
+                < unit_tolerance());
+            row_sum += rows.mat[p];
+        }
+        AMREX_ALWAYS_ASSERT(
+            std::abs(row_sum-Real(1)) < unit_tolerance());
+    }
+
+    options.max_interp_elements = 0;
+    AMG<Real> untruncated_amg(A, options);
+    AMGTestAccess<Real>::prepare_interpolation(untruncated_amg, markers);
+    auto untruncated =
+        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+            AMGTestAccess<Real>::interpolation(untruncated_amg));
+    if (begin == 0 && A.numLocalRows() > 0) {
+        AMREX_ALWAYS_ASSERT(
+            untruncated.row_offset[1]-untruncated.row_offset[0] == 5);
+    }
+
+    using host_csr_type = AMGTestAccess<Real>::host_csr_type;
+    host_csr_type cancelling_row;
+    cancelling_row.row_offset = {0, 5};
+    cancelling_row.col_index = {0, 1, 2, 3, 4};
+    cancelling_row.mat = {Real(4), Real(3), Real(-4), Real(-3), Real(1)};
+    cancelling_row.nnz = 5;
+    auto cancellation_result =
+        AMGTestAccess<Real>::truncate_interpolation(cancelling_row, 4);
+    AMREX_ALWAYS_ASSERT(cancellation_result.nnz == 4);
+    Real cancellation_sum = Real(0);
+    for (Long p = 0; p < cancellation_result.nnz; ++p) {
+        AMREX_ALWAYS_ASSERT(cancellation_result.col_index[p] == p);
+        cancellation_sum += cancellation_result.mat[p];
+    }
+    AMREX_ALWAYS_ASSERT(
+        std::abs(cancellation_sum-Real(1)) < unit_tolerance());
 }
 
 void
@@ -883,9 +1037,10 @@ solve_with_boomeramg (SpMatrix<Real> const& A,
 
     AMREX_ALWAYS_ASSERT(HYPRE_BoomerAMGCreate(&solver) == 0);
     HYPRE_BoomerAMGSetStrongThreshold(solver, HYPRE_Real(0.25));
+    HYPRE_BoomerAMGSetMaxRowSum(solver, HYPRE_Real(0.9));
     HYPRE_BoomerAMGSetCoarsenType(solver, 8);
     HYPRE_BoomerAMGSetInterpType(solver, 6);
-    HYPRE_BoomerAMGSetPMaxElmts(solver, 0);
+    HYPRE_BoomerAMGSetPMaxElmts(solver, 4);
     HYPRE_BoomerAMGSetTruncFactor(solver, HYPRE_Real(0));
     HYPRE_BoomerAMGSetAggNumLevels(solver, 0);
     HYPRE_BoomerAMGSetCycleType(solver, 1);
@@ -1038,10 +1193,13 @@ main (int argc, char* argv[])
     amrex::Initialize(argc, argv);
 
     test_strength_threshold();
+    test_strength_max_row_sum();
+    test_all_weak_terminal_level();
     test_distributed_transpose_trailing_empty_row();
     test_pmis_and_numbering();
     test_directed_pmis_rounds();
     test_extended_plus_i_interpolation();
+    test_interpolation_truncation();
     test_interpolation_restriction_and_galerkin();
     test_l1_jacobi();
     test_all_coarse_sizes();
