@@ -123,6 +123,7 @@ if (AMReX_TEST_TYPE STREQUAL "Small")
 
    if (AMReX_LINEAR_SOLVERS)
       add_subdirectory("Algebra/AMG")
+      add_subdirectory("Algebra/FLD")
       add_subdirectory("Algebra/SpGEMM")
       add_subdirectory("LinearSolvers/ABecLaplacian_C")
    endif()

@@ -5,6 +5,7 @@
 #include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_Math.H>
 #include <AMReX_SpGEMM.H>
+#include <AMReX_SpMatUtil.H>
 #include <AMReX_SpMV.H>
 
 #ifdef AMREX_USE_HYPRE
@@ -407,6 +408,47 @@ test_strength_threshold ()
         AMREX_ALWAYS_ASSERT(
             columns == Vector<Long>({1,2}));
     }
+}
+
+void
+test_distributed_transpose_trailing_empty_row ()
+{
+#ifdef AMREX_USE_MPI
+    int const nprocs = ParallelDescriptor::NProcs();
+    if (nprocs < 2) {
+        return;
+    }
+
+    Vector<Long> offsets(nprocs+1);
+    for (int rank = 0; rank <= nprocs; ++rank) {
+        offsets[rank] = Long(2)*rank;
+    }
+    AlgPartition partition(std::move(offsets));
+    int const rank = ParallelDescriptor::MyProc();
+    Long const begin = partition[rank];
+    Long const remote_row = partition[(rank+1)%nprocs];
+    auto A = make_matrix(
+        partition, partition,
+        [=] (Long row) -> Entries
+        {
+            return (row == begin)
+                ? Entries{{remote_row, Real(1)}}
+                : Entries{};
+        });
+
+    auto AT = amrex::transpose(A, partition);
+    auto rows =
+        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(AT);
+    Long const expected_column =
+        partition[(rank+nprocs-1)%nprocs];
+    AMREX_ALWAYS_ASSERT(rows.nnz == 1);
+    AMREX_ALWAYS_ASSERT(rows.row_offset.size() == 3);
+    AMREX_ALWAYS_ASSERT(rows.row_offset[0] == 0);
+    AMREX_ALWAYS_ASSERT(rows.row_offset[1] == 1);
+    AMREX_ALWAYS_ASSERT(rows.row_offset[2] == 1);
+    AMREX_ALWAYS_ASSERT(rows.col_index[0] == expected_column);
+    AMREX_ALWAYS_ASSERT(rows.mat[0] == Real(1));
+#endif
 }
 
 SpMatrix<Real>
@@ -941,6 +983,7 @@ main (int argc, char* argv[])
     amrex::Initialize(argc, argv);
 
     test_strength_threshold();
+    test_distributed_transpose_trailing_empty_row();
     test_pmis_and_numbering();
     test_directed_pmis_rounds();
     test_interpolation_restriction_and_galerkin();
@@ -965,8 +1008,8 @@ main (int argc, char* argv[])
         "2-D anisotropic diffusion", anisotropic);
 
     amrex::Print()
-        << "AMG strength, PMIS, numbering, interpolation, restriction, "
-        << "Galerkin, smoother, coarse-solve, manufactured-solution, "
-        << "and diagnostics tests passed\n";
+        << "AMG strength, distributed transpose, PMIS, numbering, "
+        << "interpolation, restriction, Galerkin, smoother, coarse-solve, "
+        << "manufactured-solution, and diagnostics tests passed\n";
     amrex::Finalize();
 }
