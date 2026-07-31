@@ -1,0 +1,782 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{mathtools}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\set}[1]{\left\{ #1 \right\}}
+\newcommand{\trans}{^{\mathsf T}}
+\newcommand{\level}{\ell}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\sgn}{sgn}
+\DeclareMathOperator{\nnz}{nnz}
+
+\title{A Minimal PMIS--Extended+i--L1-Jacobi\\
+       Algebraic Multigrid Method for AMReX}
+\author{AMReX Design Note}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This note specifies the equations for a minimal, classical C/F algebraic
+multigrid solver built on AMReX distributed sparse-matrix infrastructure.  The
+method uses classical strength of connection with the maximum-row-sum rule,
+parallel modified independent set (PMIS) coarsening, matrix-based Extended+i
+interpolation capped at four entries per row, transpose restriction, Galerkin
+coarse operators, L1-Jacobi smoothing, a multiplicative V(1,1)-cycle, and a
+small dense LU coarse solve or a terminal L1-Jacobi sweep when setup stops
+early.  It is intended to accompany
+\texttt{AMG\_BoomerAMGLite\_Plan.md}.  The comparison profile corresponds to
+BoomerAMG coarsening type 8, interpolation type 6, and relaxation type 18; it
+does not use aggregation.
+\end{abstract}
+
+\tableofcontents
+
+\section{Linear System and Hierarchy}
+
+Let the fine-level problem be
+\begin{equation}
+  A_0 x_0 = b_0,
+  \qquad
+  A_0 \in \R^{n_0\times n_0},
+  \qquad
+  x_0,b_0\in\R^{n_0}.
+  \label{eq:fine-system}
+\end{equation}
+Level indices increase as the problem is coarsened:
+\begin{equation}
+  n_0 > n_1 > \cdots > n_L,
+  \qquad
+  A_\level\in\R^{n_\level\times n_\level}.
+  \label{eq:level-sizes}
+\end{equation}
+The first implementation assumes that every $A_\level$ is square, nonsingular,
+and has a nonzero diagonal.  Its principal target is a scalar elliptic matrix
+with
+\begin{equation}
+  a_{ii}>0,
+  \qquad
+  a_{ij}\leq 0 \quad (i\neq j),
+  \label{eq:m-matrix-sign}
+\end{equation}
+although the sign-separated interpolation equations below admit mixed
+off-diagonal signs.
+
+On MPI rank $p$, the global row interval is described by a prefix partition
+\begin{equation}
+  \mathcal I_p =
+  \set{r_p,r_p+1,\ldots,r_{p+1}-1},
+  \qquad
+  0=r_0\leq r_1\leq\cdots\leq r_{N_p}=n_\level.
+  \label{eq:row-partition}
+\end{equation}
+The sparse matrix is split into locally owned and off-rank columns,
+\begin{equation}
+  A_\level =
+  \begin{bmatrix}
+    A_\level^{\mathrm{loc}} &
+    A_\level^{\mathrm{off}}
+  \end{bmatrix},
+  \label{eq:parcsr-split}
+\end{equation}
+with a cached halo exchange supplying vector values addressed by
+$A_\level^{\mathrm{off}}$.
+
+\section{Step 1: Classical Strength of Connection}
+
+For each off-diagonal entry in row $i$, define its sign-adjusted coupling
+\begin{equation}
+  q_{ij} = -\sgn(a_{ii})a_{ij},
+  \qquad j\neq i,
+  \label{eq:sign-adjusted-coupling}
+\end{equation}
+and the largest opposite-sign coupling
+\begin{equation}
+  m_i = \max_{k\neq i}\max(q_{ik},0).
+  \label{eq:row-strength-scale}
+\end{equation}
+Let the diagonal-inclusive row sum be
+\begin{equation}
+  r_i=\sum_j a_{ij}.
+  \label{eq:matrix-row-sum}
+\end{equation}
+Given a strength threshold $\theta\in(0,1]$ and maximum-row-sum parameter
+$\rho\in(0,1]$, row $i$ strongly depends on column $j$ when
+\begin{equation}
+  S_{ij} =
+  \begin{cases}
+    1, & q_{ij}\geq\theta m_i,\quad m_i>0,\quad j\neq i,
+         \quad \abs{r_i}\leq\rho\abs{a_{ii}},\\
+    0, & \text{otherwise}.
+  \end{cases}
+  \label{eq:strength-definition}
+\end{equation}
+The default profile uses
+\begin{equation}
+  \theta=0.25,
+  \qquad
+  \rho=0.9.
+  \label{eq:strength-threshold}
+\end{equation}
+Thus every off-diagonal entry is weak when
+$\abs{r_i}>0.9\abs{a_{ii}}$.  The implementation treats $\rho=1$ as disabling
+this all-weak-row rule.
+For the positive-diagonal M-matrix case in
+\eqref{eq:m-matrix-sign}, this reduces to
+\begin{equation}
+  -a_{ij}
+  \geq
+  \theta\max_{k\neq i}(-a_{ik}).
+  \label{eq:m-matrix-strength}
+\end{equation}
+
+Only indices satisfying $S_{ij}=1$ are stored.  Thus the strength graph has no
+numerical zero entries and no diagonal:
+\begin{equation}
+  \nnz(S)
+  =
+  \abs{\set{(i,j):S_{ij}=1}},
+  \qquad
+  S_{ii}=0.
+  \label{eq:compact-strength}
+\end{equation}
+
+\section{Step 2: PMIS Priorities}
+
+The influence measure for point $i$ is the number of equations that strongly
+depend on it:
+\begin{equation}
+  \mu_i
+  =
+  \sum_k S_{ki}
+  =
+  (S\trans\mathbf 1)_i.
+  \label{eq:influence-measure}
+\end{equation}
+This is obtained in the prototype design by constructing $S\trans$ and taking
+its row sum.
+
+Let $g_i$ be the global row ID and let
+\begin{equation}
+  h(g_i,s)\in\set{0,1,\ldots,2^{64}-1}
+  \label{eq:hash-range}
+\end{equation}
+be a deterministic hash with seed $s$.  Convert it to a fractional tie-breaker
+\begin{equation}
+  u_i
+  =
+  \frac{h(g_i,s)+\tfrac12}{2^{64}},
+  \qquad
+  0<u_i<1,
+  \label{eq:priority-fraction}
+\end{equation}
+and define the PMIS priority
+\begin{equation}
+  \pi_i=\mu_i+u_i.
+  \label{eq:pmis-priority}
+\end{equation}
+The integer part favors highly influential variables, while the fractional
+part establishes a deterministic total ordering.  A final lexicographic
+comparison with $g_i$ resolves the exceptional case of a hash collision:
+\begin{equation}
+  (\pi_i,g_i)>_{\mathrm{lex}}(\pi_j,g_j).
+  \label{eq:lexicographic-priority}
+\end{equation}
+
+\section{Step 3: PMIS C/F Splitting}
+
+Let $\mathcal U^{(t)}$ be the undecided set at PMIS round $t$.  Define a
+conflict neighborhood from the directed strength graph by
+\begin{equation}
+  \mathcal N_i^{\mathrm{conf}}
+  =
+  \set{j:S_{ij}=1\ \text{or}\ S_{ji}=1}.
+  \label{eq:conflict-neighborhood}
+\end{equation}
+The independent coarse candidates in round $t$ are
+\begin{equation}
+  \mathcal C^{(t)}
+  =
+  \set{
+    i\in\mathcal U^{(t)}:
+    (\pi_i,g_i)>_{\mathrm{lex}}(\pi_j,g_j)
+    \ \forall j\in
+    \mathcal N_i^{\mathrm{conf}}\cap\mathcal U^{(t)}
+  }.
+  \label{eq:round-coarse-set}
+\end{equation}
+An undecided point becomes fine if it strongly depends on a newly selected
+coarse point:
+\begin{equation}
+  \mathcal F^{(t)}
+  =
+  \set{
+    i\in\mathcal U^{(t)}\setminus\mathcal C^{(t)}:
+    \exists c\in\mathcal C^{(t)}
+    \text{ such that }S_{ic}=1
+  }.
+  \label{eq:round-fine-set}
+\end{equation}
+The active set update is
+\begin{equation}
+  \mathcal U^{(t+1)}
+  =
+  \mathcal U^{(t)}
+  \setminus
+  \left(\mathcal C^{(t)}\cup\mathcal F^{(t)}\right).
+  \label{eq:active-set-update}
+\end{equation}
+The process stops when the global undecided count is zero:
+\begin{equation}
+  \sum_{p=0}^{N_p-1}
+  \abs{\mathcal U_p^{(t)}}=0.
+  \label{eq:pmis-termination}
+\end{equation}
+
+The final splitting is
+\begin{equation}
+  \mathcal C=\bigcup_t\mathcal C^{(t)},
+  \qquad
+  \mathcal F=\bigcup_t\mathcal F^{(t)},
+  \qquad
+  \mathcal C\cap\mathcal F=\varnothing,
+  \qquad
+  \mathcal C\cup\mathcal F=\set{0,\ldots,n_\level-1}.
+  \label{eq:final-splitting}
+\end{equation}
+Isolated points are promoted to $\mathcal C$.  No aggregate mapping is
+constructed.
+
+The per-round independent-set invariant and the final interpolation-coverage
+invariant are
+\begin{align}
+  &\text{round independence:}
+  & i,j\in\mathcal C^{(t)},\ i\neq j
+  &\Longrightarrow
+  j\notin\mathcal N_i^{\mathrm{conf}},
+  \label{eq:round-coarse-independence}\\
+  &\text{interpolation coverage:}
+  & i\in\mathcal F
+  &\Longrightarrow
+  \exists c\in\mathcal C\text{ with }S_{ic}=1.
+  \label{eq:fine-coverage}
+\end{align}
+Because fine points are removed only when they strongly depend on a new coarse
+point, a later PMIS round can select a point joined to an earlier coarse point
+by an edge in the opposite direction.  The final coarse set therefore need
+not be independent in the symmetrized strength graph.
+
+\section{Step 4: Distributed Coarse Numbering}
+
+Let rank $p$ own $n_{\level,p}$ fine rows.  Its local number of coarse points
+is
+\begin{equation}
+  n_{\level+1,p}
+  =
+  \sum_{i\in\mathcal I_p}
+  \chi_{\mathcal C}(i),
+  \label{eq:local-coarse-count}
+\end{equation}
+where $\chi_{\mathcal C}$ is the indicator of the coarse set.  The rank's
+global coarse offset is
+\begin{equation}
+  o_{\level+1,p}
+  =
+  \sum_{q=0}^{p-1}n_{\level+1,q},
+  \label{eq:coarse-rank-offset}
+\end{equation}
+and the next global problem size is
+\begin{equation}
+  n_{\level+1}
+  =
+  \sum_{p=0}^{N_p-1}n_{\level+1,p}.
+  \label{eq:global-coarse-count}
+\end{equation}
+
+For a locally owned coarse point $i$, its global coarse ID is
+\begin{equation}
+  I_c(i)
+  =
+  o_{\level+1,p}
+  +
+  \sum_{\substack{k\in\mathcal I_p\\k<i}}
+  \chi_{\mathcal C}(k).
+  \label{eq:coarse-id}
+\end{equation}
+The second term is a device exclusive scan.  Values $I_c(i)$ needed by
+off-rank interpolation rows are exchanged as integer fields.
+
+\section{Step 5: Matrix-Based Extended+i Interpolation}
+
+The interpolation operator has dimensions
+\begin{equation}
+  P_\level\in\R^{n_\level\times n_{\level+1}}.
+  \label{eq:p-dimensions}
+\end{equation}
+For a coarse point, interpolation is injection:
+\begin{equation}
+  (P_\level)_{i,I_c(i)}=1,
+  \qquad
+  (P_\level)_{i,k}=0\quad(k\neq I_c(i)),
+  \qquad i\in\mathcal C.
+  \label{eq:coarse-interpolation-row}
+\end{equation}
+
+For a fine point, define its strong coarse and strong fine neighborhoods
+\begin{equation}
+  \mathcal C_i^s
+  =
+  \set{j\in\mathcal C:S_{ij}=1},
+  \qquad
+  \mathcal F_i^s
+  =
+  \set{j\in\mathcal F:S_{ij}=1}.
+  \label{eq:strong-coarse-neighborhood}
+\end{equation}
+The diagonal and weak connections contribute
+\begin{equation}
+  w_i
+  =
+  a_{ii}
+  +
+  \sum_{\substack{j\neq i\\S_{ij}=0}}a_{ij},
+  \label{eq:weak-diagonal-sum}
+\end{equation}
+while the strong-coarse row sum is
+\begin{equation}
+  \gamma_i
+  =
+  \sum_{c\in\mathcal C_i^s}a_{ic}.
+  \label{eq:strong-coarse-sum}
+\end{equation}
+For a strong fine connection $j\in\mathcal F_i^s$, define
+\begin{equation}
+  \delta_{ij}=\gamma_j+a_{ji},
+  \qquad
+  q_{ij}
+  =
+  \begin{cases}
+    a_{ij}/\delta_{ij}, & \delta_{ij}\neq0,\\
+    0,                  & \delta_{ij}=0.
+  \end{cases}
+  \label{eq:extended-i-fine-scale}
+\end{equation}
+The Extended+i row denominator is
+\begin{equation}
+  \eta_i
+  =
+  w_i
+  +
+  \sum_{j\in\mathcal F_i^s}
+  \begin{cases}
+    a_{ji}q_{ij}, & \delta_{ij}\neq0,\\
+    a_{ij},       & \delta_{ij}=0.
+  \end{cases}
+  \label{eq:extended-i-row-denominator}
+\end{equation}
+Define a scaled fine-fine matrix $M_{FF}$ by
+\begin{equation}
+  (M_{FF})_{ij}
+  =
+  \begin{cases}
+    -1/\eta_i,      & j=i,\\
+    -q_{ij}/\eta_i, & j\in\mathcal F_i^s,\\
+    0,              & \text{otherwise},
+  \end{cases}
+  \qquad i\in\mathcal F.
+  \label{eq:scaled-ff}
+\end{equation}
+If $A_{FC}^s$ contains the strong fine-to-coarse entries, the fine block of
+the untruncated interpolation operator is the sparse product
+\begin{equation}
+  P_F=M_{FF}A_{FC}^s.
+  \label{eq:extended-i-product}
+\end{equation}
+Coarse rows are represented by identity rows in both factors, so the product
+also gives the injection rows in \eqref{eq:coarse-interpolation-row}.
+
+After forming the product, let $K_i$ contain at most the four entries of row
+$i$ with largest magnitude, breaking equal-magnitude ties by global coarse
+column ID, and let $j_i^*$ be the first retained column in sorted CSR order.
+With
+\begin{equation}
+  s_i=\sum_j(P_\level)_{ij},
+  \qquad
+  \widehat s_i=\sum_{j\in K_i}(P_\level)_{ij},
+  \label{eq:truncation-row-sums}
+\end{equation}
+the stored interpolation entries are
+\begin{equation}
+  (\widehat P_\level)_{ij}
+  =
+  \begin{cases}
+    \dfrac{s_i}{\widehat s_i}(P_\level)_{ij},
+      & j\in K_i,\quad \widehat s_i\neq0,\\[2mm]
+    (P_\level)_{ij}+s_i,
+      & j=j_i^*,\quad \widehat s_i=0,\\
+    (P_\level)_{ij},
+      & j\in K_i\setminus\set{j_i^*},\quad \widehat s_i=0,\\
+    0, & j\notin K_i.
+  \end{cases}
+  \label{eq:interpolation-truncation}
+\end{equation}
+Thus truncation preserves the original row sum.  If the retained entries
+cancel exactly but $s_i\neq0$, the implementation adds $s_i$ to the first
+retained entry.  A configured cap of zero disables truncation.
+
+\section{Step 6: Restriction and Galerkin Coarsening}
+
+Restriction is the transpose of interpolation:
+\begin{equation}
+  R_\level=P_\level\trans
+  \in\R^{n_{\level+1}\times n_\level}.
+  \label{eq:transpose-restriction}
+\end{equation}
+The coarse operator is Galerkin:
+\begin{equation}
+  A_{\level+1}
+  =
+  R_\level A_\level P_\level
+  =
+  P_\level\trans A_\level P_\level.
+  \label{eq:galerkin-operator}
+\end{equation}
+It is formed with two distributed sparse products:
+\begin{equation}
+  B_\level=A_\level P_\level,
+  \qquad
+  A_{\level+1}=R_\level B_\level.
+  \label{eq:two-stage-rap}
+\end{equation}
+The action identity used by tests is
+\begin{equation}
+  A_{\level+1}v
+  =
+  R_\level\left(A_\level(P_\level v)\right)
+  \qquad
+  \forall v\in\R^{n_{\level+1}}.
+  \label{eq:galerkin-action-test}
+\end{equation}
+If $A_\level$ is symmetric positive definite and $P_\level$ has full column
+rank, then
+\begin{equation}
+  v\trans A_{\level+1}v
+  =
+  (P_\level v)\trans A_\level(P_\level v)>0
+  \qquad(v\neq0),
+  \label{eq:spd-preservation}
+\end{equation}
+so Galerkin coarsening preserves positive definiteness.
+
+\section{Step 7: L1-Jacobi Smoothing}
+
+For every level, cache the row L1 denominator
+\begin{equation}
+  d_{\level,i}
+  =
+  \sum_j\abs{(A_\level)_{ij}},
+  \qquad
+  D_\level^{(1)}
+  =
+  \diag(d_{\level,0},\ldots,d_{\level,n_\level-1}).
+  \label{eq:l1-diagonal}
+\end{equation}
+One L1-Jacobi sweep with weight $\omega=1$ is
+\begin{equation}
+  \mathcal S_\level(x,b)
+  =
+  x+
+  \left(D_\level^{(1)}\right)^{-1}
+  (b-A_\level x).
+  \label{eq:l1-jacobi}
+\end{equation}
+Componentwise,
+\begin{equation}
+  x_i^{\mathrm{new}}
+  =
+  x_i+
+  \frac{b_i-(A_\level x)_i}
+       {\sum_j\abs{(A_\level)_{ij}}}.
+  \label{eq:l1-jacobi-component}
+\end{equation}
+For a zero initial correction, the first sweep simplifies to
+\begin{equation}
+  \mathcal S_\level(0,b)
+  =
+  \left(D_\level^{(1)}\right)^{-1}b,
+  \label{eq:zero-guess-smoother}
+\end{equation}
+and no sparse matrix-vector product is needed.
+
+\section{Step 8: Multiplicative V(1,1)-Cycle}
+
+Define
+\begin{equation}
+  \mathcal V_\level(b_\level,x_\level)
+  \label{eq:vcycle-operator}
+\end{equation}
+as one V-cycle on level $\level$.  For $\level<L$, the pre-smoothing step is
+\begin{equation}
+  \bar x_\level
+  =
+  \mathcal S_\level(x_\level,b_\level).
+  \label{eq:pre-smoothing}
+\end{equation}
+The fine residual is
+\begin{equation}
+  r_\level
+  =
+  b_\level-A_\level\bar x_\level.
+  \label{eq:level-residual}
+\end{equation}
+The coarse error equation receives the restricted right-hand side
+\begin{equation}
+  b_{\level+1}
+  =
+  R_\level r_\level,
+  \qquad
+  e_{\level+1}^{(0)}=0.
+  \label{eq:residual-restriction}
+\end{equation}
+It is solved recursively:
+\begin{equation}
+  e_{\level+1}
+  =
+  \mathcal V_{\level+1}
+  (b_{\level+1},e_{\level+1}^{(0)}).
+  \label{eq:recursive-coarse-solve}
+\end{equation}
+The prolongated correction is
+\begin{equation}
+  \tilde x_\level
+  =
+  \bar x_\level+P_\level e_{\level+1}.
+  \label{eq:coarse-correction}
+\end{equation}
+The cycle finishes with one post-sweep:
+\begin{equation}
+  \mathcal V_\level(b_\level,x_\level)
+  =
+  \mathcal S_\level(\tilde x_\level,b_\level).
+  \label{eq:post-smoothing}
+\end{equation}
+Equations \eqref{eq:pre-smoothing} and \eqref{eq:post-smoothing} give one sweep
+in each direction, hence a V(1,1)-cycle.
+
+\section{Step 9: Terminal-Level Solve}
+
+Coarsening normally stops when
+\begin{equation}
+  n_L\leq 9.
+  \label{eq:coarse-size}
+\end{equation}
+Embed the active coarse matrix in a fixed $9\times9$ matrix:
+\begin{equation}
+  \widetilde A_L
+  =
+  \begin{bmatrix}
+    A_L & 0\\
+    0   & I_{9-n_L}
+  \end{bmatrix},
+  \qquad
+  \widetilde b_L
+  =
+  \begin{bmatrix}
+    b_L\\
+    0
+  \end{bmatrix}.
+  \label{eq:padded-coarse-system}
+\end{equation}
+A pivoted LU factorization is computed once during setup:
+\begin{equation}
+  \Pi\widetilde A_L=LU.
+  \label{eq:coarse-lu}
+\end{equation}
+Each V-cycle solves
+\begin{align}
+  Ly &= \Pi\widetilde b_L,
+  \label{eq:coarse-forward}\\
+  U\widetilde e_L &= y,
+  \label{eq:coarse-backward}
+\end{align}
+and retains the first $n_L$ entries:
+\begin{equation}
+  e_L
+  =
+  \left(\widetilde e_L\right)_{0:n_L-1}.
+  \label{eq:coarse-active-solution}
+\end{equation}
+The identity padding makes this equivalent to solving $A_Le_L=b_L$.
+
+If PMIS does not reduce a level larger than nine rows, or the 25-level limit
+is reached first, setup terminates without dense factorization.  Starting from
+the V-cycle's zero coarse correction, the terminal action is instead
+\begin{equation}
+  e_L=\left(D_L^{(1)}\right)^{-1}b_L,
+  \label{eq:terminal-l1-jacobi}
+\end{equation}
+which is one L1-Jacobi sweep and matches BoomerAMG's early-termination
+behavior.
+
+\section{Step 10: Preconditioner and Stationary Solver}
+
+The preconditioner applies exactly one zero-initialized V-cycle:
+\begin{equation}
+  z=M^{-1}r
+  \coloneqq
+  \mathcal V_0(r,0).
+  \label{eq:preconditioner-apply}
+\end{equation}
+There is no convergence test inside $M^{-1}$.  Consequently, the same fixed
+operation can be supplied as a right preconditioner to GMRES:
+\begin{equation}
+  AM^{-1}y=b,
+  \qquad
+  x=M^{-1}y.
+  \label{eq:right-preconditioned-system}
+\end{equation}
+
+A convenience standalone AMG solve uses stationary defect correction:
+\begin{align}
+  r^{(k)}
+  &=
+  b-Ax^{(k)},
+  \label{eq:stationary-residual}\\
+  x^{(k+1)}
+  &=
+  x^{(k)}+\mathcal V_0(r^{(k)},0).
+  \label{eq:stationary-update}
+\end{align}
+The true residual is recomputed after every cycle; an internal recurrence is
+not used for the stopping decision.
+
+\section{Step 11: Tolerance and HYPRE Agreement}
+
+Given an initial guess $x^{(0)}$, define
+\begin{equation}
+  r^{(0)}=b-Ax^{(0)}
+  \label{eq:initial-residual}
+\end{equation}
+and the requested residual threshold
+\begin{equation}
+  \tau
+  =
+  \max\left(
+    \mathtt{atol},
+    \mathtt{rtol}\norm{r^{(0)}}_2
+  \right).
+  \label{eq:residual-target}
+\end{equation}
+The initial benchmark uses $x^{(0)}=0$, so
+\begin{equation}
+  \norm{r^{(0)}}_2=\norm b_2.
+  \label{eq:zero-guess-residual}
+\end{equation}
+
+Let $x_A$ be the AMReX result and $x_H$ the result from HYPRE BoomerAMG with
+the matching PMIS/Extended+i/L1-Jacobi configuration.  Both independently
+recomputed true residuals must satisfy
+\begin{align}
+  \norm{b-Ax_A}_2
+  &\leq\tau,
+  \label{eq:amrex-residual-pass}\\
+  \norm{b-Ax_H}_2
+  &\leq\tau.
+  \label{eq:hypre-residual-pass}
+\end{align}
+On the conditioned manufactured benchmark, solution agreement is
+\begin{equation}
+  \norm{x_A-x_H}_2
+  \leq
+  \mathtt{atol}
+  +
+  \mathtt{rtol}\norm{x_H}_2.
+  \label{eq:solution-agreement}
+\end{equation}
+If the manufactured exact solution $x_\star$ is known, also report
+\begin{equation}
+  E_A=\norm{x_A-x_\star}_2,
+  \qquad
+  E_H=\norm{x_H-x_\star}_2.
+  \label{eq:exact-solution-errors}
+\end{equation}
+
+The tests do not require equality of PMIS markers, interpolation entries,
+level counts, or iteration counts.  Different deterministic priorities and
+sparse accumulation orders can produce different valid hierarchies while
+still satisfying \eqref{eq:amrex-residual-pass}--\eqref{eq:solution-agreement}.
+
+\section{Step 12: Complexity Diagnostics}
+
+Correctness is the first acceptance criterion, but setup records the grid
+complexity
+\begin{equation}
+  C_g
+  =
+  \frac{\displaystyle\sum_{\level=0}^{L}n_\level}{n_0},
+  \label{eq:grid-complexity}
+\end{equation}
+operator complexity
+\begin{equation}
+  C_A
+  =
+  \frac{\displaystyle\sum_{\level=0}^{L}\nnz(A_\level)}
+       {\nnz(A_0)},
+  \label{eq:operator-complexity}
+\end{equation}
+and interpolation complexity
+\begin{equation}
+  C_P
+  =
+  \frac{\displaystyle\sum_{\level=0}^{L-1}\nnz(P_\level)}
+       {n_0}.
+  \label{eq:interpolation-complexity}
+\end{equation}
+These quantities expose poor coarsening or interpolation growth before timing
+comparisons are interpreted.
+
+\appendix
+
+\section{Matching BoomerAMG Parameters}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Feature & HYPRE value & Mathematical section\\
+\midrule
+Strength threshold & $0.25$ & Section 2\\
+Maximum row sum & $0.9$ & Section 2\\
+PMIS coarsening & type 8 & Sections 3--4\\
+Extended+i interpolation & type 6 & Section 6\\
+Interpolation cap & \texttt{PMaxElmts = 4} & Section 6\\
+No threshold-based dropping & \texttt{TruncFactor = 0} & Section 6\\
+L1-Jacobi down/up & type 18 & Section 8\\
+Relaxation order & 0 & Section 8\\
+Sweeps & one down, one up & Section 9\\
+Transpose restriction & default & Section 7\\
+V-cycle & type 1 & Section 9\\
+Maximum coarse size & 9 & Section 10\\
+Coarse Gaussian elimination & type 9 & Section 10\\
+Aggregation levels & 0 & all sections\\
+Preconditioner iterations & 1 & Section 11\\
+Preconditioner tolerance & 0 & Section 11\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The supported GPU options and their public integer identifiers are documented
+at
+\url{https://hypre.readthedocs.io/en/latest/solvers-boomeramg.html}.
+
+\end{document}
