@@ -1546,13 +1546,16 @@ void SpMatrix<T,Allocator>::split_csr (AlgPartition const& col_partition)
             }
         });
         auto noffset = Long(m_csr.row_offset.size());
+        auto const total_nnz = m_nnz;
         auto* pro = m_csr.row_offset.data();
         m_csr_remote.row_offset.resize(noffset);
         auto* pro_r = m_csr_remote.row_offset.data();
         ParallelForOMP(noffset, [=] AMREX_GPU_DEVICE (Long i)
         {
             if (i < noffset-1) {
-                auto ro_l = p_pfsum[pro[i]];
+                auto ro_l = (pro[i] == total_nnz)
+                    ? local_nnz
+                    : p_pfsum[pro[i]];
                 pro_r[i] = pro[i] - ro_l;
                 pro[i] = ro_l;
             } else {
