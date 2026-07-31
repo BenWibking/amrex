@@ -920,9 +920,11 @@ classical algebraic multigrid preconditioner for distributed
 :cpp:`amrex::SpMatrix<T>` matrices.  The current implementation is intended
 for square, nonsingular scalar elliptic matrices with one positive diagonal
 entry per row and predominantly non-positive off-diagonal entries.  It uses
-PMIS C/F coarsening, direct interpolation, L1-Jacobi smoothing, and Galerkin
-coarse operators.  It does not use aggregation and does not require HYPRE at
-runtime.
+PMIS C/F coarsening, matrix-based Extended+i interpolation, L1-Jacobi
+smoothing, and Galerkin coarse operators.  Extended+i forms its fine-point
+weights from strong :math:`A_{FF}` and :math:`A_{FC}` submatrices and one
+sparse matrix product.  It does not use aggregation and does not require
+HYPRE at runtime.
 
 The matrix must outlive the AMG object and must not be modified after
 :cpp:`setup`.  Its row and column partitions must be identical, and every row
@@ -941,12 +943,12 @@ must contain exactly one positive diagonal entry:
    x.setVal(0.0);
    amg.solve(x, b, 1.e-10, 0.0, 100);
 
-The default options use a strength threshold of ``0.25``, at most 25 levels,
-a dense coarse solve for at most 9 unknowns, and one L1-Jacobi sweep before
-and after coarse-grid correction.  The first implementation supports only
-this V(1,1) cycle.  Use :cpp:`AMG<T>::Options` to change the strength
-threshold, hierarchy limits, or deterministic PMIS seed before calling
-:cpp:`setup`.
+The default options use a strength threshold of ``0.25``, untruncated
+interpolation, at most 25 levels, a dense coarse solve for at most 9 unknowns,
+and one L1-Jacobi sweep before and after coarse-grid correction.  The first
+implementation supports only this V(1,1) cycle.  Use
+:cpp:`AMG<T>::Options` to change the strength threshold, hierarchy limits, or
+deterministic PMIS seed before calling :cpp:`setup`.
 
 :cpp:`apply(z,r)` applies one fixed, zero-initialized V(1,1)-cycle and is
 suitable for use as a right preconditioner with :cpp:`GMRES_MV`:

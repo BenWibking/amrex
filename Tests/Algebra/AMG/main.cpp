@@ -548,6 +548,61 @@ test_directed_pmis_rounds ()
              AMGTestAccess<Real>::fine_marker()}));
 }
 
+/** Verify that Extended+i reaches coarse points through strong F-F edges. */
+void
+test_extended_plus_i_interpolation ()
+{
+    auto A = make_square_matrix(
+        4, [] (Long row) -> Entries
+        {
+            Entries result{{row, Real(3)}};
+            if (row > 0) {
+                result.emplace_back(row-1, Real(-1));
+            }
+            if (row+1 < 4) {
+                result.emplace_back(row+1, Real(-1));
+            }
+            return result;
+        });
+    Vector<int> markers{
+        AMGTestAccess<Real>::coarse_marker(),
+        AMGTestAccess<Real>::fine_marker(),
+        AMGTestAccess<Real>::fine_marker(),
+        AMGTestAccess<Real>::coarse_marker()};
+
+    AMG<Real> amg(A);
+    AMGTestAccess<Real>::prepare_interpolation(amg, markers);
+    auto rows =
+        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+            AMGTestAccess<Real>::interpolation(amg));
+
+    Long const begin = A.globalRowBegin();
+    for (Long i = 0; i < A.numLocalRows(); ++i) {
+        Long const gid = begin+i;
+        Entries expected;
+        if (gid == 0) {
+            expected = {{0, Real(1)}};
+        } else if (gid == 1) {
+            expected = {{0, Real(0.4)}, {1, Real(0.2)}};
+        } else if (gid == 2) {
+            expected = {{0, Real(0.2)}, {1, Real(0.4)}};
+        } else {
+            expected = {{1, Real(1)}};
+        }
+
+        Long const row_begin = rows.row_offset[i];
+        Long const row_end = rows.row_offset[i+1];
+        AMREX_ALWAYS_ASSERT(
+            row_end-row_begin == static_cast<Long>(expected.size()));
+        for (Long p = row_begin; p < row_end; ++p) {
+            auto const& [column,value] = expected[p-row_begin];
+            AMREX_ALWAYS_ASSERT(rows.col_index[p] == column);
+            AMREX_ALWAYS_ASSERT(
+                std::abs(rows.mat[p]-value) < unit_tolerance());
+        }
+    }
+}
+
 void
 test_interpolation_restriction_and_galerkin ()
 {
@@ -829,7 +884,7 @@ solve_with_boomeramg (SpMatrix<Real> const& A,
     AMREX_ALWAYS_ASSERT(HYPRE_BoomerAMGCreate(&solver) == 0);
     HYPRE_BoomerAMGSetStrongThreshold(solver, HYPRE_Real(0.25));
     HYPRE_BoomerAMGSetCoarsenType(solver, 8);
-    HYPRE_BoomerAMGSetInterpType(solver, 3);
+    HYPRE_BoomerAMGSetInterpType(solver, 6);
     HYPRE_BoomerAMGSetPMaxElmts(solver, 0);
     HYPRE_BoomerAMGSetTruncFactor(solver, HYPRE_Real(0));
     HYPRE_BoomerAMGSetAggNumLevels(solver, 0);
@@ -986,6 +1041,7 @@ main (int argc, char* argv[])
     test_distributed_transpose_trailing_empty_row();
     test_pmis_and_numbering();
     test_directed_pmis_rounds();
+    test_extended_plus_i_interpolation();
     test_interpolation_restriction_and_galerkin();
     test_l1_jacobi();
     test_all_coarse_sizes();

@@ -34,16 +34,18 @@ struct AMGTestAccess;
  *
  * A deliberately narrow classical algebraic multigrid implementation for
  * scalar elliptic matrices. It uses classical strength, deterministic PMIS
- * C/F splitting, direct interpolation, Galerkin coarsening, L1-Jacobi
- * smoothing, and a dense solve on the last (at most nine point) level.
+ * C/F splitting, matrix-based Extended+i interpolation, Galerkin coarsening,
+ * L1-Jacobi smoothing, and a dense solve on the last (at most nine point)
+ * level.
  */
 /**
  * \brief Classical algebraic multigrid preconditioner for scalar elliptic
  * matrices.
  *
  * The hierarchy uses sign-based strength of connection, deterministic PMIS
- * C/F splitting, direct interpolation, transpose restriction, Galerkin
- * coarse operators, L1-Jacobi smoothing, and a dense coarse solve.
+ * C/F splitting, matrix-based Extended+i interpolation, transpose
+ * restriction, Galerkin coarse operators, L1-Jacobi smoothing, and a dense
+ * coarse solve.
  *
  * \tparam T Floating-point matrix and vector scalar type.
  */
@@ -240,7 +242,15 @@ private:
     void build_strength (Level& level);
     //! Compute a deterministic PMIS C/F splitting for \p level.
     void split_pmis (Level& level);
-    //! Construct direct interpolation and transpose restriction for \p level.
+    /**
+     * \brief Construct matrix-based Extended+i interpolation and its
+     * transpose restriction for \p level.
+     *
+     * The interpolation builder extracts strong fine-to-fine and
+     * fine-to-coarse couplings, applies the Extended+i row scaling to the
+     * fine-to-fine factor, and forms interpolation with one sparse matrix
+     * product.
+     */
     void build_interpolation (Level& level);
     //! Form and append the Galerkin coarse matrix below \p level.
     void build_next_level (Level& level);
@@ -828,141 +838,249 @@ void AMG<T>::build_interpolation (Level& level)
     auto const* AMREX_RESTRICT sslot =
         level.strength_col_slots.data();
 
-    Gpu::DeviceVector<Long> counts(nrows);
-    auto* AMREX_RESTRICT pcounts = counts.data();
+    Gpu::DeviceVector<Long> ff_counts(nrows);
+    Gpu::DeviceVector<Long> fc_counts(nrows);
+    auto* AMREX_RESTRICT pff_counts = ff_counts.data();
+    auto* AMREX_RESTRICT pfc_counts = fc_counts.data();
     ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
     {
         if (marker[i] == coarse) {
-            pcounts[i] = 1;
+            pff_counts[i] = 1;
+            pfc_counts[i] = 1;
         } else {
-            Long count = 0;
+            Long ff_count = 1;
+            Long fc_count = 0;
             for (Long p = srow[i]; p < srow[i+1]; ++p) {
-                count += all_marker[sslot[p]] == coarse;
+                if (all_marker[sslot[p]] == fine) {
+                    ++ff_count;
+                } else {
+                    ++fc_count;
+                }
             }
-            pcounts[i] = count;
+            pff_counts[i] = ff_count;
+            pfc_counts[i] = fc_count;
         }
     });
 
     Long missing = Reduce::Sum<Long>(
         nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept -> Long
         {
-            return marker[i] == fine && pcounts[i] == 0;
+            return marker[i] == fine && pfc_counts[i] == 0;
         });
     ParallelAllReduce::Sum(missing, ParallelContext::CommunicatorSub());
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         missing == 0,
-        "AMG direct interpolation encountered a fine row without a "
-        "strong coarse neighbor");
+        "AMG Extended+i interpolation encountered a fine row without a "
+        "strong coarse connection");
 
-    csr_type interpolation;
-    interpolation.row_offset.resize(nrows+1);
-    auto* AMREX_RESTRICT prow = interpolation.row_offset.data();
-    Long const pnnz = Scan::PrefixSum<Long>(
+    csr_type scaled_ff;
+    scaled_ff.row_offset.resize(nrows+1);
+    auto* AMREX_RESTRICT ffrow = scaled_ff.row_offset.data();
+    Long const ff_nnz = Scan::PrefixSum<Long>(
         nrows,
         [=] AMREX_GPU_DEVICE (Long i) noexcept -> Long {
-            return pcounts[i];
+            return pff_counts[i];
         },
         [=] AMREX_GPU_DEVICE (Long i, Long offset) noexcept {
-            prow[i] = offset;
+            ffrow[i] = offset;
         },
         Scan::Type::exclusive, Scan::retSum);
-    interpolation.nnz = pnnz;
-    interpolation.mat.resize(pnnz);
-    interpolation.col_index.resize(pnnz);
-    auto* AMREX_RESTRICT pval = interpolation.mat.data();
-    auto* AMREX_RESTRICT pcol = interpolation.col_index.data();
+    scaled_ff.nnz = ff_nnz;
+    scaled_ff.mat.resize(ff_nnz);
+    scaled_ff.col_index.resize(ff_nnz);
+    auto* AMREX_RESTRICT ffval = scaled_ff.mat.data();
+    auto* AMREX_RESTRICT ffcol = scaled_ff.col_index.data();
 
-    int invalid_scales = Reduce::Sum<int>(
+    csr_type strong_fc;
+    strong_fc.row_offset.resize(nrows+1);
+    auto* AMREX_RESTRICT fcrow = strong_fc.row_offset.data();
+    Long const fc_nnz = Scan::PrefixSum<Long>(
+        nrows,
+        [=] AMREX_GPU_DEVICE (Long i) noexcept -> Long {
+            return pfc_counts[i];
+        },
+        [=] AMREX_GPU_DEVICE (Long i, Long offset) noexcept {
+            fcrow[i] = offset;
+        },
+        Scan::Type::exclusive, Scan::retSum);
+    strong_fc.nnz = fc_nnz;
+    strong_fc.mat.resize(fc_nnz);
+    strong_fc.col_index.resize(fc_nnz);
+    auto* AMREX_RESTRICT fcval = strong_fc.mat.data();
+    auto* AMREX_RESTRICT fccol = strong_fc.col_index.data();
+
+    ParallelFor(1, [=] AMREX_GPU_DEVICE (Long) noexcept
+    {
+        ffrow[nrows] = ff_nnz;
+        fcrow[nrows] = fc_nnz;
+    });
+    Gpu::streamSynchronize();
+
+    Gpu::DeviceVector<Long> ff_slots(ff_nnz);
+    Gpu::DeviceVector<T> weak_diagonal_sum(nrows);
+    Gpu::DeviceVector<T> strong_coarse_sum(nrows);
+    auto* AMREX_RESTRICT pff_slots = ff_slots.data();
+    auto* AMREX_RESTRICT pweak_diagonal_sum =
+        weak_diagonal_sum.data();
+    auto* AMREX_RESTRICT pstrong_coarse_sum =
+        strong_coarse_sum.data();
+
+    int invalid_structure = Reduce::Sum<int>(
         nrows,
         [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
         {
             if (marker[i] == coarse) {
-                pcol[prow[i]] = all_coarse_id[i];
-                pval[prow[i]] = T(1);
+                ffcol[ffrow[i]] = i + row_begin;
+                ffval[ffrow[i]] = T(1);
+                pff_slots[ffrow[i]] = i;
+                fccol[fcrow[i]] = all_coarse_id[i];
+                fcval[fcrow[i]] = T(1);
+                pweak_diagonal_sum[i] = T(0);
+                pstrong_coarse_sum[i] = T(0);
                 return 0;
             }
 
             Long const global_row = i + row_begin;
-            T diagonal = T(0);
-            T negative_sum = T(0);
-            T positive_sum = T(0);
+            Long ff_out = ffrow[i];
+            Long fc_out = fcrow[i];
+            T weak_and_diagonal = T(0);
+            T coarse_sum = T(0);
+            int diagonal_count = 0;
             for (Long p = arow[i]; p < arow[i+1]; ++p) {
-                auto const a = aval[p];
-                if (acol[p] == global_row) {
-                    diagonal = a;
-                } else if (a < T(0)) {
-                    negative_sum += a;
-                } else if (a > T(0)) {
-                    positive_sum += a;
-                }
-            }
-
-            T coarse_negative_sum = T(0);
-            T coarse_positive_sum = T(0);
-            for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
-                Long const j = scol[sp];
-                Long const slot = sslot[sp];
-                if (all_marker[slot] != coarse) {
+                Long const j = acol[p];
+                T const a = aval[p];
+                if (j == global_row) {
+                    ffcol[ff_out] = j;
+                    ffval[ff_out] = a;
+                    pff_slots[ff_out] = i;
+                    ++ff_out;
+                    weak_and_diagonal += a;
+                    ++diagonal_count;
                     continue;
                 }
-                T a = T(0);
-                for (Long ap = arow[i]; ap < arow[i+1]; ++ap) {
-                    if (acol[ap] == j) {
-                        a = aval[ap];
+
+                Long strong_entry = -1;
+                for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
+                    if (scol[sp] == j) {
+                        strong_entry = sp;
                         break;
                     }
                 }
-                if (a < T(0)) {
-                    coarse_negative_sum += a;
-                } else if (a > T(0)) {
-                    coarse_positive_sum += a;
-                }
-            }
-
-            bool const need_negative = coarse_negative_sum != T(0);
-            bool const need_positive = coarse_positive_sum != T(0);
-            T const alpha = need_negative
-                ? negative_sum/(diagonal*coarse_negative_sum) : T(0);
-            T const beta = need_positive
-                ? positive_sum/(diagonal*coarse_positive_sum) : T(0);
-
-            Long out = prow[i];
-            for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
-                Long const j = scol[sp];
-                Long const slot = sslot[sp];
-                if (all_marker[slot] != coarse) {
+                if (strong_entry < 0) {
+                    weak_and_diagonal += a;
                     continue;
                 }
-                T a = T(0);
-                for (Long ap = arow[i]; ap < arow[i+1]; ++ap) {
-                    if (acol[ap] == j) {
-                        a = aval[ap];
-                        break;
-                    }
+
+                Long const slot = sslot[strong_entry];
+                if (all_marker[slot] == fine) {
+                    ffcol[ff_out] = j;
+                    ffval[ff_out] = a;
+                    pff_slots[ff_out] = slot;
+                    ++ff_out;
+                } else {
+                    fccol[fc_out] = all_coarse_id[slot];
+                    fcval[fc_out] = a;
+                    ++fc_out;
+                    coarse_sum += a;
                 }
-                pcol[out] = all_coarse_id[slot];
-                pval[out] = (a < T(0)) ? -alpha*a : -beta*a;
-                ++out;
             }
-            return diagonal == T(0);
+
+            pweak_diagonal_sum[i] = weak_and_diagonal;
+            pstrong_coarse_sum[i] = coarse_sum;
+            return (diagonal_count != 1)
+                + (ff_out != ffrow[i+1])
+                + (fc_out != fcrow[i+1]);
         });
-    ParallelAllReduce::Sum(invalid_scales,
+    ParallelAllReduce::Sum(invalid_structure,
                            ParallelContext::CommunicatorSub());
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        invalid_scales == 0,
-        "AMG direct interpolation could not form a required sign-separated "
-        "scale");
+        invalid_structure == 0,
+        "AMG Extended+i interpolation could not extract its strong "
+        "fine-point submatrices");
 
-    ParallelFor(nrows+1, [=] AMREX_GPU_DEVICE (Long i) noexcept
-    {
-        if (i == nrows) {
-            prow[nrows] = pnnz;
-        }
-    });
     Gpu::streamSynchronize();
 
+    csr_type unscaled_ff;
+    duplicateCSR(Gpu::deviceToDevice, unscaled_ff, scaled_ff);
+    matrix_type ff_matrix(
+        partition, partition, std::move(unscaled_ff));
+    matrix_type ff_transpose = transpose(ff_matrix, partition);
+    auto host_ff_transpose =
+        helper_type::copy_local_global_csr(ff_transpose);
+    auto ff_transpose_rows = copy_to_device(host_ff_transpose);
+
+    auto halo_coarse_sum =
+        level.halo->exchange(strong_coarse_sum.data());
+    auto const* AMREX_RESTRICT all_coarse_sum =
+        halo_coarse_sum.data();
+    auto const* AMREX_RESTRICT ff_transpose_row =
+        ff_transpose_rows.row_offset.data();
+    auto const* AMREX_RESTRICT ff_transpose_col =
+        ff_transpose_rows.col_index.data();
+    auto const* AMREX_RESTRICT ff_transpose_val =
+        ff_transpose_rows.mat.data();
+
+    int invalid_scale = Reduce::Sum<int>(
+        nrows,
+        [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
+        {
+            if (marker[i] == coarse) {
+                return 0;
+            }
+
+            Long const global_row = i + row_begin;
+            T theta = pweak_diagonal_sum[i];
+            for (Long p = ffrow[i]; p < ffrow[i+1]; ++p) {
+                Long const j = ffcol[p];
+                if (j == global_row) {
+                    ffval[p] = T(1);
+                    continue;
+                }
+
+                T reverse = T(0);
+                for (Long q = ff_transpose_row[i];
+                     q < ff_transpose_row[i+1]; ++q)
+                {
+                    if (ff_transpose_col[q] == j) {
+                        reverse = ff_transpose_val[q];
+                        break;
+                    }
+                }
+
+                T const original = ffval[p];
+                T const denominator =
+                    all_coarse_sum[pff_slots[p]] + reverse;
+                if (denominator != T(0)) {
+                    ffval[p] = original/denominator;
+                    theta += reverse*ffval[p];
+                } else {
+                    ffval[p] = T(0);
+                    theta += original;
+                }
+            }
+
+            T const scale = theta != T(0) ? -T(1)/theta : -T(1);
+            int invalid = 0;
+            for (Long p = ffrow[i]; p < ffrow[i+1]; ++p) {
+                ffval[p] *= scale;
+                invalid += !Math::isfinite(ffval[p]);
+            }
+            return invalid;
+        });
+    ParallelAllReduce::Sum(invalid_scale,
+                           ParallelContext::CommunicatorSub());
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        invalid_scale == 0,
+        "AMG Extended+i interpolation produced a non-finite row scale");
+    Gpu::streamSynchronize();
+
+    matrix_type scaled_ff_matrix(
+        partition, partition, std::move(scaled_ff));
+    matrix_type strong_fc_matrix(
+        partition, level.coarse_partition, std::move(strong_fc));
     level.P = std::make_unique<matrix_type>(
-        partition, level.coarse_partition, std::move(interpolation));
+        SpGEMM(scaled_ff_matrix, strong_fc_matrix,
+               level.coarse_partition));
     level.R = std::make_unique<matrix_type>(
         transpose(*level.P, level.coarse_partition));
 }
