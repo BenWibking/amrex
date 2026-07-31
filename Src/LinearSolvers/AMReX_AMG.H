@@ -177,6 +177,8 @@ private:
     template <typename U>
     friend struct AMGTestAccess;
 
+public: // NOLINT  Private implementation details, but public for CUDA
+
     using matrix_type = SpMatrix<T>;
     using csr_type = typename matrix_type::csr_type;
     using helper_type = SpGEMMHelper<T,DefaultAllocator>;
@@ -270,6 +272,9 @@ private:
      */
     static csr_type truncate_interpolation (csr_type const& source,
                                              int max_elements);
+
+private:
+
     //! Form and append the Galerkin coarse matrix below \p level.
     void build_next_level (Level& level);
     //! Gather, pad, and factor the globally coarsest matrix.
@@ -283,7 +288,12 @@ private:
      * \param x Correction vector updated in place.
      * \param b Right-hand side on level \p ilev.
      */
+public: // NOLINT  Private function, but public for CUDA
+
     void vcycle (int ilev, AlgVector<T>& x, AlgVector<T> const& b);
+
+private:
+
     /**
      * \brief Solve the replicated dense coarse system.
      *

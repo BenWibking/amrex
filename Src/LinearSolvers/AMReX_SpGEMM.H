@@ -542,6 +542,9 @@ struct SpGEMMHelper
         });
 
         products.sort();
+        // Long GPU rows use an out-of-place sort and replace these buffers.
+        product_val = products.mat.data();
+        product_col = products.col_index.data();
 
         container_type<Long> unique_counts(nrows);
         auto* AMREX_RESTRICT ucounts = unique_counts.data();
