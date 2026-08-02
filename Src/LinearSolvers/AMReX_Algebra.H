@@ -6,6 +6,7 @@
 #include <AMReX_AlgVector.H>
 #include <AMReX_AlgVecUtil.H>
 #include <AMReX_AMG.H>
+#include <AMReX_HypreChebyshevSmoother.H>
 #include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_SpMatrix.H>
 #include <AMReX_SpGEMM.H>

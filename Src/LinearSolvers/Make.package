@@ -12,6 +12,7 @@ CEXE_headers += AMReX_AlgVector.H
 CEXE_headers += AMReX_AlgVecUtil.H
 CEXE_headers += AMReX_AMG.H
 CEXE_headers += AMReX_CSR.H
+CEXE_headers += AMReX_HypreChebyshevSmoother.H
 CEXE_headers += AMReX_L1JacobiSmoother.H
 CEXE_headers += AMReX_SpGEMM.H
 CEXE_headers += AMReX_SpMatrix.H

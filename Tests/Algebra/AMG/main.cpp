@@ -2,6 +2,7 @@
 #include <AMReX_AMG.H>
 #include <AMReX_AlgVecUtil.H>
 #include <AMReX_GMRES_MV.H>
+#include <AMReX_HypreChebyshevSmoother.H>
 #include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_Math.H>
 #include <AMReX_SpGEMM.H>
@@ -463,7 +464,7 @@ test_strength_max_row_sum ()
     }
 }
 
-/** Verify that an all-weak graph terminates with one L1-Jacobi sweep. */
+/** Verify that an all-weak graph terminates with one Chebyshev application. */
 void
 test_all_weak_terminal_level ()
 {
@@ -478,12 +479,19 @@ test_all_weak_terminal_level ()
 
     AlgVector<Real> b(A.partition());
     AlgVector<Real> x(A.partition());
+    AlgVector<Real> expected(A.partition());
     b.setVal(Real(1));
+    expected.setVal(Real(0));
+    HypreChebyshevSmoother<Real>::Options smoother_options;
+    smoother_options.order = 4;
+    HypreChebyshevSmoother<Real> smoother(A, smoother_options);
+    smoother.sweep(expected, b);
     amg.apply(x, b);
     auto local_x = copy_to_host(x);
-    for (Real const value : local_x) {
+    auto local_expected = copy_to_host(expected);
+    for (Long i = 0; i < x.numLocalRows(); ++i) {
         AMREX_ALWAYS_ASSERT(
-            std::abs(value-Real(0.5)) < unit_tolerance());
+            std::abs(local_x[i]-local_expected[i]) < unit_tolerance());
     }
 }
 
@@ -900,6 +908,67 @@ test_l1_jacobi ()
 }
 
 void
+test_hypre_chebyshev ()
+{
+    auto A = make_square_matrix(
+        3, [] (Long row) -> Entries
+        {
+            return {{row, Real(2)*Real(Long(1) << row)}};
+        });
+    HypreChebyshevSmoother<Real> smoother(A);
+    AMREX_ALWAYS_ASSERT(
+        std::abs(smoother.minEigenvalue()-Real(1))
+        < Real(50)*unit_tolerance());
+    AMREX_ALWAYS_ASSERT(
+        std::abs(smoother.maxEigenvalue()-Real(1))
+        < Real(50)*unit_tolerance());
+
+    auto scaling = copy_to_host(smoother.scaling());
+    for (Long i = 0; i < A.numLocalRows(); ++i) {
+        Real const diagonal = Real(2)*Real(Long(1) << (i+A.globalRowBegin()));
+        AMREX_ALWAYS_ASSERT(
+            std::abs(scaling[i]-Real(1)/std::sqrt(diagonal))
+            < unit_tolerance());
+    }
+
+    Real const upper = Real(1.1);
+    Real const lower = Real(1)+(upper-Real(1))*Real(0.3);
+    Real const theta = (upper+lower)/Real(2);
+    Real const delta = (upper-lower)/Real(2);
+    Real const denominator = delta*delta-Real(2)*theta*theta;
+    Vector<Real> const expected_coefficients{
+        -Real(4)*theta/denominator, Real(2)/denominator};
+    auto const& coefficients = smoother.coefficients();
+    AMREX_ALWAYS_ASSERT(coefficients.size() == 2);
+    for (int i = 0; i < 2; ++i) {
+        AMREX_ALWAYS_ASSERT(
+            std::abs(coefficients[i]-expected_coefficients[i])
+            < Real(50)*unit_tolerance());
+    }
+
+    AlgVector<Real> x(A.partition());
+    AlgVector<Real> b(A.partition());
+    auto* pb = b.data();
+    Long const begin = b.globalBegin();
+    ParallelFor(b.numLocalRows(),
+                [=] AMREX_GPU_DEVICE (Long i) noexcept
+    {
+        Real const diagonal = Real(2)*Real(Long(1) << (i+begin));
+        pb[i] = diagonal*Real(i+begin+1);
+    });
+    x.setVal(Real(0));
+    smoother.sweep(x, b);
+    auto result = copy_to_host(x);
+    Real const polynomial_at_one =
+        expected_coefficients[0]+expected_coefficients[1];
+    for (Long i = 0; i < x.numLocalRows(); ++i) {
+        Real const expected = polynomial_at_one*Real(i+begin+1);
+        AMREX_ALWAYS_ASSERT(
+            std::abs(result[i]-expected) < Real(100)*unit_tolerance());
+    }
+}
+
+void
 test_all_coarse_sizes ()
 {
     for (Long n = 1; n <= 9; ++n) {
@@ -1045,9 +1114,14 @@ solve_with_boomeramg (SpMatrix<Real> const& A,
     HYPRE_BoomerAMGSetAggNumLevels(solver, 0);
     HYPRE_BoomerAMGSetCycleType(solver, 1);
     HYPRE_BoomerAMGSetRelaxOrder(solver, 0);
-    HYPRE_BoomerAMGSetCycleRelaxType(solver, 18, 1);
-    HYPRE_BoomerAMGSetCycleRelaxType(solver, 18, 2);
+    HYPRE_BoomerAMGSetCycleRelaxType(solver, 16, 1);
+    HYPRE_BoomerAMGSetCycleRelaxType(solver, 16, 2);
     HYPRE_BoomerAMGSetCycleRelaxType(solver, 9, 3);
+    HYPRE_BoomerAMGSetChebyOrder(solver, 4);
+    HYPRE_BoomerAMGSetChebyFraction(solver, Real(0.3));
+    HYPRE_BoomerAMGSetChebyScale(solver, 1);
+    HYPRE_BoomerAMGSetChebyVariant(solver, 0);
+    HYPRE_BoomerAMGSetChebyEigEst(solver, 10);
     HYPRE_BoomerAMGSetCycleNumSweeps(solver, 1, 1);
     HYPRE_BoomerAMGSetCycleNumSweeps(solver, 1, 2);
     HYPRE_BoomerAMGSetCycleNumSweeps(solver, 1, 3);
@@ -1202,6 +1276,7 @@ main (int argc, char* argv[])
     test_interpolation_truncation();
     test_interpolation_restriction_and_galerkin();
     test_l1_jacobi();
+    test_hypre_chebyshev();
     test_all_coarse_sizes();
 
     auto shifted_2d =

@@ -45,6 +45,7 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        AMReX_AlgVecUtil.H
        AMReX_AMG.H
        AMReX_CSR.H
+       AMReX_HypreChebyshevSmoother.H
        AMReX_L1JacobiSmoother.H
        AMReX_SpGEMM.H
        AMReX_SpMatrix.H
