@@ -5,6 +5,7 @@
 #include <AMReX_AlgHaloExchange.H>
 #include <AMReX_AlgVecUtil.H>
 #include <AMReX_HypreChebyshevSmoother.H>
+#include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_LUSolver.H>
 #include <AMReX_Math.H>
 #include <AMReX_ParallelContext.H>
@@ -35,9 +36,9 @@ struct AMGTestAccess;
  * A deliberately narrow classical algebraic multigrid implementation for
  * scalar elliptic matrices. It uses classical strength, deterministic PMIS
  * C/F splitting, matrix-based Extended+i interpolation, Galerkin coarsening,
- * HYPRE-equivalent Chebyshev smoothing, and either a dense solve on a last
- * level of at most nine points or terminal Chebyshev relaxation when
- * coarsening stops early.
+ * selectable L1-Jacobi or HYPRE-equivalent Chebyshev smoothing, and either a
+ * dense solve on a last level of at most nine points or terminal relaxation
+ * when coarsening stops early.
  */
 /**
  * \brief Classical algebraic multigrid preconditioner for scalar elliptic
@@ -45,8 +46,9 @@ struct AMGTestAccess;
  *
  * The hierarchy uses sign-based strength of connection, deterministic PMIS
  * C/F splitting, matrix-based Extended+i interpolation, transpose
- * restriction, Galerkin coarse operators, Chebyshev smoothing, and a dense
- * coarse solve when the terminal level has at most nine points.
+ * restriction, Galerkin coarse operators, selectable L1-Jacobi or Chebyshev
+ * smoothing, and a dense coarse solve when the terminal level has at most
+ * nine points.
  *
  * \tparam T Floating-point matrix and vector scalar type.
  */
@@ -55,6 +57,12 @@ class AMG
 {
 public:
     static_assert(std::is_floating_point_v<T>);
+
+    /** \brief Native smoother choices and their HYPRE relaxation mappings. */
+    enum class Smoother : int {
+        chebyshev = 16, //!< HYPRE relaxation type 16.
+        l1_jacobi = 18  //!< HYPRE relaxation type 18.
+    };
 
     /**
      * \brief Setup and cycle controls for AMG.
@@ -70,13 +78,20 @@ public:
         int max_levels = 25;
         //! Largest global level factored by the dense coarse solver.
         int max_coarse_size = 9;
-        //! Number of Chebyshev applications before coarse-grid correction.
+        //! Smoother applied on every non-dense level.
+        Smoother smoother = Smoother::chebyshev;
+        //! Number of smoother applications before coarse-grid correction.
         int pre_sweeps = 1;
-        //! Number of Chebyshev applications after coarse-grid correction.
+        //! Number of smoother applications after coarse-grid correction.
         int post_sweeps = 1;
         //! HYPRE Chebyshev residual-polynomial order in [1,4].
         int chebyshev_order = 4;
-        //! HYPRE CG/Lanczos steps used to estimate the level spectrum.
+        /**
+         * \brief HYPRE-style level-spectrum estimator control.
+         *
+         * Zero selects the algorithmically partition-independent Gershgorin
+         * estimate. A positive value selects that many CG/Lanczos steps.
+         */
         int chebyshev_eigenvalue_iterations = 10;
         //! HYPRE fraction of the estimated spectrum targeted by smoothing.
         T chebyshev_fraction = T(0.3);
@@ -241,8 +256,10 @@ public: // NOLINT  Private implementation details, but public for CUDA
         //! Typed sparse exchange plan shared by setup graph fields.
         std::unique_ptr<AlgHaloExchange> halo;
 
-        //! HYPRE-equivalent Chebyshev smoother and level spectral data.
-        std::unique_ptr<HypreChebyshevSmoother<T>> smoother;
+        //! L1-Jacobi smoother and cached absolute row sums, when selected.
+        std::unique_ptr<L1JacobiSmoother<T>> l1_jacobi_smoother;
+        //! HYPRE-equivalent Chebyshev smoother, when selected.
+        std::unique_ptr<HypreChebyshevSmoother<T>> chebyshev_smoother;
         //! Level right-hand-side workspace.
         AlgVector<T> rhs;
         //! Level correction workspace.
@@ -292,6 +309,9 @@ private:
     void factor_coarse_matrix ();
     //! Recompute hierarchy complexity and persistent-storage diagnostics.
     void update_diagnostics (double setup_seconds);
+    /** Apply the configured smoother to one level. */
+    void smooth (Level& level, AlgVector<T>& x, AlgVector<T> const& b,
+                 bool zero_initial_guess);
     /**
      * \brief Apply a recursive V(1,1)-cycle beginning at level \p ilev.
      *
@@ -506,15 +526,21 @@ void AMG<T>::initialize_level (Level& level)
     auto host_rows = helper_type::copy_local_global_csr(*level.A);
     level.rows = copy_to_device(host_rows);
 
-    typename HypreChebyshevSmoother<T>::Options smoother_options;
-    smoother_options.order = m_options.chebyshev_order;
-    smoother_options.eigenvalue_iterations =
-        m_options.chebyshev_eigenvalue_iterations;
-    smoother_options.fraction = m_options.chebyshev_fraction;
-    smoother_options.variant = m_options.chebyshev_variant;
-    smoother_options.scale = m_options.chebyshev_scale;
-    level.smoother = std::make_unique<HypreChebyshevSmoother<T>>(
-        *level.A, smoother_options);
+    if (m_options.smoother == Smoother::l1_jacobi) {
+        level.l1_jacobi_smoother =
+            std::make_unique<L1JacobiSmoother<T>>(*level.A);
+    } else {
+        typename HypreChebyshevSmoother<T>::Options smoother_options;
+        smoother_options.order = m_options.chebyshev_order;
+        smoother_options.eigenvalue_iterations =
+            m_options.chebyshev_eigenvalue_iterations;
+        smoother_options.fraction = m_options.chebyshev_fraction;
+        smoother_options.variant = m_options.chebyshev_variant;
+        smoother_options.scale = m_options.chebyshev_scale;
+        level.chebyshev_smoother =
+            std::make_unique<HypreChebyshevSmoother<T>>(
+                *level.A, smoother_options);
+    }
     level.rhs.define(partition);
     level.correction.define(partition);
     level.residual.define(partition);
@@ -1366,8 +1392,12 @@ void AMG<T>::update_diagnostics (double setup_seconds)
             + static_cast<Long>(level.cf_marker.size()*sizeof(int))
             + static_cast<Long>(level.coarse_id.size()*sizeof(Long))
             + 4*level.A->numLocalRows()*static_cast<Long>(sizeof(T));
-        if (level.smoother) {
+        if (level.l1_jacobi_smoother) {
             local_storage += level.A->numLocalRows()
+                *static_cast<Long>(sizeof(T));
+        }
+        if (level.chebyshev_smoother) {
+            local_storage += 5*level.A->numLocalRows()
                 *static_cast<Long>(sizeof(T));
         }
         if (level.halo) {
@@ -1447,19 +1477,26 @@ void AMG<T>::setup ()
         m_options.pre_sweeps == 1 && m_options.post_sweeps == 1,
         "The first AMG implementation supports only V(1,1)");
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        m_options.chebyshev_order >= 1 && m_options.chebyshev_order <= 4,
-        "AMG Chebyshev order must be in [1,4]");
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        m_options.chebyshev_eigenvalue_iterations > 0,
-        "AMG Chebyshev eigenvalue iterations must be positive");
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        m_options.chebyshev_fraction >= T(0)
-        && m_options.chebyshev_fraction <= T(1),
-        "AMG Chebyshev fraction must be in [0,1]");
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-        m_options.chebyshev_variant == 0
-        || m_options.chebyshev_variant == 1,
-        "AMG Chebyshev variant must be zero or one");
+        m_options.smoother == Smoother::l1_jacobi
+        || m_options.smoother == Smoother::chebyshev,
+        "AMG smoother must be L1-Jacobi or Chebyshev");
+    if (m_options.smoother == Smoother::chebyshev) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            m_options.chebyshev_order >= 1
+            && m_options.chebyshev_order <= 4,
+            "AMG Chebyshev order must be in [1,4]");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            m_options.chebyshev_eigenvalue_iterations >= 0,
+            "AMG Chebyshev eigenvalue iterations must be nonnegative");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            m_options.chebyshev_fraction >= T(0)
+            && m_options.chebyshev_fraction <= T(1),
+            "AMG Chebyshev fraction must be in [0,1]");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            m_options.chebyshev_variant == 0
+            || m_options.chebyshev_variant == 1,
+            "AMG Chebyshev variant must be zero or one");
+    }
 
     m_is_setup = false;
     m_use_dense_coarse_solve = true;
@@ -1532,6 +1569,20 @@ void AMG<T>::solve_coarse (AlgVector<T>& x,
 }
 
 template <typename T>
+void AMG<T>::smooth (Level& level, AlgVector<T>& x,
+                     AlgVector<T> const& b, bool zero_initial_guess)
+{
+    if (m_options.smoother == Smoother::l1_jacobi) {
+        AMREX_ALWAYS_ASSERT(level.l1_jacobi_smoother != nullptr);
+        level.l1_jacobi_smoother->sweep(
+            x, b, level.work, zero_initial_guess);
+    } else {
+        AMREX_ALWAYS_ASSERT(level.chebyshev_smoother != nullptr);
+        level.chebyshev_smoother->sweep(x, b);
+    }
+}
+
+template <typename T>
 void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
                      AlgVector<T> const& b)
 {
@@ -1540,13 +1591,13 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
         if (m_use_dense_coarse_solve) {
             solve_coarse(x, b);
         } else {
-            level.smoother->sweep(x, b);
+            smooth(level, x, b, true);
         }
         return;
     }
 
     Long const nrows = x.numLocalRows();
-    level.smoother->sweep(x, b);
+    smooth(level, x, b, true);
 
     SpMV(level.work, *level.A, x);
     auto const* AMREX_RESTRICT pb = b.data();
@@ -1565,7 +1616,7 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
     SpMV(level.work, *level.P, next.correction);
     x.plusAsync(level.work);
 
-    level.smoother->sweep(x, b);
+    smooth(level, x, b, false);
     Gpu::streamSynchronize();
 }
 

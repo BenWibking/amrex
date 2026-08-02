@@ -920,11 +920,11 @@ classical algebraic multigrid preconditioner for distributed
 :cpp:`amrex::SpMatrix<T>` matrices.  The current implementation is intended
 for square, nonsingular scalar elliptic matrices with one positive diagonal
 entry per row and predominantly non-positive off-diagonal entries.  It uses
-PMIS C/F coarsening, matrix-based Extended+i interpolation, L1-Jacobi
-smoothing, and Galerkin coarse operators.  Extended+i forms its fine-point
-weights from strong :math:`A_{FF}` and :math:`A_{FC}` submatrices and one
-sparse matrix product.  It does not use aggregation and does not require
-HYPRE at runtime.
+PMIS C/F coarsening, matrix-based Extended+i interpolation, selectable
+L1-Jacobi or Chebyshev smoothing, and Galerkin coarse operators.  Extended+i
+forms its fine-point weights from strong :math:`A_{FF}` and
+:math:`A_{FC}` submatrices and one sparse matrix product.  It does not use
+aggregation and does not require HYPRE at runtime.
 
 The matrix must outlive the AMG object and must not be modified after
 :cpp:`setup`.  Its row and column partitions must be identical, and every row
@@ -949,12 +949,38 @@ entries per row.  Interpolation truncation retains the largest-magnitude
 entries and adjusts them to preserve the original row sum; set
 ``max_interp_elements`` to zero to disable the cap.  The hierarchy has at most
 25 levels, uses a dense coarse solve for at most 9 unknowns, and applies one
-L1-Jacobi sweep before and after coarse-grid correction.  If PMIS does not
-reduce a larger level, or the level limit is reached first, that terminal
-level instead receives one zero-initialized L1-Jacobi sweep, matching
-BoomerAMG's setup termination behavior.  The first implementation supports
-only this V(1,1) cycle.  Use :cpp:`AMG<T>::Options` to change these controls or
-the deterministic PMIS seed before calling :cpp:`setup`.
+smoother before and after coarse-grid correction.  Chebyshev is the default;
+L1-Jacobi maps to HYPRE relaxation type 18 and Chebyshev maps to type 16.  If
+PMIS does not reduce a larger level, or the level limit is reached first, that
+terminal level instead receives one zero-initialized application of the
+selected smoother.  The first implementation supports only this V(1,1)
+cycle.  Select the smoother before calling :cpp:`setup`:
+
+.. code-block:: c++
+
+   amrex::AMG<amrex::Real>::Options options;
+   options.smoother =
+       amrex::AMG<amrex::Real>::Smoother::l1_jacobi;
+   amrex::AMG<amrex::Real> amg(A, options);
+
+For Chebyshev, ``chebyshev_eigenvalue_iterations`` follows HYPRE's
+``eig_est`` convention.  Its default value of 10 performs ten CG/Lanczos
+steps using HYPRE-compatible rank-seeded starting values.  Setting it to zero
+uses the Gershgorin algorithm instead.  That estimate is mathematically
+independent of the MPI row partition because it uses complete matrix-row
+bounds followed only by global minimum and maximum operations:
+
+.. code-block:: c++
+
+   amrex::AMG<amrex::Real>::Options options;
+   options.smoother =
+       amrex::AMG<amrex::Real>::Smoother::chebyshev;
+   options.chebyshev_eigenvalue_iterations = 0;
+   amrex::AMG<amrex::Real> amg(A, options);
+
+Floating-point summation order can still prevent bitwise-identical estimates
+across different executions.  Other :cpp:`AMG<T>::Options` control the
+Chebyshev polynomial, hierarchy, interpolation, and deterministic PMIS seed.
 
 :cpp:`apply(z,r)` applies one fixed, zero-initialized V(1,1)-cycle and is
 suitable for use as a right preconditioner with :cpp:`GMRES_MV`:

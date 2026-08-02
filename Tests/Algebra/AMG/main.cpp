@@ -464,7 +464,7 @@ test_strength_max_row_sum ()
     }
 }
 
-/** Verify that an all-weak graph terminates with one Chebyshev application. */
+/** Verify both smoother choices on a terminal all-weak level. */
 void
 test_all_weak_terminal_level ()
 {
@@ -473,26 +473,42 @@ test_all_weak_terminal_level ()
         {
             return {{row, Real(2)}};
         });
-    AMG<Real> amg(A);
-    amg.setup();
-    AMREX_ALWAYS_ASSERT(amg.numLevels() == 1);
-
     AlgVector<Real> b(A.partition());
-    AlgVector<Real> x(A.partition());
-    AlgVector<Real> expected(A.partition());
     b.setVal(Real(1));
-    expected.setVal(Real(0));
-    HypreChebyshevSmoother<Real>::Options smoother_options;
-    smoother_options.order = 4;
-    HypreChebyshevSmoother<Real> smoother(A, smoother_options);
-    smoother.sweep(expected, b);
-    amg.apply(x, b);
-    auto local_x = copy_to_host(x);
-    auto local_expected = copy_to_host(expected);
-    for (Long i = 0; i < x.numLocalRows(); ++i) {
-        AMREX_ALWAYS_ASSERT(
-            std::abs(local_x[i]-local_expected[i]) < unit_tolerance());
-    }
+    auto check_smoother = [&] (AMG<Real>::Smoother smoother_type)
+    {
+        AMG<Real>::Options options;
+        options.smoother = smoother_type;
+        options.chebyshev_eigenvalue_iterations = 0;
+        AMG<Real> amg(A, options);
+        amg.setup();
+        AMREX_ALWAYS_ASSERT(amg.numLevels() == 1);
+
+        AlgVector<Real> x(A.partition());
+        AlgVector<Real> expected(A.partition());
+        expected.setVal(Real(0));
+        if (smoother_type == AMG<Real>::Smoother::l1_jacobi) {
+            AlgVector<Real> work(A.partition());
+            L1JacobiSmoother<Real> smoother(A);
+            smoother.sweep(expected, b, work, true);
+        } else {
+            HypreChebyshevSmoother<Real>::Options smoother_options;
+            smoother_options.order = 4;
+            smoother_options.eigenvalue_iterations = 0;
+            HypreChebyshevSmoother<Real> smoother(A, smoother_options);
+            smoother.sweep(expected, b);
+        }
+        amg.apply(x, b);
+        auto local_x = copy_to_host(x);
+        auto local_expected = copy_to_host(expected);
+        for (Long i = 0; i < x.numLocalRows(); ++i) {
+            AMREX_ALWAYS_ASSERT(
+                std::abs(local_x[i]-local_expected[i]) < unit_tolerance());
+        }
+    };
+
+    check_smoother(AMG<Real>::Smoother::l1_jacobi);
+    check_smoother(AMG<Real>::Smoother::chebyshev);
 }
 
 void
@@ -968,6 +984,58 @@ test_hypre_chebyshev ()
     }
 }
 
+/** Verify HYPRE's partition-independent Gershgorin eigenvalue estimate. */
+void
+test_hypre_chebyshev_gershgorin ()
+{
+    // Three rows leave one empty rank in the four-rank regression.
+    auto A = make_periodic_shifted_1d(3, Real(4));
+    HypreChebyshevSmoother<Real>::Options options;
+    options.eigenvalue_iterations = 0;
+    HypreChebyshevSmoother<Real> scaled(A, options);
+    AMREX_ALWAYS_ASSERT(
+        std::abs(scaled.minEigenvalue()-Real(0.5)) < unit_tolerance());
+    AMREX_ALWAYS_ASSERT(
+        std::abs(scaled.maxEigenvalue()-Real(1.5)) < unit_tolerance());
+
+    options.scale = false;
+    HypreChebyshevSmoother<Real> unscaled(A, options);
+    AMREX_ALWAYS_ASSERT(
+        std::abs(unscaled.minEigenvalue()-Real(2)) < unit_tolerance());
+    AMREX_ALWAYS_ASSERT(
+        std::abs(unscaled.maxEigenvalue()-Real(6)) < unit_tolerance());
+}
+
+/** Exercise both selectable smoothers through a multilevel V-cycle. */
+void
+test_amg_smoother_options ()
+{
+    auto A = make_shifted_2d(10, 9, false, Real(1), Real(1));
+    AlgVector<Real> exact(A.partition());
+    AlgVector<Real> b(A.partition());
+    fill_exact(exact);
+    SpMV(b, A, exact);
+    Real const initial_residual = b.norm2();
+
+    auto check_smoother = [&] (AMG<Real>::Smoother smoother_type,
+                               int eigenvalue_iterations)
+    {
+        AMG<Real>::Options options;
+        options.smoother = smoother_type;
+        options.chebyshev_eigenvalue_iterations = eigenvalue_iterations;
+        AMG<Real> amg(A, options);
+        amg.setup();
+        AMREX_ALWAYS_ASSERT(amg.numLevels() > 1);
+        AlgVector<Real> correction(A.partition());
+        amg.apply(correction, b);
+        AMREX_ALWAYS_ASSERT(
+            true_residual(A, correction, b) < initial_residual);
+    };
+
+    check_smoother(AMG<Real>::Smoother::l1_jacobi, 10);
+    check_smoother(AMG<Real>::Smoother::chebyshev, 0);
+}
+
 void
 test_all_coarse_sizes ()
 {
@@ -1277,6 +1345,8 @@ main (int argc, char* argv[])
     test_interpolation_restriction_and_galerkin();
     test_l1_jacobi();
     test_hypre_chebyshev();
+    test_hypre_chebyshev_gershgorin();
+    test_amg_smoother_options();
     test_all_coarse_sizes();
 
     auto shifted_2d =

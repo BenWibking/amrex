@@ -11,6 +11,8 @@
 #include <AMReX_Gpu.H>
 #include <AMReX_Math.H>
 #include <AMReX_ParallelDescriptor.H>
+#include <AMReX_ParallelReduce.H>
+#include <AMReX_Reduce.H>
 #include <AMReX_SpMatrix.H>
 #include <AMReX_SpMV.H>
 
@@ -25,10 +27,11 @@ namespace amrex {
  * \brief Diagonally scaled Chebyshev relaxation matching HYPRE BoomerAMG.
  *
  * This follows HYPRE relaxation type 16, including its default order-two
- * standard polynomial, diagonal scaling, ten-step CG/Lanczos eigenvalue
- * estimate, spectral fraction 0.3, coefficient formulas, and Horner apply.
- * The implementation follows par_cheby_setup.c, par_cheby_solve.c, and the
- * CG eigenvalue estimator in par_relax_more.c from HYPRE.
+ * standard polynomial, diagonal scaling, either a CG/Lanczos or Gershgorin
+ * eigenvalue estimate, spectral fraction 0.3, coefficient formulas, and
+ * Horner apply. The implementation follows par_cheby_setup.c,
+ * par_cheby_solve.c, and the eigenvalue estimators in par_relax_more.c from
+ * HYPRE.
  */
 template <typename T>
 class HypreChebyshevSmoother
@@ -38,6 +41,7 @@ public:
 
     struct Options {
         int order = 2;
+        //! Zero selects Gershgorin; a positive value selects CG/Lanczos.
         int eigenvalue_iterations = 10;
         T fraction = T(0.3);
         int variant = 0;
@@ -51,10 +55,14 @@ public:
           m_original(A.partition()), m_tmp(A.partition())
     {
         m_options.order = std::clamp(m_options.order, 1, 4);
-        AMREX_ALWAYS_ASSERT(m_options.eigenvalue_iterations > 0);
+        AMREX_ALWAYS_ASSERT(m_options.eigenvalue_iterations >= 0);
         AMREX_ALWAYS_ASSERT(m_options.variant == 0 || m_options.variant == 1);
         define_scaling();
-        estimate_eigenvalues();
+        if (m_options.eigenvalue_iterations == 0) {
+            estimate_eigenvalues_gershgorin();
+        } else {
+            estimate_eigenvalues_cg();
+        }
         define_coefficients();
     }
 
@@ -251,7 +259,75 @@ private:
         return 0;
     }
 
-    void estimate_eigenvalues ()
+    /**
+     * \brief Estimate the spectrum with HYPRE's Gershgorin algorithm.
+     *
+     * The bounds depend only on complete global matrix rows and a global
+     * minimum/maximum, so the mathematical estimate is independent of how
+     * rows are partitioned among MPI ranks.
+     */
+    void estimate_eigenvalues_gershgorin ()
+    {
+        auto const a = m_matrix->const_parcsr();
+        auto const& diagonal = m_matrix->diagonalVector();
+        auto const* AMREX_RESTRICT pd = diagonal.data();
+        Long const nrows = m_matrix->numLocalRows();
+        bool const scale = m_options.scale;
+
+        ReduceOps<ReduceOpMin,ReduceOpMax> reduce_op;
+        ReduceData<T,T> reduce_data(reduce_op);
+        using ReduceTuple = typename decltype(reduce_data)::Type;
+        reduce_op.eval(
+            nrows, reduce_data,
+            [=] AMREX_GPU_DEVICE (Long i) noexcept -> ReduceTuple
+            {
+                T radius = T(0);
+                for (Long p = a.csr0.row_offset[i];
+                     p < a.csr0.row_offset[i+1]; ++p)
+                {
+                    radius += Math::abs(a.csr0.mat[p]);
+                }
+                if (a.csr1.nnz > 0 && a.row_map != nullptr) {
+                    Long const remote_row = a.row_map[i];
+                    if (remote_row >= 0) {
+                        for (Long p = a.csr1.row_offset[remote_row];
+                             p < a.csr1.row_offset[remote_row+1]; ++p)
+                        {
+                            radius += Math::abs(a.csr1.mat[p]);
+                        }
+                    }
+                }
+                T const diagonal_value = pd[i];
+                radius -= Math::abs(diagonal_value);
+                T lower = diagonal_value-radius;
+                T upper = diagonal_value+radius;
+                if (scale) {
+                    T const diagonal_magnitude = Math::abs(diagonal_value);
+                    lower /= diagonal_magnitude;
+                    upper /= diagonal_magnitude;
+                }
+                return {lower,upper};
+            });
+
+        auto bounds = reduce_data.value(reduce_op);
+        T lower = amrex::get<0>(bounds);
+        T upper = amrex::get<1>(bounds);
+        ParallelAllReduce::Min(
+            lower, ParallelContext::CommunicatorSub());
+        ParallelAllReduce::Max(
+            upper, ParallelContext::CommunicatorSub());
+
+        if (Math::abs(lower) > Math::abs(upper)) {
+            m_min_eigenvalue = lower;
+            m_max_eigenvalue = std::min(T(0), upper);
+        } else {
+            m_min_eigenvalue = std::max(lower, T(0));
+            m_max_eigenvalue = upper;
+        }
+    }
+
+    /** Estimate the spectrum with HYPRE's CG/Lanczos algorithm. */
+    void estimate_eigenvalues_cg ()
     {
         int const iterations = m_options.eigenvalue_iterations;
         AlgVector<T> p(m_matrix->partition());
