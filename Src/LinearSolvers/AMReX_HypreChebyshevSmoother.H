@@ -8,6 +8,7 @@
 #include <AMReX_Config.H>
 
 #include <AMReX_AlgVecUtil.H>
+#include <AMReX_BLProfiler.H>
 #include <AMReX_Gpu.H>
 #include <AMReX_Math.H>
 #include <AMReX_ParallelDescriptor.H>
@@ -124,6 +125,7 @@ public:
 private:
     void define_scaling ()
     {
+        BL_PROFILE("Chebyshev::define_scaling()");
         if (!m_options.scale) {
             m_scaling.setVal(T(1));
             return;
@@ -268,6 +270,7 @@ private:
      */
     void estimate_eigenvalues_gershgorin ()
     {
+        BL_PROFILE("Chebyshev::estimate_eigenvalues_gershgorin()");
         auto const a = m_matrix->const_parcsr();
         auto const& diagonal = m_matrix->diagonalVector();
         auto const* AMREX_RESTRICT pd = diagonal.data();
@@ -329,6 +332,7 @@ private:
     /** Estimate the spectrum with HYPRE's CG/Lanczos algorithm. */
     void estimate_eigenvalues_cg ()
     {
+        BL_PROFILE("Chebyshev::estimate_eigenvalues_cg()");
         int const iterations = m_options.eigenvalue_iterations;
         AlgVector<T> p(m_matrix->partition());
         AlgVector<T> s(m_matrix->partition());

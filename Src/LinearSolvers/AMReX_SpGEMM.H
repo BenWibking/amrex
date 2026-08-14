@@ -2,8 +2,10 @@
 #define AMREX_SPGEMM_H_
 #include <AMReX_Config.H>
 
+#include <AMReX_BLProfiler.H>
 #include <AMReX_Gpu.H>
 #include <AMReX_ParallelContext.H>
+#include <AMReX_ParallelDescriptor.H>
 #include <AMReX_Reduce.H>
 #include <AMReX_Scan.H>
 #include <AMReX_SpMatrix.H>
@@ -57,6 +59,7 @@ struct SpGEMMHelper
      */
     static host_csr_type copy_local_global_csr (matrix_type const& A)
     {
+        BL_PROFILE("SpGEMM::copy_local_global_csr()");
         host_csr_type hlocal;
         host_csr_type hremote;
 
@@ -134,6 +137,25 @@ struct SpGEMMHelper
             result.row_offset[i+1] = static_cast<Long>(result.mat.size());
         }
         result.nnz = static_cast<Long>(result.mat.size());
+        return result;
+    }
+
+    /**
+     * \brief Copy an unsplit local CSR block into pinned host memory without
+     * the sort/merge canonicalization.
+     *
+     * Valid only on a single rank, where the matrix is unsplit and its column
+     * indices are already global.  The Gustavson kernels accumulate duplicate
+     * columns correctly, so this is sufficient input for \ref multiply and
+     * \ref rap_fused.
+     */
+    static host_csr_type copy_local_global_csr_fast (matrix_type const& A)
+    {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            !A.m_split,
+            "SpGEMM fast path requires an unsplit matrix (single rank)");
+        host_csr_type result;
+        copy_to_host(result, A.m_csr);
         return result;
     }
 
@@ -237,6 +259,7 @@ struct SpGEMMHelper
     static host_csr_type import_required_rows (host_csr_type& A,
                                                matrix_type const& B)
     {
+        BL_PROFILE("SpGEMM::import_required_rows()");
         auto local = copy_local_global_csr(B);
         auto const& partition = B.partition().dataVector();
         Long const global_nrows = B.numGlobalRows();
@@ -462,6 +485,7 @@ struct SpGEMMHelper
                               host_csr_type const& hB,
                               Long ncols)
     {
+        BL_PROFILE("SpGEMM::multiply()");
         csr_type A;
         csr_type B;
         copy_to_device(A, hA);
@@ -479,8 +503,13 @@ struct SpGEMMHelper
 
         auto const* AMREX_RESTRICT arow = A.row_offset.data();
         auto const* AMREX_RESTRICT acol = A.col_index.data();
+        auto const* AMREX_RESTRICT aval = A.mat.data();
         auto const* AMREX_RESTRICT brow = B.row_offset.data();
+        auto const* AMREX_RESTRICT bcol = B.col_index.data();
+        auto const* AMREX_RESTRICT bval = B.mat.data();
         Long const brows = B.nrows();
+
+#ifdef AMREX_USE_GPU
 
         container_type<Long> product_counts(nrows);
         auto* AMREX_RESTRICT pcounts = product_counts.data();
@@ -520,9 +549,6 @@ struct SpGEMMHelper
         products.col_index.resize(num_products);
         auto* AMREX_RESTRICT product_val = products.mat.data();
         auto* AMREX_RESTRICT product_col = products.col_index.data();
-        auto const* AMREX_RESTRICT aval = A.mat.data();
-        auto const* AMREX_RESTRICT bval = B.mat.data();
-        auto const* AMREX_RESTRICT bcol = B.col_index.data();
         ParallelFor(nrows+1, [=] AMREX_GPU_DEVICE (Long i) noexcept
         {
             if (i == nrows) {
@@ -608,9 +634,233 @@ struct SpGEMMHelper
                 }
             }
         });
+
+#else
+
+        // Gustavson accumulation: gather into a dense column accumulator and
+        // emit sorted columns without sorting the full expanded product list.
+        container_type<Long> mark(ncols, Long(-1));
+        container_type<Long> counts(nrows, Long(0));
+
+        for (Long i = 0; i < nrows; ++i) {
+            Long count = 0;
+            for (Long ap = arow[i]; ap < arow[i+1]; ++ap) {
+                Long const k = acol[ap];
+                AMREX_ALWAYS_ASSERT(k >= 0 && k < brows);
+                for (Long bp = brow[k]; bp < brow[k+1]; ++bp) {
+                    Long const j = bcol[bp];
+                    if (mark[j] != i) {
+                        mark[j] = i;
+                        ++count;
+                    }
+                }
+            }
+            counts[i] = count;
+        }
+        for (Long j = 0; j < ncols; ++j) {
+            mark[j] = Long(-1);
+        }
+
+        csr_type C;
+        C.row_offset.resize(nrows+1);
+        Long cnnz = 0;
+        for (Long i = 0; i < nrows; ++i) {
+            C.row_offset[i] = cnnz;
+            cnnz += counts[i];
+        }
+        C.row_offset[nrows] = cnnz;
+        C.nnz = cnnz;
+        C.col_index.resize(cnnz);
+        C.mat.resize(cnnz);
+
+        container_type<T> acc(ncols, T(0));
+        container_type<Long> order(ncols);
+        Long out = 0;
+        for (Long i = 0; i < nrows; ++i) {
+            Long count = 0;
+            for (Long ap = arow[i]; ap < arow[i+1]; ++ap) {
+                Long const k = acol[ap];
+                T const a = aval[ap];
+                for (Long bp = brow[k]; bp < brow[k+1]; ++bp) {
+                    Long const j = bcol[bp];
+                    if (mark[j] != i) {
+                        mark[j] = i;
+                        acc[j] = T(0);
+                        order[count++] = j;
+                    }
+                    acc[j] += a * bval[bp];
+                }
+            }
+            std::sort(order.data(), order.data() + count);
+            for (Long x = 0; x < count; ++x) {
+                Long const j = order[x];
+                C.col_index[out] = j;
+                C.mat[out] = acc[j];
+                ++out;
+            }
+        }
+
+#endif
+
         Gpu::streamSynchronize();
         return C;
     }
+
+    /**
+     * \brief Form the Galerkin product \f$C = R A P\f$ in two host-space
+     * products, skipping the intermediate distributed-matrix round-trip.
+     *
+     * Correct only when every row referenced by \p hR is present in the
+     * intermediate product (i.e. the single-rank case).
+     */
+    static csr_type rap (host_csr_type const& hR,
+                         host_csr_type const& hA,
+                         host_csr_type const& hP,
+                         Long ncols)
+    {
+        auto B = multiply(hA, hP, ncols);
+        host_csr_type B_host;
+        copy_to_host(B_host, B);
+        return multiply(hR, B_host, ncols);
+    }
+
+#ifndef AMREX_USE_GPU
+    /**
+     * \brief Form the Galerkin product \f$C = R A P\f$ in a single fused
+     * triple loop (HYPRE-style), never materializing the intermediate
+     * \f$A P\f$ matrix.
+     *
+     * Two Gustavson marker arrays drive the accumulation.  \c amark tracks
+     * which fine points have had their \c P row expanded for the current
+     * coarse row (so each is expanded once per row), and \c pmark tracks
+     * which coarse columns already own an accumulator slot for the current
+     * coarse row.  Correct only on a single rank, where every row referenced
+     * by \p hR is present in \p hA and \p hP.
+     *
+     * \param hR Restriction in canonical local-global form (coarse rows,
+     *          fine columns).
+     * \param hA Level operator in canonical local-global form; its column
+     *          indices are the compact indices returned by
+     *          \ref import_required_rows.
+     * \param hP Interpolation imported by \ref import_required_rows (fine
+     *          rows, coarse columns).
+     * \param ncols Number of coarse columns in the product.
+     * \return Device-accessible local CSR rows of \f$R A P\f$.
+     */
+    static csr_type rap_fused (host_csr_type const& hR,
+                               host_csr_type const& hA,
+                               host_csr_type const& hP,
+                               Long ncols)
+    {
+        BL_PROFILE("SpGEMM::rap_fused()");
+        Long const ncoarse = hR.nrows();
+        Long const nfine = hA.nrows();
+        Long const nimported = hP.nrows();
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            ncoarse == ncols,
+            "SpGEMM_RAP: coarse row count does not match coarse column count");
+
+        if (ncoarse == 0 || hR.nnz == 0 || hA.nnz == 0 || hP.nnz == 0) {
+            csr_type empty;
+            empty.resize(ncoarse, 0);
+            return empty;
+        }
+
+        auto const* AMREX_RESTRICT rrow = hR.row_offset.data();
+        auto const* AMREX_RESTRICT rcol = hR.col_index.data();
+        auto const* AMREX_RESTRICT rval = hR.mat.data();
+        auto const* AMREX_RESTRICT arow = hA.row_offset.data();
+        auto const* AMREX_RESTRICT acol = hA.col_index.data();
+        auto const* AMREX_RESTRICT aval = hA.mat.data();
+        auto const* AMREX_RESTRICT prow = hP.row_offset.data();
+        auto const* AMREX_RESTRICT pcol = hP.col_index.data();
+        auto const* AMREX_RESTRICT pval = hP.mat.data();
+
+        // Symbolic pass: count distinct output columns per coarse row.
+        container_type<Long> counts(ncoarse, Long(0));
+        container_type<Long> amark(nimported, Long(-1));
+        container_type<Long> pmark(ncols, Long(-1));
+        for (Long i = 0; i < ncoarse; ++i) {
+            Long cnt = 0;
+            for (Long rp = rrow[i]; rp < rrow[i+1]; ++rp) {
+                Long const k = rcol[rp];
+                AMREX_ALWAYS_ASSERT(k >= 0 && k < nfine);
+                for (Long ap = arow[k]; ap < arow[k+1]; ++ap) {
+                    Long const l = acol[ap];
+                    if (amark[l] != i) {
+                        amark[l] = i;
+                        for (Long pp = prow[l]; pp < prow[l+1]; ++pp) {
+                            Long const j = pcol[pp];
+                            if (pmark[j] != i) {
+                                pmark[j] = i;
+                                ++cnt;
+                            }
+                        }
+                    }
+                }
+            }
+            counts[i] = cnt;
+        }
+
+        for (Long l = 0; l < nimported; ++l) { amark[l] = Long(-1); }
+        for (Long j = 0; j < ncols; ++j) { pmark[j] = Long(-1); }
+
+        csr_type C;
+        C.row_offset.resize(ncoarse+1);
+        Long cnnz = 0;
+        for (Long i = 0; i < ncoarse; ++i) {
+            C.row_offset[i] = cnnz;
+            cnnz += counts[i];
+        }
+        C.row_offset[ncoarse] = cnnz;
+        C.nnz = cnnz;
+        C.col_index.resize(cnnz);
+        C.mat.resize(cnnz);
+
+        // Numeric pass: accumulate and emit sorted columns.
+        container_type<T> acc(ncols, T(0));
+        container_type<Long> order(ncols);
+        Long out = 0;
+        for (Long i = 0; i < ncoarse; ++i) {
+            Long count = 0;
+            for (Long rp = rrow[i]; rp < rrow[i+1]; ++rp) {
+                Long const k = rcol[rp];
+                T const r = rval[rp];
+                for (Long ap = arow[k]; ap < arow[k+1]; ++ap) {
+                    Long const l = acol[ap];
+                    T const ra = r * aval[ap];
+                    if (amark[l] != i) {
+                        amark[l] = i;
+                        for (Long pp = prow[l]; pp < prow[l+1]; ++pp) {
+                            Long const j = pcol[pp];
+                            T const rap = ra * pval[pp];
+                            if (pmark[j] != i) {
+                                pmark[j] = i;
+                                acc[j] = T(0);
+                                order[count++] = j;
+                            }
+                            acc[j] += rap;
+                        }
+                    } else {
+                        for (Long pp = prow[l]; pp < prow[l+1]; ++pp) {
+                            Long const j = pcol[pp];
+                            acc[j] += ra * pval[pp];
+                        }
+                    }
+                }
+            }
+            std::sort(order.data(), order.data() + count);
+            for (Long x = 0; x < count; ++x) {
+                Long const j = order[x];
+                C.col_index[out] = j;
+                C.mat[out] = acc[j];
+                ++out;
+            }
+            AMREX_ALWAYS_ASSERT(out == C.row_offset[i+1]);
+        }
+        return C;
+    }
+#endif
 
 private:
     /**
@@ -694,6 +944,21 @@ SpGEMM (SpMatrix<T,Allocator> const& A,
         B.columnPartition().empty()
         || B.columnPartition() == col_partition,
         "SpGEMM: right column partition does not match product column partition");
+    if (ParallelDescriptor::NProcs() == 1) {
+        // Single rank: columns are global and no remote rows exist, so the
+        // sort/merge + row-import round-trip is unnecessary.
+        auto hA = SpGEMMHelper<T,Allocator>::copy_local_global_csr_fast(A);
+        auto hB = SpGEMMHelper<T,Allocator>::copy_local_global_csr_fast(B);
+        for (auto const col : hB.col_index) {
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                col >= 0 && col < col_partition.numGlobalRows(),
+                "SpGEMM: right column index is outside product column range");
+        }
+        auto C = SpGEMMHelper<T,Allocator>::multiply(
+            hA, hB, col_partition.numGlobalRows());
+        return SpMatrix<T,Allocator>(
+            A.partition(), col_partition, std::move(C));
+    }
     auto hA = SpGEMMHelper<T,Allocator>::copy_local_global_csr(A);
     auto hB = SpGEMMHelper<T,Allocator>::import_required_rows(hA, B);
     for (auto const col : hB.col_index) {
@@ -705,6 +970,62 @@ SpGEMM (SpMatrix<T,Allocator> const& A,
         hA, hB, col_partition.numGlobalRows());
     return SpMatrix<T,Allocator>(
         A.partition(), col_partition, std::move(C));
+}
+
+/**
+ * \brief Form the algebraic multigrid Galerkin product \f$C = R A P\f$.
+ *
+ * \param R Restriction (coarse rows, fine columns).
+ * \param A Level operator (fine rows and columns).
+ * \param P Interpolation (fine rows, coarse columns).
+ * \param col_partition Column partition of the product.
+ *
+ * On a single rank the two SpGEMM products are fused in host space, avoiding
+ * the intermediate \f$A P\f$ distributed-matrix round-trip.  Multi-rank
+ * builds fall back to two ordinary SpGEMM products so remote-row import is
+ * handled correctly.
+ */
+template <typename T, template <typename> class Allocator>
+SpMatrix<T,Allocator>
+SpGEMM_RAP (SpMatrix<T,Allocator> const& R,
+            SpMatrix<T,Allocator> const& A,
+            SpMatrix<T,Allocator> const& P,
+            AlgPartition const& col_partition)
+{
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        R.columnPartition().empty() || R.columnPartition() == A.partition(),
+        "SpGEMM_RAP: R column partition does not match A row partition");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        A.columnPartition().empty() || A.columnPartition() == P.partition(),
+        "SpGEMM_RAP: A column partition does not match P row partition");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        P.columnPartition().empty() || P.columnPartition() == col_partition,
+        "SpGEMM_RAP: P column partition does not match product column partition");
+
+    if (ParallelDescriptor::NProcs() > 1) {
+        auto B = SpGEMM(A, P, col_partition);
+        return SpGEMM(R, B, col_partition);
+    }
+
+    // Single rank: columns are global and every referenced row is local,
+    // so the sort/merge + row-import round-trip is unnecessary.
+    auto hR = SpGEMMHelper<T,Allocator>::copy_local_global_csr_fast(R);
+    auto hA = SpGEMMHelper<T,Allocator>::copy_local_global_csr_fast(A);
+    auto hP = SpGEMMHelper<T,Allocator>::copy_local_global_csr_fast(P);
+    for (auto const col : hP.col_index) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            col >= 0 && col < col_partition.numGlobalRows(),
+            "SpGEMM_RAP: P column index is outside product column range");
+    }
+#ifdef AMREX_USE_GPU
+    auto C = SpGEMMHelper<T,Allocator>::rap(
+        hR, hA, hP, col_partition.numGlobalRows());
+#else
+    auto C = SpGEMMHelper<T,Allocator>::rap_fused(
+        hR, hA, hP, col_partition.numGlobalRows());
+#endif
+    return SpMatrix<T,Allocator>(
+        R.partition(), col_partition, std::move(C));
 }
 
 }

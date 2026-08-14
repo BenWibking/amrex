@@ -4,6 +4,7 @@
 
 #include <AMReX_AlgHaloExchange.H>
 #include <AMReX_AlgVecUtil.H>
+#include <AMReX_BLProfiler.H>
 #include <AMReX_HypreChebyshevSmoother.H>
 #include <AMReX_L1JacobiSmoother.H>
 #include <AMReX_LUSolver.H>
@@ -90,9 +91,12 @@ public:
          * \brief HYPRE-style level-spectrum estimator control.
          *
          * Zero selects the algorithmically partition-independent Gershgorin
-         * estimate. A positive value selects that many CG/Lanczos steps.
+         * estimate. A positive value selects that many CG/Lanczos steps. The
+         * default is Gershgorin: it is reproducible across MPI decompositions
+         * and, for diagonally dominant operators such as the FLD diffusion
+         * operator, matches the CG estimate without the per-level Lanczos cost.
          */
-        int chebyshev_eigenvalue_iterations = 10;
+        int chebyshev_eigenvalue_iterations = 0;
         //! HYPRE fraction of the estimated spectrum targeted by smoothing.
         T chebyshev_fraction = T(0.3);
         //! HYPRE Chebyshev polynomial variant (zero is standard).
@@ -101,6 +105,9 @@ public:
         bool chebyshev_scale = true;
         //! Seed used by the deterministic PMIS priority hash.
         int priority_seed = 0;
+        //! The matrix is symmetric, so the Extended+i reverse coupling is
+        //! the forward coupling and the explicit ff transpose can be skipped.
+        bool symmetric = false;
     };
 
     //! Persistent hierarchy information for one level.
@@ -515,6 +522,7 @@ AlgPartition AMG<T>::make_coarse_partition (Long local_coarse_size)
 template <typename T>
 void AMG<T>::initialize_level (Level& level)
 {
+    BL_PROFILE("AMG::initialize_level()");
     auto const partition = level.A->partition();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         level.A->columnPartition().empty()
@@ -585,6 +593,7 @@ void AMG<T>::initialize_level (Level& level)
 template <typename T>
 void AMG<T>::build_strength (Level& level)
 {
+    BL_PROFILE("AMG::build_strength()");
     Long const nrows = level.A->numLocalRows();
     auto const row_begin = level.A->globalRowBegin();
     auto const* AMREX_RESTRICT arow = level.rows.row_offset.data();
@@ -595,6 +604,10 @@ void AMG<T>::build_strength (Level& level)
 
     Gpu::DeviceVector<Long> counts(nrows);
     auto* AMREX_RESTRICT pcounts = counts.data();
+    Gpu::DeviceVector<T> row_maxima(nrows);
+    Gpu::DeviceVector<int> all_weak_flag(nrows);
+    auto* AMREX_RESTRICT prow_max = row_maxima.data();
+    auto* AMREX_RESTRICT pall_weak = all_weak_flag.data();
     ParallelFor(nrows, [=] AMREX_GPU_DEVICE (Long i) noexcept
     {
         auto const global_row = i + row_begin;
@@ -609,9 +622,11 @@ void AMG<T>::build_strength (Level& level)
                 row_max = amrex::max(row_max, -aval[p]);
             }
         }
-        Long count = 0;
         bool const all_weak = max_row_sum < T(1)
             && Math::abs(row_sum) > Math::abs(diagonal)*max_row_sum;
+        prow_max[i] = row_max;
+        pall_weak[i] = all_weak ? 1 : 0;
+        Long count = 0;
         if (!all_weak && row_max > T(0)) {
             T const threshold = theta*row_max;
             for (Long p = arow[i]; p < arow[i+1]; ++p) {
@@ -646,20 +661,9 @@ void AMG<T>::build_strength (Level& level)
             return;
         }
         auto const global_row = i + row_begin;
-        T row_max = T(0);
-        T diagonal = T(0);
-        T row_sum = T(0);
-        for (Long p = arow[i]; p < arow[i+1]; ++p) {
-            row_sum += aval[p];
-            if (acol[p] == global_row) {
-                diagonal = aval[p];
-            } else {
-                row_max = amrex::max(row_max, -aval[p]);
-            }
-        }
+        T const row_max = prow_max[i];
+        bool const all_weak = pall_weak[i] != 0;
         Long out = grow[i];
-        bool const all_weak = max_row_sum < T(1)
-            && Math::abs(row_sum) > Math::abs(diagonal)*max_row_sum;
         if (!all_weak && row_max > T(0)) {
             T const threshold = theta*row_max;
             for (Long p = arow[i]; p < arow[i+1]; ++p) {
@@ -724,6 +728,7 @@ void AMG<T>::build_strength (Level& level)
 template <typename T>
 void AMG<T>::split_pmis (Level& level)
 {
+    BL_PROFILE("AMG::split_pmis()");
     Long const nlocal = level.A->numLocalRows();
     Long const row_begin = level.A->globalRowBegin();
 
@@ -906,6 +911,7 @@ template <typename T>
 auto AMG<T>::truncate_interpolation (csr_type const& source,
                                      int max_elements) -> csr_type
 {
+    BL_PROFILE("AMG::truncate_interpolation()");
     AMREX_ALWAYS_ASSERT(max_elements > 0);
     Long const nrows = source.nrows();
     auto const* AMREX_RESTRICT source_row = source.row_offset.data();
@@ -927,6 +933,10 @@ auto AMG<T>::truncate_interpolation (csr_type const& source,
                 rank += other_magnitude > magnitude
                     || (other_magnitude == magnitude
                         && source_col[q] < source_col[p]);
+                if (rank >= max_elements) {
+                    break;  // cannot be retained; rank value is only used
+                           // as (rank < max_elements), so capping is exact
+                }
             }
             ranks[p] = rank;
             retained += rank < max_elements;
@@ -989,6 +999,8 @@ auto AMG<T>::truncate_interpolation (csr_type const& source,
 template <typename T>
 void AMG<T>::build_interpolation (Level& level)
 {
+    BL_PROFILE("AMG::build_interpolation()");
+    bool const symmetric = m_options.symmetric;
     Long const nrows = level.A->numLocalRows();
     Long const row_begin = level.A->globalRowBegin();
     auto const partition = level.A->partition();
@@ -1173,14 +1185,17 @@ void AMG<T>::build_interpolation (Level& level)
 
     Gpu::streamSynchronize();
 
-    csr_type unscaled_ff;
-    duplicateCSR(Gpu::deviceToDevice, unscaled_ff, scaled_ff);
-    matrix_type ff_matrix(
-        partition, partition, std::move(unscaled_ff));
-    matrix_type ff_transpose = transpose(ff_matrix, partition);
-    auto host_ff_transpose =
-        helper_type::copy_local_global_csr(ff_transpose);
-    auto ff_transpose_rows = copy_to_device(host_ff_transpose);
+    csr_type ff_transpose_rows;
+    if (!symmetric) {
+        csr_type unscaled_ff;
+        duplicateCSR(Gpu::deviceToDevice, unscaled_ff, scaled_ff);
+        matrix_type ff_matrix(
+            partition, partition, std::move(unscaled_ff));
+        matrix_type ff_transpose = transpose(ff_matrix, partition);
+        auto host_ff_transpose =
+            helper_type::copy_local_global_csr(ff_transpose);
+        ff_transpose_rows = copy_to_device(host_ff_transpose);
+    }
 
     auto halo_coarse_sum =
         level.halo->exchange(strong_coarse_sum.data());
@@ -1211,12 +1226,15 @@ void AMG<T>::build_interpolation (Level& level)
                 }
 
                 T reverse = T(0);
-                for (Long q = ff_transpose_row[i];
-                     q < ff_transpose_row[i+1]; ++q)
-                {
-                    if (ff_transpose_col[q] == j) {
-                        reverse = ff_transpose_val[q];
-                        break;
+                if (symmetric) {
+                    reverse = ffval[p];  // ff(j,i) == ff(i,j)
+                } else {
+                    for (Long q = ff_transpose_row[i];
+                         q < ff_transpose_row[i+1]; ++q) {
+                        if (ff_transpose_col[q] == j) {
+                            reverse = ff_transpose_val[q];
+                            break;
+                        }
                     }
                 }
 
@@ -1269,9 +1287,9 @@ void AMG<T>::build_interpolation (Level& level)
 template <typename T>
 void AMG<T>::build_next_level (Level& level)
 {
-    auto B = SpGEMM(*level.A, *level.P, level.coarse_partition);
+    BL_PROFILE("AMG::build_next_level()");
     auto coarse_matrix =
-        SpGEMM(*level.R, B, level.coarse_partition);
+        SpGEMM_RAP(*level.R, *level.A, *level.P, level.coarse_partition);
 
     auto next = std::make_unique<Level>();
     next->owned_A =
@@ -1283,6 +1301,7 @@ void AMG<T>::build_next_level (Level& level)
 template <typename T>
 void AMG<T>::factor_coarse_matrix ()
 {
+    BL_PROFILE("AMG::factor_coarse_matrix()");
     auto const& level = *m_levels.back();
     auto global = helper_type::gather_global_rows(*level.A);
     m_coarse_active_size = level.A->numGlobalRows();
@@ -1454,6 +1473,7 @@ void AMG<T>::printDiagnostics () const
 template <typename T>
 void AMG<T>::setup ()
 {
+    BL_PROFILE("AMG::setup()");
     double const setup_start = amrex::second();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_options.strong_threshold > T(0)
@@ -1544,6 +1564,7 @@ template <typename T>
 void AMG<T>::solve_coarse (AlgVector<T>& x,
                            AlgVector<T> const& b) const
 {
+    BL_PROFILE("AMG::solve_coarse()");
     auto global_rhs = gather_device_to_host(
         b.data(), b.partition());
     T padded_rhs[dense_coarse_size] = {};
@@ -1572,6 +1593,7 @@ template <typename T>
 void AMG<T>::smooth (Level& level, AlgVector<T>& x,
                      AlgVector<T> const& b, bool zero_initial_guess)
 {
+    BL_PROFILE("AMG::smooth()");
     if (m_options.smoother == Smoother::l1_jacobi) {
         AMREX_ALWAYS_ASSERT(level.l1_jacobi_smoother != nullptr);
         level.l1_jacobi_smoother->sweep(
@@ -1586,6 +1608,7 @@ template <typename T>
 void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
                      AlgVector<T> const& b)
 {
+    BL_PROFILE("AMG::vcycle()");
     auto& level = *m_levels[ilev];
     if (ilev+1 == static_cast<int>(m_levels.size())) {
         if (m_use_dense_coarse_solve) {
@@ -1623,6 +1646,7 @@ void AMG<T>::vcycle (int ilev, AlgVector<T>& x,
 template <typename T>
 void AMG<T>::apply (AlgVector<T>& z, AlgVector<T> const& r)
 {
+    BL_PROFILE("AMG::apply()");
     double const apply_start = amrex::second();
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_is_setup, "AMG::setup must be called before AMG::apply");
