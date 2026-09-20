@@ -442,6 +442,7 @@ public: // NOLINT  Private implementation details, but public for CUDA
 
     static constexpr int undecided = -1;
     static constexpr int fine = 0;
+    static constexpr int special_fine = -2;
     static constexpr int coarse = 1;
     static constexpr int dense_coarse_size = 9;
 
@@ -463,6 +464,8 @@ public: // NOLINT  Private implementation details, but public for CUDA
         csr_type strength_rows;
         //! Compact incoming strength graph.
         csr_type strength_transpose_rows;
+        //! Local-or-ghost slots for all matrix columns, including weak edges.
+        Gpu::DeviceVector<Long> matrix_col_slots;
         //! Local-or-ghost slots corresponding to outgoing graph columns.
         Gpu::DeviceVector<Long> strength_col_slots;
         //! Local-or-ghost slots corresponding to incoming graph columns.
@@ -477,7 +480,7 @@ public: // NOLINT  Private implementation details, but public for CUDA
         //! Restriction operator formed as the transpose of interpolation.
         std::unique_ptr<matrix_type> R;
 
-        //! Local PMIS coarse/fine marker for every owned point.
+        //! Local PMIS coarse/fine/special-fine marker for every owned point.
         Gpu::DeviceVector<int> cf_marker;
         //! Global coarse ID for owned coarse points, or -1 for fine points.
         Gpu::DeviceVector<Long> coarse_id;
@@ -910,19 +913,29 @@ void AMG<T>::build_strength (Level& level)
     auto host_transpose = helper_type::copy_local_global_csr(*level.ST);
     level.strength_transpose_rows = copy_to_device(host_transpose);
 
+    // Interpolation must also recognize special-fine points across weak
+    // edges: HYPRE excludes those coefficients from the row scaling.
+    Gpu::PinnedVector<Long> matrix_columns(level.rows.col_index.size());
+    Gpu::copy(Gpu::deviceToHost, level.rows.col_index.begin(),
+              level.rows.col_index.end(), matrix_columns.begin());
     Vector<Long> requested_ids;
     requested_ids.reserve(
-        static_cast<std::size_t>(host_strength.nnz
-                                 + host_transpose.nnz));
+        matrix_columns.size() + static_cast<std::size_t>(host_transpose.nnz));
     requested_ids.insert(requested_ids.end(),
-                         host_strength.col_index.begin(),
-                         host_strength.col_index.end());
+                         matrix_columns.begin(), matrix_columns.end());
     requested_ids.insert(requested_ids.end(),
                          host_transpose.col_index.begin(),
                          host_transpose.col_index.end());
     level.halo = std::make_unique<AlgHaloExchange>(
         level.A->partition(), std::move(requested_ids));
 
+    Gpu::PinnedVector<Long> matrix_slots(matrix_columns.size());
+    for (std::size_t p = 0; p < matrix_columns.size(); ++p) {
+        matrix_slots[p] = level.halo->localOrGhostIndex(matrix_columns[p]);
+    }
+    level.matrix_col_slots.resize(matrix_slots.size());
+    Gpu::copy(Gpu::hostToDevice, matrix_slots.begin(), matrix_slots.end(),
+              level.matrix_col_slots.begin());
     Gpu::PinnedVector<Long> strength_slots(host_strength.nnz);
     for (Long p = 0; p < host_strength.nnz; ++p) {
         strength_slots[p] =
@@ -962,10 +975,15 @@ void AMG<T>::split_pmis (Level& level)
     auto* AMREX_RESTRICT pinfluence = influence.data();
     auto const* AMREX_RESTRICT strow =
         level.strength_transpose_rows.row_offset.data();
+    auto const* AMREX_RESTRICT srow =
+        level.strength_rows.row_offset.data();
     ParallelFor(nlocal, [=] AMREX_GPU_DEVICE (Long i) noexcept
     {
-        marker[i] = undecided;
-        pinfluence[i] = strow[i+1] - strow[i];
+        // Match HYPRE PMIS: no outgoing strong edges means special fine,
+        // even when other rows strongly depend on this point.
+        bool const isolated = srow[i+1] == srow[i];
+        marker[i] = isolated ? special_fine : undecided;
+        pinfluence[i] = isolated ? Long(0) : strow[i+1] - strow[i];
     });
 
     auto halo_influence = level.halo->exchange(influence.data());
@@ -975,17 +993,18 @@ void AMG<T>::split_pmis (Level& level)
     Gpu::DeviceVector<Long> next_active(nlocal);
     auto* AMREX_RESTRICT active_rows = active.data();
     auto* AMREX_RESTRICT next_rows = next_active.data();
-    ParallelFor(nlocal, [=] AMREX_GPU_DEVICE (Long i) noexcept
-    {
-        active_rows[i] = i;
-    });
+    Long active_count = Scan::PrefixSum<Long>(
+        nlocal,
+        [=] AMREX_GPU_DEVICE (Long i) noexcept -> Long {
+            return marker[i] == undecided;
+        },
+        [=] AMREX_GPU_DEVICE (Long i, Long offset) noexcept {
+            if (marker[i] == undecided) { active_rows[offset] = i; }
+        },
+        Scan::Type::exclusive, Scan::retSum);
 
     Gpu::DeviceVector<int> candidate(nlocal);
     auto* AMREX_RESTRICT is_candidate = candidate.data();
-    Long active_count = nlocal;
-
-    auto const* AMREX_RESTRICT srow =
-        level.strength_rows.row_offset.data();
     auto const* AMREX_RESTRICT scol =
         level.strength_rows.col_index.data();
     auto const* AMREX_RESTRICT stcol =
@@ -1089,7 +1108,7 @@ void AMG<T>::split_pmis (Level& level)
     int coverage_failures = Reduce::Sum<int>(
         nlocal, [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
         {
-            if (marker[i] == coarse) {
+            if (marker[i] != fine) {
                 return 0;
             }
             bool covered = false;
@@ -1239,6 +1258,7 @@ void AMG<T>::build_interpolation (Level& level)
     auto const* AMREX_RESTRICT arow = level.rows.row_offset.data();
     auto const* AMREX_RESTRICT acol = level.rows.col_index.data();
     auto const* AMREX_RESTRICT aval = level.rows.mat.data();
+    auto const* AMREX_RESTRICT aslot = level.matrix_col_slots.data();
     auto const* AMREX_RESTRICT srow =
         level.strength_rows.row_offset.data();
     auto const* AMREX_RESTRICT scol =
@@ -1255,13 +1275,16 @@ void AMG<T>::build_interpolation (Level& level)
         if (marker[i] == coarse) {
             pff_counts[i] = 1;
             pfc_counts[i] = 1;
+        } else if (marker[i] == special_fine) {
+            pff_counts[i] = 0;
+            pfc_counts[i] = 0;
         } else {
             Long ff_count = 1;
             Long fc_count = 0;
             for (Long p = srow[i]; p < srow[i+1]; ++p) {
                 if (all_marker[sslot[p]] == fine) {
                     ++ff_count;
-                } else {
+                } else if (all_marker[sslot[p]] == coarse) {
                     ++fc_count;
                 }
             }
@@ -1348,6 +1371,12 @@ void AMG<T>::build_interpolation (Level& level)
                 return 0;
             }
 
+            if (marker[i] == special_fine) {
+                pweak_diagonal_sum[i] = T(0);
+                pstrong_coarse_sum[i] = T(0);
+                return 0;
+            }
+
             Long const global_row = i + row_begin;
             Long ff_out = ffrow[i];
             Long fc_out = fcrow[i];
@@ -1366,6 +1395,10 @@ void AMG<T>::build_interpolation (Level& level)
                     ++diagonal_count;
                     continue;
                 }
+
+                // Special-fine points receive no coarse correction, and
+                // their couplings must not be lumped into the diagonal.
+                if (all_marker[aslot[p]] == special_fine) { continue; }
 
                 Long strong_entry = -1;
                 for (Long sp = srow[i]; sp < srow[i+1]; ++sp) {
@@ -1435,7 +1468,7 @@ void AMG<T>::build_interpolation (Level& level)
         nrows,
         [=] AMREX_GPU_DEVICE (Long i) noexcept -> int
         {
-            if (marker[i] == coarse) {
+            if (marker[i] != fine) {
                 return 0;
             }
 
@@ -1635,7 +1668,8 @@ void AMG<T>::update_diagnostics (double setup_seconds)
             + csr_bytes(level.strength_rows)
             + csr_bytes(level.strength_transpose_rows)
             + static_cast<Long>(
-                (level.strength_col_slots.size()
+                (level.matrix_col_slots.size()
+                 +level.strength_col_slots.size()
                  +level.strength_transpose_col_slots.size())
                 *sizeof(Long))
             + static_cast<Long>(level.cf_marker.size()*sizeof(int))
@@ -1773,9 +1807,9 @@ void AMG<T>::setup ()
         Long const coarse_size =
             level.coarse_partition.numGlobalRows();
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-            coarse_size > 0 && coarse_size <= fine_size,
+            coarse_size >= 0 && coarse_size <= fine_size,
             "AMG PMIS produced an invalid global coarse size");
-        if (coarse_size == fine_size) {
+        if (coarse_size == 0 || coarse_size == fine_size) {
             m_use_dense_coarse_solve = false;
             break;
         }

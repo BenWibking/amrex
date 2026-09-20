@@ -146,6 +146,11 @@ struct AMGTestAccess
         return *amg.m_levels.front()->R;
     }
 
+    static constexpr int special_fine_marker () noexcept
+    {
+        return amg_type::special_fine;
+    }
+
     static constexpr int fine_marker () noexcept
     {
         return amg_type::fine;
@@ -483,6 +488,13 @@ test_all_weak_terminal_level ()
         AMG<Real> amg(A, options);
         amg.setup();
         AMREX_ALWAYS_ASSERT(amg.numLevels() == 1);
+        AMREX_ALWAYS_ASSERT(
+            AMGTestAccess<Real>::coarse_partition(amg).numGlobalRows() == 0);
+        auto const markers = AMGTestAccess<Real>::global_markers(amg);
+        AMREX_ALWAYS_ASSERT(std::all_of(markers.begin(), markers.end(),
+            [] (int marker) {
+                return marker == AMGTestAccess<Real>::special_fine_marker();
+            }));
 
         AlgVector<Real> x(A.partition());
         AlgVector<Real> expected(A.partition());
@@ -639,14 +651,78 @@ test_directed_pmis_rounds ()
         AMGTestAccess<Real>::global_markers(amg);
 
     // Point 0 wins the first conflict round. Points 2 and 3 strongly
-    // depend on it and become fine. Point 1 remains active because the
-    // one-way edge is 0 -> 1, so it becomes coarse in the next round.
+    // depend on it and become fine. Point 1 is excluded because the
+    // one-way edge is 0 -> 1. It has no outgoing strength edges and is
+    // special fine even though point 0 depends on it.
     AMREX_ALWAYS_ASSERT(
         markers == Vector<int>(
             {AMGTestAccess<Real>::coarse_marker(),
-             AMGTestAccess<Real>::coarse_marker(),
+             AMGTestAccess<Real>::special_fine_marker(),
              AMGTestAccess<Real>::fine_marker(),
              AMGTestAccess<Real>::fine_marker()}));
+}
+
+/** Special-fine rows and their strong/weak couplings do not enter P. */
+void
+test_special_fine_interpolation ()
+{
+    // Three SPD blocks distribute both strong and weak special-fine
+    // neighbors across ranks, including ranks with no coarse unknowns.
+    auto A = make_square_matrix(12, [] (Long row) -> Entries {
+        Long const base = (row/4)*4;
+        switch (row%4) {
+        case 0: return {{row, Real(20)}, {base+1, Real(-1)}};
+        case 1: return {{base, Real(-1)}, {row, Real(4)},
+                        {base+2, Real(-1)}, {base+3, Real(-0.1)}};
+        case 2: return {{base+1, Real(-1)}, {row, Real(2)}};
+        default: return {{base+1, Real(-0.1)}, {row, Real(20)}};
+        }
+    });
+    for (bool symmetric : {false, true}) {
+        AMG<Real>::Options options;
+        options.symmetric = symmetric;
+        AMG<Real> amg(A, options);
+        AMGTestAccess<Real>::prepare_pmis(amg);
+        auto markers = AMGTestAccess<Real>::global_markers(amg);
+        for (Long i = 0; i < 12; ++i) {
+            if (i%4 == 0 || i%4 == 3) {
+                AMREX_ALWAYS_ASSERT(
+                    markers[i] == AMGTestAccess<Real>::special_fine_marker());
+            }
+        }
+        for (Long i = 0; i < 12; ++i) {
+            markers[i] = (i%4 == 0 || i%4 == 3)
+                ? AMGTestAccess<Real>::special_fine_marker()
+                : (i%4 == 1 ? AMGTestAccess<Real>::fine_marker()
+                            : AMGTestAccess<Real>::coarse_marker());
+        }
+        AMGTestAccess<Real>::prepare_interpolation(amg, markers);
+        auto rows = AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(
+            AMGTestAccess<Real>::interpolation(amg));
+        for (Long i = 0; i < A.numLocalRows(); ++i) {
+            Long const gid = A.globalRowBegin()+i;
+            Long const first = rows.row_offset[i];
+            Long const count = rows.row_offset[i+1]-first;
+            if (gid%4 == 0 || gid%4 == 3) {
+                AMREX_ALWAYS_ASSERT(count == 0);
+            } else {
+                AMREX_ALWAYS_ASSERT(count == 1);
+                AMREX_ALWAYS_ASSERT(rows.col_index[first] == gid/4);
+                Real const expected = gid%4 == 1 ? Real(0.25) : Real(1);
+                AMREX_ALWAYS_ASSERT(
+                    std::abs(rows.mat[first]-expected) < unit_tolerance());
+            }
+        }
+        // Exercise the actual PMIS split through a full hierarchy and solve.
+        amg.setup();
+        AlgVector<Real> exact(A.partition()), rhs(A.partition()), x(A.partition());
+        exact.setVal(Real(1));
+        SpMV(rhs, A, exact);
+        x.setVal(Real(0));
+        amg.solve(x, rhs, solve_tolerance(), Real(0), 100);
+        Axpy(x, Real(-1), exact);
+        AMREX_ALWAYS_ASSERT(x.norm2() < Real(10)*solve_tolerance());
+    }
 }
 
 /** Verify that Extended+i reaches coarse points through strong F-F edges. */
@@ -1340,6 +1416,7 @@ main (int argc, char* argv[])
     test_distributed_transpose_trailing_empty_row();
     test_pmis_and_numbering();
     test_directed_pmis_rounds();
+    test_special_fine_interpolation();
     test_extended_plus_i_interpolation();
     test_interpolation_truncation();
     test_interpolation_restriction_and_galerkin();

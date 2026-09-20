@@ -988,10 +988,20 @@ entries and adjusts them to preserve the original row sum; set
 25 levels, uses a dense coarse solve for at most 9 unknowns, and applies one
 smoother before and after coarse-grid correction.  Chebyshev is the default;
 L1-Jacobi maps to HYPRE relaxation type 18 and Chebyshev maps to type 16.  If
-PMIS does not reduce a larger level, or the level limit is reached first, that
-terminal level instead receives one zero-initialized application of the
-selected smoother.  The first implementation supports only this V(1,1)
-cycle.  Select the smoother before calling :cpp:`setup`:
+PMIS produces no coarse points, does not reduce a larger level, or the level
+limit is reached first, that terminal level instead receives one
+zero-initialized application of the selected smoother.  The first implementation supports only this V(1,1)
+cycle.
+
+As in HYPRE PMIS, points with no outgoing strong connections are classified
+as special fine points, even if other points strongly depend on them.  They
+are excluded from the coarse set, have empty interpolation rows, and receive
+corrections only through smoothing.  Their couplings are excluded from
+interpolation row scaling, including weak couplings to remote special fine
+points.  An all-isolated level therefore stops coarsening and uses the
+terminal smoother rather than constructing an empty coarse matrix.
+
+Select the smoother before calling :cpp:`setup`:
 
 .. code-block:: c++
 
