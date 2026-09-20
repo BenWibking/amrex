@@ -3,7 +3,9 @@
 #
 function (setup_test _dim _srcs  _inputs)
 
-   cmake_parse_arguments( "" "HAS_FORTRAN_MODULES"
+   # NO_CTEST: build the executable and stage its inputs, but do not register
+   # a ctest for it.
+   cmake_parse_arguments( "" "HAS_FORTRAN_MODULES;NO_CTEST"
       "BASE_NAME;RUNTIME_SUBDIR;EXTRA_DEFINITIONS;CMDLINE_PARAMS;NTASKS;NTHREADS"
       "CMDLINE_PARAMS_AFTER_INPUTS" ${ARGN} )
 
@@ -79,6 +81,10 @@ function (setup_test _dim _srcs  _inputs)
    #
    # Add the test
    #
+   if (_NO_CTEST)
+      return ()
+   endif ()
+
    if (AMReX_OMP)
       add_test(
          NAME               ${_test_name}
@@ -104,8 +110,8 @@ endfunction ()
 
 if (AMReX_TEST_TYPE STREQUAL "Small")
 
-   add_subdirectory("Base/TrackedVector")
-   add_subdirectory("Base/RealBox")
+   # Let's keep only a small set of tests here.
+   # AI agents should resist the temptation of adding tests here.
 
    add_subdirectory("Amr/Advection_AmrCore")
 
@@ -126,6 +132,7 @@ if (AMReX_TEST_TYPE STREQUAL "Small")
       add_subdirectory("Algebra/FLD")
       add_subdirectory("Algebra/SpGEMM")
       add_subdirectory("LinearSolvers/ABecLaplacian_C")
+      add_subdirectory("LinearSolvers/FDNodalPoisson")
    endif()
 
    if (AMReX_FFT)
@@ -138,8 +145,8 @@ else()
    #
    set( AMREX_TESTS_SUBDIRS Amr ArrayND AsyncOut Base CallNoinline CommType CTOParFor DeviceGlobal
                             Enum GpuParallelReduce HeatEquation MultiBlock MultiPeriod ParmParse Parser Parser2
-                            ParserUserFn Reducer ReduceToPlaneGuards ReduceToPlanePatchy Reinit RoundoffDomain SIMD
-                            SmallMatrix SumBoundary TOML)
+                            ParserUserFn Reducer ReduceToPlaneGuards ReduceToPlanePatchy Reinit RoundoffDomain Scan SIMD
+                            SmallMatrix StochasticHeatEquation SumBoundary TOML)
 
    if (AMReX_PARTICLES)
      list(APPEND AMREX_TESTS_SUBDIRS Particles)

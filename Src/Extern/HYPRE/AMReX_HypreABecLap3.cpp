@@ -64,7 +64,8 @@ HypreABecLap3::getSolution (MultiFab& a_soln)
     MultiFab* l_soln = &a_soln;
     MultiFab tmp;
     if (use_tmp_mf) {
-        tmp.define(a_soln.boxArray(), a_soln.DistributionMap(), 1, 0);
+        tmp.define(a_soln.boxArray(), a_soln.DistributionMap(), 1, 0,
+                   MFInfo().SetArena(The_Async_Arena()));
         l_soln = &tmp;
     }
 
@@ -96,13 +97,11 @@ HypreABecLap3::prepareSolver ()
     const BoxArray& ba = acoefs.boxArray();
     const DistributionMapping& dm = acoefs.DistributionMap();
 
-#if defined(AMREX_DEBUG) || defined(AMREX_TESTING)
     if (sizeof(HYPRE_Int) < sizeof(Long)) {
         Long ncells_grids = ba.numPts();
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ncells_grids < static_cast<Long>(std::numeric_limits<HYPRE_Int>::max()),
                                          "You might need to configure Hypre with --enable-bigint");
     }
-#endif
 
     static_assert(std::is_signed_v<HYPRE_Int>, "HYPRE_Int is assumed to be signed");
 
@@ -443,13 +442,11 @@ HypreABecLap3::prepareSolver ()
             HYPRE_Int* ncols = ncols_fab.dataPtr();
 
             // Remove invalid elements
-#if defined(AMREX_DEBUG) || defined(AMREX_TESTING)
             if (sizeof(HYPRE_Int) < sizeof(Long)) {
                 Long ntot = static_cast<Long>(nrows)*max_stencil_size;
                 AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ntot <  static_cast<Long>(std::numeric_limits<HYPRE_Int>::max()),
                                                  "Integer overflow: please configure Hypre with --enable-bigint");
             }
-#endif
             HYPRE_Int nelems = nrows * max_stencil_size;
             HYPRE_Int const* cols_in = cols_aos_fab.dataPtr();
             Real const* mat_in = mat_aos_fab.dataPtr();
@@ -600,6 +597,7 @@ HypreABecLap3::loadVectors (MultiFab& soln, const MultiFab& rhs)
                     }
                 }
             }
+            if (Gpu::inNoSyncRegion()) { Gpu::synchronize(); }
         }
     } else
 #endif
@@ -653,6 +651,7 @@ HypreABecLap3::loadVectors (MultiFab& soln, const MultiFab& rhs)
                     });
                 }
             }
+            if (Gpu::inNoSyncRegion()) { Gpu::synchronize(); }
         }
     }
 

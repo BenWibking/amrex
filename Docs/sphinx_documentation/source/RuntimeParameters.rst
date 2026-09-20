@@ -138,7 +138,12 @@ can be set via :cpp:`ParmParse`.
    This controls the blocking factor on AMR levels, one value for each
    level. If the size of the integer array is less than the total number of
    levels, the last integer will be used for the unspecified levels. The
-   default value is 8. Note that the user can also call
+   default value is 8. The values must be powers of 2, except that with
+   :py:data:`amr.no_box_split_dir` set, on a level with an odd refinement ratio the
+   blocking factor may also be the refinement ratio times a power of 2
+   (e.g., 24 for ref_ratio 3), and the blocking factor divided by the ratio
+   must be a power of 2. See
+   :ref:`sec:grid_creation:odd` for details. Note that the user can also call
    :cpp:`AmrMesh::SetBlockingFactor` to set the blocking
    factors. Additionally, the values set by this parameter can be overridden
    by :py:data:`amr.blocking_factor_x`, :py:data:`amr.blocking_factor_y` and
@@ -256,6 +261,30 @@ can be set via :cpp:`ParmParse`.
 
    This parameter, if found, will override the
    :py:data:`amrex.refine_grid_layout` parameter in the z-direction.
+
+.. py:data:: amr.refine_whole_domain_dir
+   :type: int
+   :value: -1
+
+   If this is 0, 1 or 2, the fine levels will cover the entire domain in that
+   coordinate direction, no matter where the cells are tagged. Tagging a cell
+   then behaves as if the whole line of cells through it in that direction were
+   tagged, and :py:data:`amr.grid_eff` refers to the fraction of tagged cells in
+   the plane perpendicular to that direction. A negative value, the default,
+   disables this.
+
+.. py:data:: amr.no_box_split_dir
+   :type: int
+   :value: -1
+
+   If this is 0, 1 or 2, the grids are never decomposed in that coordinate
+   direction: :py:data:`amr.max_grid_size` and
+   :py:data:`amr.refine_grid_layout` are ignored in it, level 0 is split
+   in the other directions only (when the level 0 blocking factor is 1 in
+   those directions), and on finer levels no two grids share an interior face
+   normal to it. This does not exclude contact through a periodic boundary.
+   See :ref:`sec:grid_creation` for details. A negative value, the
+   default, disables this.
 
 .. py:data:: amr.check_input
    :type: bool
@@ -701,7 +730,10 @@ Embedded Boundary
    extended perpendicularly from the domain face. Otherwise, it's generated
    with the user provided implicit function. Note that this parameter can be
    overridden by the user when calling :cpp:`amrex::EB2::Build` with the
-   optional parameter ``bool extend_domain_face``.
+   optional parameter ``bool extend_domain_face``. Note also that this
+   parameter has no effect for STL geometries, because an STL file is
+   expected to describe a water-tight object that already defines the
+   embedded boundary outside the domain.
 
 .. py:data:: eb2.num_coarsen_opt
    :type: int
@@ -1178,6 +1210,37 @@ Particles
    container when writing checkpoint and plot files for particles. The
    special value of ``-1`` indicates one file per process.
 
+.. py:data:: particles.redistribute_use_mask
+   :type: bool
+   :value: true
+
+   .. versionadded:: 26.08
+      Runtime parameter ``particles.redistribute_use_mask``.
+
+   On CPU builds, this controls whether local ``Redistribute()`` may use a
+   level-0 mask for particle-to-grid lookup when the call is otherwise eligible.
+
+.. py:data:: particles.redistribute_mask_max_ratio
+   :type: double
+   :value: 8.0
+
+   .. versionadded:: 26.08
+      Runtime parameter ``particles.redistribute_mask_max_ratio``.
+
+   This is the maximum ratio of grown mask cells to valid cells for using the
+   CPU local ``Redistribute()`` lookup mask. Non-positive values disable this
+   ratio limit.
+
+.. py:data:: particles.redistribute_mask_max_bytes
+   :type: long
+   :value: 268435456
+
+   .. versionadded:: 26.08
+      Runtime parameter ``particles.redistribute_mask_max_bytes``.
+
+   This is the maximum estimated per-rank storage, in bytes, for using the CPU
+   local ``Redistribute()`` lookup mask. Negative values disable this byte limit.
+
 Tiling
 ------
 
@@ -1600,12 +1663,17 @@ enabled.
 
 .. py:data:: tiny_profiler.output_file
    :type: string
-   :value: [empty]
+   :value: stdout
 
    .. versionadded:: 24.09
       Runtime parameter ``tiny_profiler.output_file``.
 
-   If this parameter is empty, the output of tiny profiling is dumped to the
-   default output stream of AMReX. If it is not empty, it specifies the file
-   name for the output. Note that ``/dev/null`` is a special name that means
-   no output.
+   .. versionchanged:: 26.09
+      Special names ``stdout`` and ``stderr``; the default value is now
+      ``stdout`` (same behavior as the previous default, the empty string).
+
+   This parameter specifies the destination of the tiny profiling output.
+   Note that ``stdout``, ``stderr`` and ``/dev/null`` are special names that
+   mean the default output stream, the default error stream, and no output,
+   respectively. An empty value is treated the same as ``stdout``. Any other
+   value specifies the file name for the output.

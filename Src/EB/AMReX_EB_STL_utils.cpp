@@ -6,6 +6,7 @@
 #include <AMReX_Stack.H>
 
 #include <cstring>
+#include <type_traits>
 
 // Reference for BVH: https://rmrsk.github.io/EBGeometry/Concepts.html#bounding-volume-hierarchies
 
@@ -54,8 +55,11 @@ namespace {
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     Real sign (Real x1, Real y1, Real x2, Real y2, Real x3, Real y3)
     {
-        Real cp = (x2-x1)*(y3-y2) - (x3-x2)*(y2-y1);
-        if (std::abs(cp) < std::numeric_limits<Real>::epsilon()) {
+        Real a = (x2-x1)*(y3-y2);
+        Real b = (x3-x2)*(y2-y1);
+        Real cp = a - b;
+        // the tolerance must follow the magnitude of the two products
+        if (std::abs(cp) <= std::numeric_limits<Real>::epsilon()*amrex::max(std::abs(a),std::abs(b))) {
             return 0._rt;
         } else {
             return std::copysign(1.0_rt, cp);
@@ -110,42 +114,34 @@ namespace {
     }
 
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-    bool line_box_intersects (Real const a[3], Real const b[3], RealBox const& box)
+    bool line_box_intersects (Real const a[3], Real const inv_direction[3],
+                              RealBox const& box)
     {
+        // Multiplying by the reciprocal loses the exactness that dividing by
+        // the direction gives when the segment ends exactly on a face plane,
+        // so open the far bound by a few ulps instead of culling a box the
+        // segment might really touch.
+        constexpr Real ulps = Real(4)*std::numeric_limits<Real>::epsilon();
+        Real tmin = 0.0_rt;
+        Real tmax = 1.0_rt;
         for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
-            if ((a[idim] < box.lo(idim) && b[idim] < box.lo(idim)) ||
-                (a[idim] > box.hi(idim) && b[idim] > box.hi(idim))) {
-                return false;
-            }
-        }
-        if (box.contains(a) || box.contains(b)) {
-            return true;
-        }
-        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
-            // Note that we have made bounding box slightly bigger. So it's
-            // safe to assume that a line in the plane does not intersect
-            // with the actual bounding box.
-            if (a[idim] == b[idim]) { continue; }
-            Real xi[] = {box.lo(idim), box.hi(idim)};
-            for (auto xface : xi) {
-                if (!((a[idim] > xface && b[idim] > xface) ||
-                      (a[idim] < xface && b[idim] < xface)))
-                {
-                    Real w = (xface-a[idim]) / (b[idim]-a[idim]);
-                    bool inside = true;
-                    for (int jdim = 0; jdim < AMREX_SPACEDIM; ++jdim) {
-                        if (idim != jdim) {
-                            Real xpt = a[jdim] + (b[jdim]-a[jdim]) * w;
-                            inside = inside && (xpt >= box.lo(jdim)
-                                            &&  xpt <= box.hi(jdim));
-                        }
-                    }
-                    if (inside) { return true; }
+            // A zero reciprocal marks a direction parallel to this pair of
+            // faces. 1/direction is never zero for a finite direction.
+            if (inv_direction[idim] == 0.0_rt) {
+                if (a[idim] < box.lo(idim) || a[idim] > box.hi(idim)) {
+                    return false;
+                }
+            } else {
+                Real const t1 = (box.lo(idim)-a[idim]) * inv_direction[idim];
+                Real const t2 = (box.hi(idim)-a[idim]) * inv_direction[idim];
+                tmin = amrex::max(tmin, amrex::min(t1,t2));
+                tmax = amrex::min(tmax, amrex::max(t1,t2));
+                if (tmin > tmax*(1.0_rt+ulps) + ulps) {
+                    return false;
                 }
             }
         }
-
-        return false;
+        return true;
     }
 
     template <int M, int N, typename F>
@@ -154,11 +150,18 @@ namespace {
                                   STLtools::BVHNodeT<M,N> const* root,
                                   F const& f)
     {
+        // Reuse these reciprocals for every bounding box visited by this ray.
+        Real inv_direction[3];
+        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+            Real const direction = b[idim] - a[idim];
+            inv_direction[idim] = (direction == 0.0_rt) ? 0.0_rt : 1.0_rt/direction;
+        }
+
         // Use stack to avoid recursion
         Stack<int, STLtools::m_bvh_max_stack_size> nodes_to_do;
         Stack<std::int8_t, STLtools::m_bvh_max_stack_size> nchildren_done;
 
-        if (line_box_intersects(a, b, root->boundingbox)) {
+        if (line_box_intersects(a, inv_direction, root->boundingbox)) {
             nodes_to_do.push(0);
             nchildren_done.push(0);
         }
@@ -176,7 +179,7 @@ namespace {
                     for (auto ichild = ndone; ichild < node.nchildren; ++ichild) {
                         ++ndone;
                         int inode = node.children[ichild];
-                        if (line_box_intersects(a, b, root[inode].boundingbox)) {
+                        if (line_box_intersects(a, inv_direction, root[inode].boundingbox)) {
                             nodes_to_do.push(inode);
                             nchildren_done.push(0);
                             break;
@@ -250,117 +253,19 @@ namespace {
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     Real pt_box_min_d2 (XDim3 const& pt, RealBox const& bbox)
     {
-        bool inside_x = (pt.x >= bbox.lo(0)) && (pt.x <= bbox.hi(0));
-        bool inside_y = (pt.y >= bbox.lo(1)) && (pt.y <= bbox.hi(1));
-        bool inside_z = (pt.z >= bbox.lo(2)) && (pt.z <= bbox.hi(2));
-        if (inside_x && inside_y && inside_z) {
-            return Real(0);
-        } else if (inside_x && inside_y) {
-            if (pt.z < bbox.lo(2)) {
-                return Math::powi<2>(pt.z-bbox.lo(2));
-            } else {
-                return Math::powi<2>(pt.z-bbox.hi(2));
-            }
-        } else if (inside_x && inside_z) {
-            if (pt.y < bbox.lo(1)) {
-                return Math::powi<2>(pt.y-bbox.lo(1));
-            } else {
-                return Math::powi<2>(pt.y-bbox.hi(1));
-            }
-        } else if (inside_y && inside_z) {
-            if (pt.x < bbox.lo(0)) {
-                return Math::powi<2>(pt.x-bbox.lo(0));
-            } else {
-                return Math::powi<2>(pt.x-bbox.hi(0));
-            }
-        } else if (inside_x) {
-            if ((pt.y < bbox.lo(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.y < bbox.lo(1)) && (pt.z > bbox.hi(2))) {
-                return Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            } else if ((pt.y > bbox.hi(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else {
-                return Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            }
-        } else if (inside_y) {
-            if ((pt.x < bbox.lo(0)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.x < bbox.lo(0)) && (pt.z > bbox.hi(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            } else if ((pt.x > bbox.hi(0)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            }
-        } else if (inside_z) {
-            if ((pt.x < bbox.lo(0)) && (pt.y < bbox.lo(1))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1));
-            } else if ((pt.x < bbox.lo(0)) && (pt.y > bbox.hi(1))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1));
-
-            } else if ((pt.x > bbox.hi(0)) && (pt.y < bbox.lo(1))) {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1));
-
-            } else {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1));
-
-            }
-        } else {
-            if ((pt.x < bbox.lo(0)) && (pt.y < bbox.lo(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.x > bbox.hi(0)) && (pt.y < bbox.lo(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.x < bbox.lo(0)) && (pt.y > bbox.hi(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.x > bbox.hi(0)) && (pt.y > bbox.hi(1)) && (pt.z < bbox.lo(2))) {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.lo(2));
-            } else if ((pt.x < bbox.lo(0)) && (pt.y < bbox.lo(1)) && (pt.z > bbox.hi(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            } else if ((pt.x > bbox.hi(0)) && (pt.y < bbox.lo(1)) && (pt.z > bbox.hi(2))) {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.lo(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            } else if ((pt.x < bbox.lo(0)) && (pt.y > bbox.hi(1)) && (pt.z > bbox.hi(2))) {
-                return Math::powi<2>(pt.x-bbox.lo(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            } else {
-                return Math::powi<2>(pt.x-bbox.hi(0))
-                    +  Math::powi<2>(pt.y-bbox.hi(1))
-                    +  Math::powi<2>(pt.z-bbox.hi(2));
-            }
-        }
+        Real const dx = amrex::max(bbox.lo(0)-pt.x, Real(0), pt.x-bbox.hi(0));
+        Real const dy = amrex::max(bbox.lo(1)-pt.y, Real(0), pt.y-bbox.hi(1));
+        Real const dz = amrex::max(bbox.lo(2)-pt.z, Real(0), pt.z-bbox.hi(2));
+        return dx*dx + dy*dy + dz*dz;
     }
 
     template <int M, int N>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     Real bvh_d2 (XDim3 const& pt, STLtools::BVHNodeT<M,N> const* root)
     {
+        static_assert(N <= std::numeric_limits<std::uint8_t>::digits);
         Stack<int, STLtools::m_bvh_max_stack_size> nodes_to_do;
-        Stack<std::int8_t, STLtools::m_bvh_max_stack_size> nchildren_done;
+        Stack<std::uint8_t, STLtools::m_bvh_max_stack_size> nchildren_done;
         nodes_to_do.push(0);
         nchildren_done.push(0);
 
@@ -378,20 +283,46 @@ namespace {
                 nchildren_done.pop();
             } else {
                 auto& ndone = nchildren_done.top();
-                if (ndone < node.nchildren) {
-                    for (auto ichild = ndone; ichild < node.nchildren; ++ichild) {
-                        ++ndone;
+                if (ndone == 0) {
+                    // Visit the nearest child first to tighten d before testing
+                    // the remaining children against their lower bounds.
+                    Real closest_d2 = std::numeric_limits<Real>::max();
+                    std::int8_t closest_child = 0;
+                    for (std::int8_t ichild = 0; ichild < node.nchildren; ++ichild) {
+                        auto const child_d2 = pt_box_min_d2(
+                            pt, root[node.children[ichild]].boundingbox);
+                        if (child_d2 < closest_d2) {
+                            closest_d2 = child_d2;
+                            closest_child = ichild;
+                        }
+                    }
+                    if (d > closest_d2) {
+                        ndone = static_cast<std::uint8_t>(ndone | (1 << closest_child));
+                        nodes_to_do.push(node.children[closest_child]);
+                        nchildren_done.push(0);
+                    } else {
+                        nodes_to_do.pop();
+                        nchildren_done.pop();
+                    }
+                } else {
+                    bool child_added = false;
+                    for (std::int8_t ichild = 0; ichild < node.nchildren; ++ichild) {
+                        auto const child_bit = static_cast<std::uint8_t>(1 << ichild);
+                        if ((ndone & child_bit) != 0) { continue; }
+                        ndone = static_cast<std::uint8_t>(ndone | child_bit);
                         int inode = node.children[ichild];
                         auto dmin = pt_box_min_d2(pt, root[inode].boundingbox);
                         if (d > dmin) {
                             nodes_to_do.push(inode);
                             nchildren_done.push(0);
+                            child_added = true;
                             break;
                         }
                     }
-                } else {
-                    nodes_to_do.pop();
-                    nchildren_done.pop();
+                    if (!child_added) {
+                        nodes_to_do.pop();
+                        nchildren_done.pop();
+                    }
                 }
             }
         }
@@ -456,10 +387,6 @@ STLtools::read_binary_stl_file (std::string const& fname, Real scale,
         amrex::readIntData<uint32_t,uint32_t>(&numtris, 1, is, uint32_descr);
         AMREX_ALWAYS_ASSERT(numtris < uint32_t(std::numeric_limits<int>::max()));
         m_num_tri = static_cast<int>(numtris);
-        // maximum number of triangles allowed for traversing the BVH tree
-        // using stack.
-        int max_tri_stack = Math::powi<m_bvh_max_stack_size-1>(m_bvh_max_splits)*m_bvh_max_size;
-        AMREX_ALWAYS_ASSERT(m_num_tri <= max_tri_stack);
         a_tri_pts.resize(m_num_tri);
 
         if (amrex::Verbose()) {
@@ -569,13 +496,24 @@ STLtools::prepare (Gpu::PinnedVector<Triangle> a_tri_pts)
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_num_tri > 0,
                                      "STLtools::prepare: STL contains no triangles");
 
+    // maximum number of triangles allowed for traversing the BVH tree
+    // using stack.
+    int max_tri_stack = Math::powi<m_bvh_max_stack_size-1>(m_bvh_max_splits)*m_bvh_max_size;
+    AMREX_ALWAYS_ASSERT(m_num_tri <= max_tri_stack);
+
     Gpu::PinnedVector<Node> bvh_nodes;
     if (m_bvh_optimization) {
         BL_PROFILE("STLtools::build_bvh");
         std::size_t nnodes = 0;
         bvh_size(int(a_tri_pts.size()), nnodes);
         bvh_nodes.reserve(nnodes);
-        build_bvh(a_tri_pts.data(), a_tri_pts.data()+a_tri_pts.size(), bvh_nodes);
+        // build_bvh sorts the triangles it is given.  It works on a copy so
+        // that the order stored in m_tri_pts_d, and therefore the reference
+        // point derived from the first triangle below, is the order the file
+        // was read in whether or not the BVH is built.  The nodes hold their
+        // own copies of the triangles, so they do not depend on this array.
+        Gpu::PinnedVector<Triangle> bvh_tri_pts(a_tri_pts);
+        build_bvh(bvh_tri_pts.data(), bvh_tri_pts.data()+bvh_tri_pts.size(), bvh_nodes);
 #ifdef AMREX_USE_GPU
         m_bvh_nodes.resize(bvh_nodes.size());
         Gpu::copyAsync(Gpu::hostToDevice, bvh_nodes.begin(), bvh_nodes.end(),
@@ -952,6 +890,73 @@ STLtools::getBoxType (Box const& box, Geometry const& geom, RunOn) const
 
         auto const* bvh_root = m_bvh_nodes.data();
 
+#ifndef AMREX_USE_GPU
+        // Unlike the device reduction, the serial host path can stop as soon
+        // as it sees both signs.
+        auto classify_on_cpu = [&] (auto use_bvh) -> int
+        {
+            int first_value = -1;
+            if (blo.x < ptmin.x || blo.y < ptmin.y || blo.z < ptmin.z ||
+                bhi.x > ptmax.x || bhi.y > ptmax.y || bhi.z > ptmax.z)
+            {
+                first_value = ref_value;
+            }
+
+            const Dim3 lo = amrex::lbound(box);
+            const Dim3 hi = amrex::ubound(box);
+            for (int k = lo.z; k <= hi.z; ++k) {
+            for (int j = lo.y; j <= hi.y; ++j) {
+            for (int i = lo.x; i <= hi.x; ++i) {
+                Real coords[3];
+                coords[0]=plo[0]+static_cast<Real>(i)*dx[0];
+                coords[1]=plo[1]+static_cast<Real>(j)*dx[1];
+#if (AMREX_SPACEDIM == 2)
+                amrex::ignore_unused(k);
+                coords[2]=Real(0.);
+#else
+                coords[2]=plo[2]+static_cast<Real>(k)*dx[2];
+#endif
+                if (coords[0] < ptmin.x || coords[0] > ptmax.x ||
+                    coords[1] < ptmin.y || coords[1] > ptmax.y ||
+                    coords[2] < ptmin.z || coords[2] > ptmax.z)
+                {
+                    continue;
+                }
+
+                Real pr[] = {ptref.x, ptref.y, ptref.z};
+                int num_intersects = 0;
+                if constexpr (decltype(use_bvh)::value) {
+                    bvh_line_tri_intersects(pr, coords, bvh_root,
+                                            [&] (int ntri, Triangle const* tri,
+                                                    XDim3 const*) -> int
+                    {
+                        for (int tr = 0; tr < ntri; ++tr) {
+                            num_intersects += line_tri_intersects(pr, coords, tri[tr]);
+                        }
+                        return 0;
+                    });
+                } else {
+                    for (int tr = 0; tr < num_triangles; ++tr) {
+                        num_intersects += line_tri_intersects(pr, coords, tri_pts[tr]);
+                    }
+                }
+
+                int const value = (num_intersects % 2 == 0) ? ref_value : 1-ref_value;
+                if (first_value < 0) {
+                    first_value = value;
+                } else if (value != first_value) {
+                    return mixedcells;
+                }
+            }}}
+            return first_value == 1 ? allregular : allcovered;
+        };
+
+        if (m_bvh_optimization) {
+            return classify_on_cpu(std::true_type{});
+        } else {
+            return classify_on_cpu(std::false_type{});
+        }
+#else
         ReduceOps<ReduceOpSum> reduce_op;
         ReduceData<int> reduce_data(reduce_op);
         using ReduceTuple = typename decltype(reduce_data)::Type;
@@ -1015,6 +1020,7 @@ STLtools::getBoxType (Box const& box, Geometry const& geom, RunOn) const
         } else {
             return mixedcells;
         }
+#endif
     }
 }
 
@@ -1115,7 +1121,7 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
 #ifdef AMREX_USE_CUDA
             amrex::ignore_unused(num_triangles,tri_pts,tri_norm,lst,bvh_root);
 #endif
-            Real r = std::numeric_limits<Real>::quiet_NaN();
+            Real r = EB2::no_intercept;
             if (type(i,j,k) == EB2::Type::irregular) {
                 XDim3 p1{.x = plo[0]+static_cast<Real>(i)*dx[0],
                          .y = plo[1]+static_cast<Real>(j)*dx[1],
@@ -1135,10 +1141,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                            tri.v1, tri.v2, tri.v3,
                                                            tri_norm[it],
                                                            lst(i+1,j,k)-lst(i,j,k));
-                            if (tmp.first) {
+                            if (tmp.first && (!found || tmp.second < r)) {
                                 r = tmp.second;
                                 found = true;
-                                break;
                             }
                         }
                     } else {
@@ -1154,10 +1159,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                                tri.v1, tri.v2, tri.v3,
                                                                ptrinorm[it],
                                                                lst(i+1,j,k)-lst(i,j,k));
-                                if (tmp.first) {
+                                if (tmp.first && (!found || tmp.second < r)) {
                                     r = tmp.second;
                                     found = true;
-                                    return 1;
                                 }
                             }
                             return 0;
@@ -1179,10 +1183,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                            XDim3{.x = tri.v3.y, .y = tri.v3.z, .z = tri.v3.x},
                                                            XDim3{.x =   norm.y, .y =   norm.z, .z =   norm.x},
                                                            lst(i,j+1,k)-lst(i,j,k));
-                            if (tmp.first) {
+                            if (tmp.first && (!found || tmp.second < r)) {
                                 r = tmp.second;
                                 found = true;
-                                break;
                             }
                         }
                     } else {
@@ -1201,10 +1204,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                                XDim3{.x = tri.v3.y, .y = tri.v3.z, .z = tri.v3.x},
                                                                XDim3{.x =   norm.y, .y =   norm.z, .z =   norm.x},
                                                                lst(i,j+1,k)-lst(i,j,k));
-                                if (tmp.first) {
+                                if (tmp.first && (!found || tmp.second < r)) {
                                     r = tmp.second;
                                     found = true;
-                                    return 1;
                                 }
                             }
                             return 0;
@@ -1228,10 +1230,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                            XDim3{.x = tri.v3.z, .y = tri.v3.x, .z = tri.v3.y},
                                                            XDim3{.x =   norm.z, .y =   norm.x, .z =   norm.y},
                                                            lst(i,j,k+1)-lst(i,j,k));
-                            if (tmp.first) {
+                            if (tmp.first && (!found || tmp.second < r)) {
                                 r = tmp.second;
                                 found = true;
-                                break;
                             }
                         }
                     } else {
@@ -1250,10 +1251,9 @@ STLtools::getIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
                                                                XDim3{.x = tri.v3.z, .y = tri.v3.x, .z = tri.v3.y},
                                                                XDim3{.x =   norm.z, .y =   norm.x, .z =   norm.y},
                                                                lst(i,j,k+1)-lst(i,j,k));
-                                if (tmp.first) {
+                                if (tmp.first && (!found || tmp.second < r)) {
                                     r = tmp.second;
                                     found = true;
-                                    return 1;
                                 }
                             }
                             return 0;
@@ -1284,40 +1284,40 @@ STLtools::updateIntercept (Array<Array4<Real>,AMREX_SPACEDIM> const& inter_arr,
         amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k)
         {
             if (type(i,j,k) == EB2::Type::irregular) {
-                bool is_nan = amrex::isnan(inter(i,j,k));
+                bool no_inter = (inter(i,j,k) == EB2::no_intercept);
                 if (idim == 0) {
                     if (lst(i,j,k) == Real(0.0) ||
-                        (lst(i,j,k) > Real(0.0) && is_nan))
+                        (lst(i,j,k) > Real(0.0) && no_inter))
                     {
-                        // interp might still be quiet_nan because lst that
-                        // was set to zero has been changed by FillBoundary
-                        // at periodic boundaries.
+                        // The edge can still be without an intercept because
+                        // lst that was set to zero has been changed by
+                        // FillBoundary at periodic boundaries.
                         inter(i,j,k) = problo[0] + static_cast<Real>(i)*dx[0];
                     }
                     else if (lst(i+1,j,k) == Real(0.0) ||
-                             (lst(i+1,j,k) > Real(0.0) && is_nan))
+                             (lst(i+1,j,k) > Real(0.0) && no_inter))
                     {
                         inter(i,j,k) = problo[0] + static_cast<Real>(i+1)*dx[0];
                     }
                 } else if (idim == 1) {
                     if (lst(i,j,k) == Real(0.0) ||
-                        (lst(i,j,k) > Real(0.0) && is_nan))
+                        (lst(i,j,k) > Real(0.0) && no_inter))
                     {
                         inter(i,j,k) = problo[1] + static_cast<Real>(j)*dx[1];
                     }
                     else if (lst(i,j+1,k) == Real(0.0) ||
-                             (lst(i,j+1,k) > Real(0.0) && is_nan))
+                             (lst(i,j+1,k) > Real(0.0) && no_inter))
                     {
                         inter(i,j,k) = problo[1] + static_cast<Real>(j+1)*dx[1];
                     }
                 } else {
                     if (lst(i,j,k) == Real(0.0) ||
-                        (lst(i,j,k) > Real(0.0) && is_nan))
+                        (lst(i,j,k) > Real(0.0) && no_inter))
                     {
                         inter(i,j,k) = problo[2] + static_cast<Real>(k)*dx[2];
                     }
                     else if (lst(i,j,k+1) == Real(0.0) ||
-                             (lst(i,j,k+1) > Real(0.0) && is_nan))
+                             (lst(i,j,k+1) > Real(0.0) && no_inter))
                     {
                         inter(i,j,k) = problo[2] + static_cast<Real>(k+1)*dx[2];
                     }

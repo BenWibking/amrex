@@ -1,276 +1,285 @@
+#include <AMReX_Algebra.H>
 #include <AMReX.H>
-#include <AMReX_AlgVecUtil.H>
-#include <AMReX_SpGEMM.H>
-#include <AMReX_SpMatUtil.H>
-#include <AMReX_SpMV.H>
+#include <AMReX_ParallelDescriptor.H>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <random>
 
 using namespace amrex;
 
 namespace {
 
-Real
-tolerance ()
+// Partition with uneven sizes; rank `empty_rank` (if valid) gets no rows.
+AlgPartition make_partition (Long nrows, int empty_rank, int seed)
 {
-    return (sizeof(Real) == sizeof(float)) ? Real(3.e-5) : Real(5.e-13);
-}
-
-AlgVector<Real>
-make_vector (AlgPartition const& partition)
-{
-    AlgVector<Real> x(partition);
-    auto* px = x.data();
-    Long const begin = x.globalBegin();
-    ParallelFor(x.numLocalRows(),
-                [=] AMREX_GPU_DEVICE (Long i) noexcept
-    {
-        Long const row = i+begin;
-        px[i] = Real(1.0) + Real(0.125)*Real(row % 11)
-            - Real(0.03125)*Real(row % 3);
-    });
-    return x;
-}
-
-void
-assert_canonical (SpMatrix<Real> const& matrix)
-{
-    auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(matrix);
-    for (Long i = 0; i < rows.nrows(); ++i) {
-        Long previous = -1;
-        for (Long p = rows.row_offset[i]; p < rows.row_offset[i+1]; ++p) {
-            AMREX_ALWAYS_ASSERT(rows.col_index[p] > previous);
-            AMREX_ALWAYS_ASSERT(rows.mat[p] != Real(0));
-            previous = rows.col_index[p];
-        }
+    int const nprocs = ParallelDescriptor::NProcs();
+    Vector<Long> rows(nprocs+1, 0);
+    Vector<Long> w(nprocs, 1);
+    for (int i = 0; i < nprocs; ++i) {
+        w[i] = 1 + (i*7 + seed) % 5;
+        if (i == empty_rank && nprocs > 1) { w[i] = 0; }
     }
+    Long wsum = std::accumulate(w.begin(), w.end(), Long(0)); // >= 1
+    Long acc = 0;
+    for (int i = 0; i < nprocs; ++i) {
+        acc += w[i];
+        rows[i+1] = nrows * acc / wsum;
+    }
+    return AlgPartition(rows);
 }
 
-Real
-action_error (SpMatrix<Real> const& actual,
-              SpMatrix<Real> const& expected,
-              AlgPartition const& column_partition)
+bool all_true (bool b)
 {
-    auto x = make_vector(column_partition);
-    AlgVector<Real> actual_x(actual.partition());
-    AlgVector<Real> expected_x(expected.partition());
-    SpMV(actual_x, actual, x);
-    SpMV(expected_x, expected, x);
-    Axpy(actual_x, Real(-1), expected_x);
-    return actual_x.norminf();
+    ParallelDescriptor::ReduceBoolAnd(b);
+    return b;
 }
 
-Real
-product_action_error (SpMatrix<Real> const& product,
-                      SpMatrix<Real> const& A,
-                      SpMatrix<Real> const& B,
-                      AlgPartition const& column_partition)
+// Compare (A*B)x with A(Bx).
+template <typename T>
+bool check_spmv (SpMatrix<T> const& A, SpMatrix<T> const& B, SpMatrix<T> const& AB,
+                 AlgPartition const& xpart, T tol)
 {
-    auto x = make_vector(column_partition);
-    AlgVector<Real> bx(B.partition());
-    AlgVector<Real> expected(A.partition());
-    AlgVector<Real> actual(A.partition());
-    SpMV(bx, B, x);
-    SpMV(expected, A, bx);
-    SpMV(actual, product, x);
-    Axpy(actual, Real(-1), expected);
-    return actual.norminf();
-}
+    AlgVector<T> x(xpart);
+    auto* px = x.data();
+    Long begin = x.globalBegin();
+    ParallelFor(x.numLocalRows(), [=] AMREX_GPU_DEVICE (Long i) {
+        px[i] = T(1) + T(0.25) * T((i + begin) % 7);
+    });
 
-SpMatrix<Real>
-make_identity (AlgPartition const& partition)
-{
-    SpMatrix<Real> identity(partition, partition, 1);
-    identity.setVal(
-        [] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = row;
-            val[0] = Real(1);
-        },
-        CsrSorted{true});
-    return identity;
-}
+    AlgVector<T> t(B.partition());
+    AlgVector<T> y1(A.partition());
+    AlgVector<T> y2(A.partition());
+    SpMV(t, B, x);
+    SpMV(y1, A, t);
+    SpMV(y2, AB, x);
 
-void
-test_identity_and_rectangular ()
-{
-    constexpr Long m = 29;
-    constexpr Long k = 23;
-    constexpr Long n = 31;
-    AlgPartition const m_partition(m);
-    AlgPartition const k_partition(k);
-    AlgPartition const n_partition(n);
-
-    SpMatrix<Real> A(m_partition, k_partition, 3);
-    A.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = row % k;
-            col[1] = (row + 1) % k;
-            col[2] = (row + 7) % k;
-            val[0] = Real(1.0) + Real(0.01)*Real(row);
-            val[1] = Real(-0.25);
-            val[2] = Real(0.125);
-        },
-        CsrSorted{false});
-
-    SpMatrix<Real> B(k_partition, n_partition, 3);
-    B.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = row % n;
-            col[1] = (row + 2) % n;
-            col[2] = (row + 9) % n;
-            val[0] = Real(0.5) + Real(0.02)*Real(row);
-            val[1] = Real(-0.75);
-            val[2] = Real(0.0625);
-        },
-        CsrSorted{false});
-
-    auto C = SpGEMM(A, B, n_partition);
-    AMREX_ALWAYS_ASSERT(C.partition() == m_partition);
-    AMREX_ALWAYS_ASSERT(C.columnPartition() == n_partition);
-    AMREX_ALWAYS_ASSERT(
-        product_action_error(C, A, B, n_partition) < tolerance());
-    assert_canonical(C);
-
-    auto Im = make_identity(m_partition);
-    auto Ik = make_identity(k_partition);
-    auto left = SpGEMM(Im, A, k_partition);
-    auto right = SpGEMM(A, Ik, k_partition);
-    AMREX_ALWAYS_ASSERT(action_error(left, A, k_partition) < tolerance());
-    AMREX_ALWAYS_ASSERT(action_error(right, A, k_partition) < tolerance());
-    assert_canonical(left);
-    assert_canonical(right);
-
-    auto CT = transpose(C, n_partition);
-    auto AT = transpose(A, k_partition);
-    auto BT = transpose(B, n_partition);
-    auto BTAT = SpGEMM(BT, AT, m_partition);
-    AMREX_ALWAYS_ASSERT(action_error(CT, BTAT, m_partition) < tolerance());
-}
-
-void
-test_permutation ()
-{
-    constexpr Long n = 37;
-    constexpr Long shift = 5;
-    AlgPartition const partition(n);
-    SpMatrix<Real> P(partition, partition, 1);
-    SpMatrix<Real> Pinverse(partition, partition, 1);
-    P.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = (row+shift) % n;
-            val[0] = Real(1);
-        },
-        CsrSorted{true});
-    Pinverse.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = (row+n-shift) % n;
-            val[0] = Real(1);
-        },
-        CsrSorted{true});
-    auto product = SpGEMM(P, Pinverse, partition);
-    auto identity = make_identity(partition);
-    AMREX_ALWAYS_ASSERT(
-        action_error(product, identity, partition) < tolerance());
-    assert_canonical(product);
-}
-
-void
-test_laplacian_square ()
-{
-    constexpr Long n = 41;
-    AlgPartition const partition(n);
-    SpMatrix<Real> L(partition, partition, 3);
-    L.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = (row+n-1) % n;
-            col[1] = row;
-            col[2] = (row+1) % n;
-            val[0] = Real(-1);
-            val[1] = Real(2);
-            val[2] = Real(-1);
-        },
-        CsrSorted{false});
-
-    SpMatrix<Real> expected(partition, partition, 5);
-    expected.setVal(
-        [=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = (row+n-2) % n;
-            col[1] = (row+n-1) % n;
-            col[2] = row;
-            col[3] = (row+1) % n;
-            col[4] = (row+2) % n;
-            val[0] = Real(1);
-            val[1] = Real(-4);
-            val[2] = Real(6);
-            val[3] = Real(-4);
-            val[4] = Real(1);
-        },
-        CsrSorted{false});
-
-    auto square = SpGEMM(L, L, partition);
-    AMREX_ALWAYS_ASSERT(
-        action_error(square, expected, partition) < tolerance());
-    assert_canonical(square);
-}
-
-void
-test_empty_local_rows_and_remote_import ()
-{
-    Long const nprocs = ParallelDescriptor::NProcs();
-    Long const m = 1;
-    Long const k = 2*nprocs+1;
-    Long const n = 2;
-    AlgPartition const m_partition(m);
-    AlgPartition const k_partition(k);
-    AlgPartition const n_partition(n);
-
-    SpMatrix<Real> A(m_partition, k_partition, 3);
-    A.setVal(
-        [=] AMREX_GPU_DEVICE (Long, Long* col, Real* val) noexcept
-        {
-            col[0] = 0;
-            col[1] = k/2;
-            col[2] = k-1;
-            val[0] = Real(0.5);
-            val[1] = Real(-0.25);
-            val[2] = Real(1.25);
-        },
-        CsrSorted{true});
-    SpMatrix<Real> B(k_partition, n_partition, 1);
-    B.setVal(
-        [] AMREX_GPU_DEVICE (Long row, Long* col, Real* val) noexcept
-        {
-            col[0] = row % 2;
-            val[0] = Real(1) + Real(0.125)*Real(row);
-        },
-        CsrSorted{true});
-
-    auto product = SpGEMM(A, B, n_partition);
-    AMREX_ALWAYS_ASSERT(
-        product_action_error(product, A, B, n_partition) < tolerance());
-    assert_canonical(product);
+    auto y1max = y1.norminf();
+    auto* p1 = y1.data();
+    auto const* p2 = y2.data();
+    ParallelFor(y1.numLocalRows(), [=] AMREX_GPU_DEVICE (Long i) {
+        p1[i] -= p2[i];
+    });
+    Gpu::streamSynchronize();
+    auto err = y1.norminf();
+    return err <= tol * y1max;
 }
 
 }
 
-int
-main (int argc, char* argv[])
+int main (int argc, char *argv[])
 {
     amrex::Initialize(argc, argv);
+    {
+        int const nprocs = ParallelDescriptor::NProcs();
 
-    test_identity_and_rectangular();
-    test_permutation();
-    test_laplacian_square();
-    test_empty_local_rows_and_remote_import();
+        // Identity Matrix
+        for (int ipart = 0; ipart < 3; ++ipart)
+        {
+            Long nrows = 30;
+            Long ncols = 27;
+            AlgPartition rpart = (ipart == 0) ? AlgPartition(nrows)
+                : make_partition(nrows, (ipart == 1) ? 0 : nprocs-1, ipart);
+            AlgPartition cpart = (ipart == 0) ? AlgPartition(ncols)
+                : make_partition(ncols, (ipart == 1) ? nprocs-1 : 0, ipart+3);
+            auto Ir = IdentityMatrix<Real>(rpart);
+            auto Ic = IdentityMatrix<Real>(cpart);
 
-    amrex::Print()
-        << "SpGEMM identity, rectangular, permutation, transpose, "
-        << "Laplacian-square, and empty-row tests passed\n";
+            Real lambda = Real(2.8);
+            int nnz_per_row_max = int(nrows/3);
+            auto A = RandomMatrix<Real>(rpart, nrows, ncols, lambda, nnz_per_row_max);
+
+            auto A2 = amrex::SpGEMM(Ir, A, cpart);
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(A,A2)));
+
+            auto A3 = amrex::SpGEMM(A2, Ic, cpart);
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(A,A3)));
+
+            auto II = amrex::SpGEMM(Ir, Ir, rpart);
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(II, Ir)));
+        }
+
+        // Permutation Matrix
+        {
+            std::random_device rd;
+            std::uniform_int_distribution<unsigned> dist(0, std::numeric_limits<unsigned>::max());
+            unsigned seed = dist(rd);
+            ParallelDescriptor::Bcast(&seed, 1);
+            std::mt19937 gen(seed);
+
+            int nrows = 240;
+            Gpu::PinnedVector<Long> perm(nrows);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::shuffle(perm.begin(), perm.end(), gen);
+
+            Gpu::DeviceVector<Long> perm_dv(nrows);
+            Gpu::copyAsync(Gpu::hostToDevice, perm.begin(), perm.end(),
+                           perm_dv.begin());
+            auto const* pp = perm_dv.data();
+
+            SpMatrix<float> P(make_partition(nrows, -1, 1), 1);
+            P.setVal([=] AMREX_GPU_DEVICE (Long row, Long* col, float* val)
+            {
+                *col = pp[row];
+                *val = 1.0F;
+            }, CsrSorted{true});
+
+            auto PT = amrex::transpose(P, P.partition());
+
+            auto PPT = amrex::SpGEMM(P, PT, P.partition());
+            auto PTP = amrex::SpGEMM(PT, P, P.partition());
+            auto I = IdentityMatrix<float>(P.partition());
+
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(PPT,PTP)));
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(PPT,I)));
+        }
+
+        // 1D periodic Laplacian: Lap*Lap == Lap2
+        for (int nrows : {6, 128})
+        {
+            AlgPartition part = (nrows == 6) ? AlgPartition(nrows)
+                                             : make_partition(nrows, -1, 2);
+            SpMatrix<Real> Lap(part, 3);
+            Lap.setVal([=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val)
+            {
+                if (row == 0) {
+                    col[0] = 0;
+                    col[1] = 1;
+                    col[2] = nrows-1;
+                    val[0] = Real(2);
+                    val[1] = Real(-1);
+                    val[2] = Real(-1);
+                } else if (row < nrows-1) {
+                    col[0] = row-1;
+                    col[1] = row;
+                    col[2] = row+1;
+                    val[0] = Real(-1);
+                    val[1] = Real(2);
+                    val[2] = Real(-1);
+                } else {
+                    col[0] = 0;
+                    col[1] = row-1;
+                    col[2] = row;
+                    val[0] = Real(-1);
+                    val[1] = Real(-1);
+                    val[2] = Real(2);
+                }
+            }, CsrSorted{true});
+
+            SpMatrix<Real> Lap2(Lap.partition(), 5);
+            Lap2.setVal([=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val)
+            {
+                if (row == 0) {
+                    col[0] = 0;
+                    col[1] = 1;
+                    col[2] = 2;
+                    col[3] = nrows-2;
+                    col[4] = nrows-1;
+                    val[0] = Real(6);
+                    val[1] = Real(-4);
+                    val[2] = Real(1);
+                    val[3] = Real(1);
+                    val[4] = Real(-4);
+                } else if (row == 1) {
+                    col[0] = 0;
+                    col[1] = 1;
+                    col[2] = 2;
+                    col[3] = 3;
+                    col[4] = nrows-1;
+                    val[0] = Real(-4);
+                    val[1] = Real(6);
+                    val[2] = Real(-4);
+                    val[3] = Real(1);
+                    val[4] = Real(1);
+                } else if (row < nrows-2) {
+                    col[0] = row-2;
+                    col[1] = row-1;
+                    col[2] = row;
+                    col[3] = row+1;
+                    col[4] = row+2;
+                    val[0] = Real(1);
+                    val[1] = Real(-4);
+                    val[2] = Real(6);
+                    val[3] = Real(-4);
+                    val[4] = Real(1);
+                } else if (row == nrows-2) {
+                    col[0] = 0;
+                    col[1] = row-2;
+                    col[2] = row-1;
+                    col[3] = row;
+                    col[4] = row+1;
+                    val[0] = Real(1);
+                    val[1] = Real(1);
+                    val[2] = Real(-4);
+                    val[3] = Real(6);
+                    val[4] = Real(-4);
+                } else { // row == nrows-1
+                    col[0] = 0;
+                    col[1] = 1;
+                    col[2] = row-2;
+                    col[3] = row-1;
+                    col[4] = row;
+                    val[0] = Real(-4);
+                    val[1] = Real(1);
+                    val[2] = Real(1);
+                    val[3] = Real(-4);
+                    val[4] = Real(6);
+                }
+            }, CsrSorted{true});
+
+            auto LL = amrex::SpGEMM(Lap, Lap, Lap.partition());
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(LL,Lap2)));
+        }
+
+        // (A*B)^T = B^T * A^T, and (A*B)x = A(Bx)
+        for (int ipart = 0; ipart < 2; ++ipart)
+        {
+            Long n1 = 75;
+            Long n2 = 100;
+            Long n3 = 80;
+            AlgPartition pt1 = (ipart == 0) ? AlgPartition(n1) : make_partition(n1, 0, 4);
+            AlgPartition pt2 = (ipart == 0) ? AlgPartition(n2) : make_partition(n2, nprocs/2, 5);
+            AlgPartition pt3 = (ipart == 0) ? AlgPartition(n3) : make_partition(n3, nprocs-1, 6);
+            Real lambda = Real(3.4);
+            int nnz_per_row_max = 9;
+            auto A = RandomMatrix<Real>(pt1, n1, n2, lambda, nnz_per_row_max);
+            auto B = RandomMatrix<Real>(pt2, n2, n3, lambda, nnz_per_row_max);
+            auto AT = amrex::transpose(A, pt2);
+            auto BT = amrex::transpose(B, pt3);
+            auto AB = amrex::SpGEMM(A, B, pt3);
+            auto ABT = amrex::transpose(AB, pt3);
+            auto BTAT = amrex::SpGEMM(BT, AT, pt1);
+            // Products are summed in different orders.
+            AMREX_ALWAYS_ASSERT(all_true(amrex::almostEqual(ABT,BTAT,32)));
+
+            Real tol = std::numeric_limits<Real>::epsilon() * Real(100);
+            AMREX_ALWAYS_ASSERT(all_true(check_spmv(A, B, AB, pt3, tol)));
+        }
+
+        // Empty matrices
+        {
+            Long n1 = 40, n2 = 50, n3 = 45;
+            AlgPartition pt1 = make_partition(n1, -1, 7);
+            AlgPartition pt2 = make_partition(n2, -1, 8);
+            AlgPartition pt3 = make_partition(n3, -1, 9);
+            SpMatrix<Real> Z1(pt1, 0);
+            SpMatrix<Real> Z2(pt2, 0);
+            auto A = RandomMatrix<Real>(pt1, n1, n2, Real(3), 6);
+            auto B = RandomMatrix<Real>(pt2, n2, n3, Real(3), 6);
+            auto ZB = amrex::SpGEMM(Z1, B, pt3);
+            auto AZ = amrex::SpGEMM(A, Z2, pt3);
+            AMREX_ALWAYS_ASSERT(all_true(ZB.numLocalNonZeros() == 0 &&
+                                         AZ.numLocalNonZeros() == 0 &&
+                                         ZB.numLocalRows() == pt1.numLocalRows() &&
+                                         AZ.numLocalRows() == pt1.numLocalRows()));
+            AlgVector<Real> x(pt3), y(pt1);
+            x.setVal(Real(1));
+            SpMV(y, ZB, x);
+            SpMV(y, AZ, x);
+            AMREX_ALWAYS_ASSERT(all_true(y.norminf() == Real(0)));
+        }
+    }
     amrex::Finalize();
 }

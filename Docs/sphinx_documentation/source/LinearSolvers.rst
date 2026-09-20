@@ -367,7 +367,7 @@ biconjugate gradient stabilized method, but can easily be changed with the :cpp:
 
 Available choices of the bottom solver are
 
-- :cpp:`MLMG::BottomSolver::bicgstab`: The default.
+- :cpp:`MLMG::BottomSolver::bicgstab`: The default for most operators.
 
 - :cpp:`MLMG::BottomSolver::cg`: The conjugate gradient method.  The
   matrix must be symmetric.
@@ -384,6 +384,13 @@ Available choices of the bottom solver are
   see the section below on External Solvers
 
 - :cpp:`MLMG::BottomSolver::petsc`: Currently for cell-centered only.
+
+- :cpp:`MLMG::BottomSolver::custom`: A solver provided by the linear operator
+  itself, for operators that ship one.  :cpp:`MLEBNodeFDLaplacian` is currently
+  the only such operator, and it uses this by default.  Its custom solver is a
+  BiCGStab that runs entirely on the GPU when the bottom level has a single
+  Box.  This is currently available for CUDA and HIP only; other builds fall
+  back to the standard BiCGStab solver.
 
 The :cpp:`LPInfo` class can be used to control the agglomeration and
 consolidation strategy for multigrid coarsening.
@@ -409,6 +416,15 @@ consolidation strategy for multigrid coarsening.
   :cpp:`LPInfo::setConsolidationRatio(int)`, and
   :cpp:`LPInfo::setConsolidationStrategy(int)`, to give control over how this
   process works.  If agglomeration is used, consolidation is ignored.
+
+- :cpp:`LPInfo::setSemicoarsening(bool)` (by default false) allows multigrid
+  to coarsen in only some of the directions when a direction can no longer be
+  coarsened.  :cpp:`LPInfo::setMaxSemicoarseningLevel(int)` caps how many such
+  levels are built, and :cpp:`LPInfo::setSemicoarseningDirection(int)` pins the
+  direction that is left uncoarsened.  On semi-coarsened levels the
+  cell-centered solvers smooth with a line solve along the uncoarsened
+  direction.  That smoother runs on the CPU only, so cell-centered
+  semi-coarsening is not supported in GPU builds and will abort.
 
 :cpp:`MLMG::setThrowException(bool)` controls whether multigrid failure results
 in aborting (default) or throwing an exception, whereby control will return to the calling
@@ -439,6 +455,20 @@ For example, using AMReX-Hydro's :cpp:`NodalProjector`
     } catch (const MLMG::error& e) {
         // Do something else...
     }
+
+On GPUs, calling :cpp:`MLMG::setNoGpuSync(true)` makes :cpp:`MLMG::solve`
+run in a single-stream region without the implicit stream synchronizations
+that :cpp:`MFIter` and many AMReX functions normally perform (see
+:ref:`sec:gpu:stream`).  This is off by default.  When it is on, the GPU
+streams are synchronized once when :cpp:`solve` returns, so the solution is
+complete when control comes back to the application, unless the application
+itself is inside a :cpp:`Gpu::NoSyncRegion`.  Whether this is faster depends
+on the problem.  Avoiding the many small synchronizations of a multigrid
+cycle helps small problems with few boxes per process, but running on a
+single stream removes the concurrency between the per-box kernels that some
+solvers (e.g., the nodal and EB solvers) launch, which can make solves with
+many small boxes slower.  Users are encouraged to time their solves with and
+without :cpp:`setNoGpuSync(true)` and use whichever is faster.
 
 
 Boundary Stencils for Cell-Centered Solvers
@@ -805,6 +835,13 @@ viscous term `divtau` explicitly:
 
    solver.apply(GetVecOfPtrs(divtau), GetVecOfPtrs(vel));
 
+A tensor operator and the :cpp:`MLMG` object built on it may be reused for any
+number of ``solve`` and ``apply`` calls, provided the coefficients are left
+untouched after the first call.  Unlike the other operators, the tensor
+operators do not support updating coefficients in place: calling
+``setShearViscosity``, ``setBulkViscosity``, ``setACoeffs``, or their EB
+counterparts on an operator that has already been used will abort on the next
+call.  Build a new operator when the viscosities change.
 
 Multi-Component Operators
 =========================
@@ -1002,8 +1039,10 @@ Hierarchy statistics and recent timings are available after setup or a solve:
                   << info.operator_complexity << '\n';
 
 MPI hierarchy setup exchanges only referenced strength-graph fields through a
-typed sparse halo.  Sparse matrix products import only the remote rows of the
-right operand referenced by local rows.  The final matrix and right-hand side
+typed sparse halo.  Galerkin coarse operators are formed as two sparse
+matrix products, first ``A P`` and then ``R (A P)``, using :cpp:`SpGEMM`.
+Sparse matrix products import only the remote rows of the right operand
+referenced by local rows.  The final matrix and right-hand side
 are replicated only after the hierarchy reaches the dense coarse threshold of
 at most nine unknowns.  V-cycle matrix-vector products use the ordinary
 sparse-matrix halo exchange.
@@ -1030,3 +1069,53 @@ https://amrex-codes.github.io/amrex/tutorials_html/LinearSolvers_Tutorial.html.
 AMReX also provides :cpp:`GMRESMLMGT`, a class template that solves the
 linear system in :cpp:`MLMG` using GMRES with :cpp:`MLMG` itself serving as
 the preconditioner.
+
+Sparse Linear Algebra
+=====================
+
+AMReX provides distributed sparse matrices and vectors in
+``AMReX_Algebra.H``. An :cpp:`AlgPartition` describes how global row indices
+are divided among MPI processes: each process owns a contiguous range of
+rows. :cpp:`AlgVector<T>` is a vector distributed with such a partition, and
+:cpp:`SpMatrix<T>` is a sparse matrix in compressed sparse row (CSR) format
+whose rows are distributed with a partition. The data live in GPU memory in
+GPU builds.
+
+A matrix can be built with a fixed number of nonzeros per row and filled
+with a functor that sets the global column indices and values of each row,
+or from existing CSR arrays with :cpp:`define`.
+
+.. highlight:: c++
+
+::
+
+    // 1D Laplacian with n global rows, 3 nonzeros per row
+    AlgPartition partition(n);
+    SpMatrix<Real> A(partition, 3);
+    A.setVal([=] AMREX_GPU_DEVICE (Long row, Long* col, Real* val)
+    {
+        col[0] = (row+n-1) % n; val[0] = Real(-1);
+        col[1] = row;           val[1] = Real(2);
+        col[2] = (row+1) % n;   val[2] = Real(-1);
+    }, CsrSorted{false});
+
+The following operations are available.
+
+- :cpp:`SpMV(y, A, x)` computes :math:`y = A x`.
+- :cpp:`transpose(A, col_partition)` returns :math:`A^T`, where
+  ``col_partition`` is the column partition of ``A`` and becomes the row
+  partition of the result.
+- :cpp:`SpGEMM(A, B, col_partition)` returns the product :math:`A B`. Its
+  rows are partitioned like ``A``, and ``col_partition`` is the column
+  partition of ``B`` and of the product. The rows of ``B`` needed by other
+  processes are exchanged with MPI, and the local product uses cuSPARSE,
+  rocSPARSE or oneMKL on GPUs and an OpenMP-parallel kernel on CPUs.
+
+Column partitions are set on first use. Since a matrix keeps its column
+partition, a given matrix must always be used with the same column
+partition; for example, the same ``col_partition`` must be passed every time
+a matrix appears on the right-hand side of :cpp:`SpGEMM`.
+
+Utilities in ``AMReX_SpMatUtil.H`` include :cpp:`IdentityMatrix`,
+:cpp:`RandomMatrix` and :cpp:`almostEqual` for tests. See
+``Tests/Algebra`` for examples.

@@ -121,7 +121,8 @@ HypreABecLap2::getSolution (MultiFab& a_soln)
     MultiFab* soln = &a_soln;
     MultiFab tmp;
     if (a_soln.nGrowVect() != 0) {
-        tmp.define(a_soln.boxArray(), a_soln.DistributionMap(), 1, 0);
+        tmp.define(a_soln.boxArray(), a_soln.DistributionMap(), 1, 0,
+                   MFInfo().SetArena(The_Async_Arena()));
         soln = &tmp;
     }
 
@@ -148,6 +149,13 @@ void
 HypreABecLap2::prepareSolver ()
 {
     BL_PROFILE("HypreABecLap2::prepareSolver()");
+
+    // Free handles from a previous call.
+    if (solver) { HYPRE_BoomerAMGDestroy(solver); solver = nullptr; }
+    if (A) { HYPRE_SStructMatrixDestroy(A); A = nullptr; }
+    if (graph) { HYPRE_SStructGraphDestroy(graph); graph = nullptr; }
+    if (stencil) { HYPRE_SStructStencilDestroy(stencil); stencil = nullptr; }
+    if (hgrid) { HYPRE_SStructGridDestroy(hgrid); hgrid = nullptr; }
 
     HYPRE_SStructGridCreate(comm, AMREX_SPACEDIM, 1, &hgrid);
 
@@ -324,6 +332,7 @@ HypreABecLap2::loadVectors (MultiFab& soln, const MultiFab& rhs)
                 rhs_diag_a(i,j,k) = rhs_a(i,j,k) * diaginv_a(i,j,k);
             });
         }
+        if (Gpu::inNoSyncRegion()) { Gpu::synchronize(); }
     }
 
     const HYPRE_Int part = 0;

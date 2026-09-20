@@ -539,7 +539,7 @@ test_distributed_transpose_trailing_empty_row ()
 
     auto AT = amrex::transpose(A, partition);
     auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(AT);
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(AT);
     Long const expected_column =
         partition[(rank+nprocs-1)%nprocs];
     AMREX_ALWAYS_ASSERT(rows.nnz == 1);
@@ -674,7 +674,7 @@ test_extended_plus_i_interpolation ()
     AMG<Real> amg(A);
     AMGTestAccess<Real>::prepare_interpolation(amg, markers);
     auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(
             AMGTestAccess<Real>::interpolation(amg));
 
     Long const begin = A.globalRowBegin();
@@ -732,7 +732,7 @@ test_interpolation_truncation ()
     AMG<Real> amg(A, options);
     AMGTestAccess<Real>::prepare_interpolation(amg, markers);
     auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(
             AMGTestAccess<Real>::interpolation(amg));
 
     Long const begin = A.globalRowBegin();
@@ -756,7 +756,7 @@ test_interpolation_truncation ()
     AMG<Real> untruncated_amg(A, options);
     AMGTestAccess<Real>::prepare_interpolation(untruncated_amg, markers);
     auto untruncated =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(
             AMGTestAccess<Real>::interpolation(untruncated_amg));
     if (begin == 0 && A.numLocalRows() > 0) {
         AMREX_ALWAYS_ASSERT(
@@ -798,7 +798,7 @@ test_interpolation_restriction_and_galerkin ()
     auto const coarse_partition =
         AMGTestAccess<Real>::coarse_partition(amg);
     auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(P);
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(P);
     Long const begin = A.globalRowBegin();
     for (Long i = 0; i < A.numLocalRows(); ++i) {
         Long const gid = begin+i;
@@ -1073,7 +1073,7 @@ solve_with_boomeramg (SpMatrix<Real> const& A,
     Long const end = A.globalRowEnd();
     Long const nlocal = A.numLocalRows();
     auto rows =
-        SpGEMMHelper<Real,DefaultAllocator>::copy_local_global_csr(A);
+        AMGMatrixHelper<Real,DefaultAllocator>::copy_local_global_csr(A);
     AMREX_ALWAYS_ASSERT(nlocal <= std::numeric_limits<HYPRE_Int>::max());
     AMREX_ALWAYS_ASSERT(rows.nnz <= std::numeric_limits<HYPRE_Int>::max());
 

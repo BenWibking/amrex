@@ -9,8 +9,25 @@
 #include <AMReX_ParReduce.H>
 #include <limits>
 
+/**
+ * \file AMReX_FabArrayUtility.H
+ * \brief Reduction helpers and utility algorithms for FabArray objects.
+ */
+
 namespace amrex {
 
+/**
+ * \brief Sum a user-defined quantity over locally owned data, including \p nghost cells.
+ *
+ * Only data owned by the calling rank is reduced; no MPI reduction across ranks
+ * is performed. On the host, \p f receives a tile box, while in a GPU launch
+ * region it receives a one-cell box.
+ *
+ * \param fa     FabArray supplying data to the reduction.
+ * \param nghost Number of ghost cells to include uniformly in every direction.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)` whose
+ *               return value contributes to the rank-local sum.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceSum (FabArray<FAB> const& fa, int nghost, F&& f)
@@ -123,6 +140,14 @@ typename FAB::value_type ReduceSum_host_wrapper (FabArray<FAB> const& fa, IntVec
 }
 /// \endcond
 
+/**
+ * \brief Sum a user-defined quantity over locally owned data, including \p nghost.
+ *
+ * \param fa     FabArray supplying data to the reduction.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)` whose
+ *               return contributes to the reduction.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceSum (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -134,6 +159,14 @@ ReduceSum (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
     }
 }
 #else
+/**
+ * \brief Sum a user-defined quantity over locally owned data, including \p nghost.
+ *
+ * \param fa     FabArray supplying data to the reduction.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)` whose
+ *               return contributes to the reduction.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceSum (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -142,6 +175,14 @@ ReduceSum (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 }
 #endif
 
+/**
+ * \brief Sum a functor over two FabArrays with the same BoxArray and DistributionMapping.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data (can have different value_type).
+ * \param nghost Number of ghost cells to include uniformly.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -199,6 +240,14 @@ typename FAB1::value_type ReduceSum_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Sum a functor over two FabArrays with per-direction ghost-cell widths.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -211,6 +260,14 @@ ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Sum a functor over two FabArrays with per-direction ghost-cell widths.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -220,6 +277,15 @@ ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Sum a functor over three FabArrays with the same layout.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param fa3    Third FabArray supplying data.
+ * \param nghost Uniform ghost-cell count to include.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&, Array4<T3 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2, FabArray<FAB3> const& fa3,
@@ -278,6 +344,15 @@ typename FAB1::value_type ReduceSum_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Sum a functor over three FabArrays with per-direction ghost-cell widths.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param fa3    Third FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&, Array4<T3 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -290,6 +365,15 @@ ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Sum a functor over three FabArrays with per-direction ghost-cell widths.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param fa3    Third FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include before invoking the functor.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&, Array4<T3 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -299,6 +383,17 @@ ReduceSum (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Compute the rank-local minimum of a functor, including \p nghost cells.
+ *
+ * Only data owned by the calling rank is reduced; no MPI reduction across ranks
+ * is performed. On the host, \p f receives a tile box, while in a GPU launch
+ * region it receives a one-cell box.
+ *
+ * \param fa     FabArray supplying data.
+ * \param nghost Number of ghost cells to include uniformly.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)` whose return participates in a min-reduction.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMin (FabArray<FAB> const& fa, int nghost, F&& f)
@@ -350,6 +445,13 @@ typename FAB::value_type ReduceMin_host_wrapper (FabArray<FAB> const& fa, IntVec
 }
 /// \endcond
 
+/**
+ * \brief Compute the rank-local minimum of a functor with per-direction ghost widths.
+ *
+ * \param fa     FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)`.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMin (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -361,6 +463,13 @@ ReduceMin (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
     }
 }
 #else
+/**
+ * \brief Compute the rank-local minimum of a functor with per-direction ghost widths.
+ *
+ * \param fa     FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include.
+ * \param f      Callable invoked as `f(Box const&, Array4<T const> const&)`.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMin (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -369,6 +478,14 @@ ReduceMin (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 }
 #endif
 
+/**
+ * \brief Compute the minimum of a functor that touches two FabArrays grown by \p nghost.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param nghost Uniform ghost width to include for both.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2, int nghost, F&& f)
@@ -425,6 +542,14 @@ typename FAB1::value_type ReduceMin_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Compute the minimum of a functor that touches two FabArrays grown by \p nghost.
+ *
+ * \param fa1    First FabArray supplying data.
+ * \param fa2    Second FabArray supplying data.
+ * \param nghost Per-direction ghost cells to include.
+ * \param f      Callable invoked as `f(Box const&, Array4<T1 const> const&, Array4<T2 const> const&)`.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -437,6 +562,9 @@ ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Compute the minimum of a functor that touches two FabArrays grown by \p nghost.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -446,6 +574,9 @@ ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Convenience overload of ReduceMin for three FabArrays with a uniform ghost width.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2, FabArray<FAB3> const& fa3,
@@ -504,6 +635,9 @@ typename FAB1::value_type ReduceMin_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Compute the minimum of a functor that touches three FabArrays with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -516,6 +650,9 @@ ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Compute the minimum of a functor that touches three FabArrays with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -525,6 +662,13 @@ ReduceMin (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Compute the rank-local maximum of a functor, including \p nghost cells.
+ *
+ * Only data owned by the calling rank is reduced; no MPI reduction across ranks
+ * is performed. On the host, \p f receives a tile box, while in a GPU launch
+ * region it receives a one-cell box.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMax (FabArray<FAB> const& fa, int nghost, F&& f)
@@ -577,6 +721,9 @@ typename FAB::value_type ReduceMax_host_wrapper (FabArray<FAB> const& fa, IntVec
 }
 /// \endcond
 
+/**
+ * \brief Compute the rank-local maximum of a functor with per-direction ghost widths.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMax (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -588,6 +735,9 @@ ReduceMax (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
     }
 }
 #else
+/**
+ * \brief Compute the rank-local maximum of a functor with per-direction ghost widths.
+ */
 template <BaseFabType FAB, class F>
 typename FAB::value_type
 ReduceMax (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -596,6 +746,9 @@ ReduceMax (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 }
 #endif
 
+/**
+ * \brief Convenience overload of ReduceMax for two FabArrays with uniform ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2, int nghost, F&& f)
@@ -652,6 +805,9 @@ typename FAB1::value_type ReduceMax_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Compute the maximum of a functor that touches two FabArrays grown by \p nghost.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -664,6 +820,9 @@ ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Compute the maximum of a functor that touches two FabArrays grown by \p nghost.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -673,6 +832,9 @@ ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Convenience overload of ReduceMax for three FabArrays with a uniform ghost width.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2, FabArray<FAB3> const& fa3,
@@ -731,6 +893,9 @@ typename FAB1::value_type ReduceMax_host_wrapper (FabArray<FAB1> const& fa1, Fab
 }
 /// \endcond
 
+/**
+ * \brief Compute the maximum of a functor that touches three FabArrays with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -743,6 +908,9 @@ ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Compute the maximum of a functor that touches three FabArrays with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, BaseFabType FAB3, class F>
 typename FAB1::value_type
 ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -752,6 +920,13 @@ ReduceMax (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Return the logical AND of predicate results over locally owned data.
+ *
+ * Only data owned by the calling rank is reduced; no MPI reduction across ranks
+ * is performed. On the host, \p f receives a tile box, while in a GPU launch
+ * region it receives a one-cell box.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB> const& fa, int nghost, F&& f)
@@ -803,6 +978,9 @@ bool ReduceLogicalAnd_host_wrapper (FabArray<FAB> const& fa, IntVect const& ngho
 }
 /// \endcond
 
+/**
+ * \brief Return the logical AND of predicate results over locally owned data.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -814,6 +992,9 @@ ReduceLogicalAnd (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
     }
 }
 #else
+/**
+ * \brief Return the logical AND of predicate results over locally owned data.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -822,6 +1003,9 @@ ReduceLogicalAnd (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 }
 #endif
 
+/**
+ * \brief Convenience overload of ReduceLogicalAnd for two FabArrays with uniform ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -878,6 +1062,9 @@ bool ReduceLogicalAnd_host_wrapper (FabArray<FAB1> const& fa1, FabArray<FAB2> co
 }
 /// \endcond
 
+/**
+ * \brief Two-Fab logical AND reduction with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -890,6 +1077,9 @@ ReduceLogicalAnd (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Two-Fab logical AND reduction with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalAnd (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -899,6 +1089,13 @@ ReduceLogicalAnd (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Return the logical OR of predicate results over locally owned data.
+ *
+ * Only data owned by the calling rank is reduced; no MPI reduction across ranks
+ * is performed. On the host, \p f receives a tile box, while in a GPU launch
+ * region it receives a one-cell box.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalOr (FabArray<FAB> const& fa, int nghost, F&& f)
@@ -941,15 +1138,18 @@ bool ReduceLogicalOr_host_wrapper (FabArray<FAB> const& fa, IntVect const& nghos
 
 template <BaseFabType FAB, class F>
 requires (amrex::DefinitelyNotHostRunnable<F>::value)
-bool ReduceLogicalOr_host (FabArray<FAB> const& fa, IntVect const& nghost, F&& /*f*/)
+bool ReduceLogicalOr_host_wrapper (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 {
-    amrex::ignore_unused(fa,nghost);
+    amrex::ignore_unused(fa,nghost,f);
     amrex::Abort("ReduceLogicalOr: Launch Region is off. Device lambda cannot be called by host.");
-    return 0;
+    return false;
 }
 }
 /// \endcond
 
+/**
+ * \brief Return the logical OR of predicate results over locally owned data.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalOr (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -961,6 +1161,9 @@ ReduceLogicalOr (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
     }
 }
 #else
+/**
+ * \brief Return the logical OR of predicate results over locally owned data.
+ */
 template <BaseFabType FAB, class F>
 bool
 ReduceLogicalOr (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
@@ -969,6 +1172,9 @@ ReduceLogicalOr (FabArray<FAB> const& fa, IntVect const& nghost, F&& f)
 }
 #endif
 
+/**
+ * \brief Convenience overload of ReduceLogicalOr for two FabArrays with uniform ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalOr (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -1025,6 +1231,9 @@ bool ReduceLogicalOr_host_wrapper (FabArray<FAB1> const& fa1, FabArray<FAB2> con
 }
 /// \endcond
 
+/**
+ * \brief Two-Fab logical OR reduction with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalOr (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -1037,6 +1246,9 @@ ReduceLogicalOr (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
     }
 }
 #else
+/**
+ * \brief Two-Fab logical OR reduction with per-direction ghost cells.
+ */
 template <BaseFabType FAB1, BaseFabType FAB2, class F>
 bool
 ReduceLogicalOr (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
@@ -1046,6 +1258,14 @@ ReduceLogicalOr (FabArray<FAB1> const& fa1, FabArray<FAB2> const& fa2,
 }
 #endif
 
+/**
+ * \brief Print the value(s) stored at a specific cell of a FabArray.
+ *
+ * \param mf    FabArray inspected.
+ * \param cell  Cell index to read.
+ * \param comp  Component to print, or -1 to dump every component.
+ * \param ng    Extra grow cells to include when finding FABs that contain \p cell.
+ */
 template <BaseFabType FAB>
 void
 printCell (FabArray<FAB> const& mf, const IntVect& cell, int comp = -1,
@@ -1098,6 +1318,16 @@ printCell (FabArray<FAB> const& mf, const IntVect& cell, int comp = -1,
     }
 }
 
+/**
+ * \brief Swap a component subset (with uniform ghost cells) between two FabArrays.
+ *
+ * \param dst      Destination FabArray whose components will be exchanged.
+ * \param src      Source FabArray providing the other half of the exchange.
+ * \param srccomp  Starting component in \p src.
+ * \param dstcomp  Starting component in \p dst.
+ * \param numcomp  Number of components to swap.
+ * \param nghost   Uniform ghost width involved in the exchange.
+ */
 template <BaseFabType FAB>
 void
 Swap (FabArray<FAB>& dst, FabArray<FAB>& src, int srccomp, int dstcomp, int numcomp, int nghost)
@@ -1105,6 +1335,16 @@ Swap (FabArray<FAB>& dst, FabArray<FAB>& src, int srccomp, int dstcomp, int numc
     Swap(dst,src,srccomp,dstcomp,numcomp,IntVect(nghost));
 }
 
+/**
+ * \brief Swap a component subset (with per-direction ghost cells) between two FabArrays.
+ *
+ * \param dst      Destination FabArray whose components will be exchanged.
+ * \param src      Source FabArray providing the other half of the exchange.
+ * \param srccomp  Starting component in \p src.
+ * \param dstcomp  Starting component in \p dst.
+ * \param numcomp  Number of components to swap.
+ * \param nghost   Per-direction ghost width involved in the exchange.
+ */
 template <BaseFabType FAB>
 void
 Swap (FabArray<FAB>& dst, FabArray<FAB>& src, int srccomp, int dstcomp, int numcomp, const IntVect& nghost)
@@ -1114,7 +1354,8 @@ Swap (FabArray<FAB>& dst, FabArray<FAB>& src, int srccomp, int dstcomp, int numc
 
     bool explicit_swap = true;
 
-    if (srccomp == dstcomp && dstcomp == 0 && src.nComp() == dst.nComp() &&
+    if (srccomp == dstcomp && dstcomp == 0 && numcomp == src.nComp() &&
+        src.nComp() == dst.nComp() &&
         src.nGrowVect() == nghost && src.nGrowVect() == dst.nGrowVect() &&
         src.arena() == dst.arena() && src.hasEBFabFactory() == dst.hasEBFabFactory()) {
         explicit_swap = false;
@@ -1163,6 +1404,7 @@ Swap (FabArray<FAB>& dst, FabArray<FAB>& src, int srccomp, int dstcomp, int numc
     }
 }
 
+//! Apply `dst(dstcomp+n) -= src(srccomp+n)` using a uniform ghost width.
 template <BaseFabType FAB>
 void
 Subtract (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, int nghost)
@@ -1170,6 +1412,7 @@ Subtract (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp
     Subtract(dst,src,srccomp,dstcomp,numcomp,IntVect(nghost));
 }
 
+//! Apply `dst(dstcomp+n) -= src(srccomp+n)` using per-direction ghost widths.
 template <BaseFabType FAB>
 void
 Subtract (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, const IntVect& nghost)
@@ -1209,6 +1452,7 @@ Subtract (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp
 }
 
 
+//! Apply `dst(dstcomp+n) *= src(srccomp+n)` using a uniform ghost width.
 template <BaseFabType FAB>
 void
 Multiply (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, int nghost)
@@ -1216,6 +1460,7 @@ Multiply (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp
     Multiply(dst,src,srccomp,dstcomp,numcomp,IntVect(nghost));
 }
 
+//! Apply `dst(dstcomp+n) *= src(srccomp+n)` using per-direction ghost widths.
 template <BaseFabType FAB>
 void
 Multiply (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, const IntVect& nghost)
@@ -1255,6 +1500,7 @@ Multiply (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp
 }
 
 
+//! Apply `dst(dstcomp+n) /= src(srccomp+n)` using a uniform ghost width.
 template <BaseFabType FAB>
 void
 Divide (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, int nghost)
@@ -1262,6 +1508,7 @@ Divide (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, 
     Divide(dst,src,srccomp,dstcomp,numcomp,IntVect(nghost));
 }
 
+//! Apply `dst(dstcomp+n) /= src(srccomp+n)` using per-direction ghost widths.
 template <BaseFabType FAB>
 void
 Divide (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, int numcomp, const IntVect& nghost)
@@ -1300,6 +1547,7 @@ Divide (FabArray<FAB>& dst, FabArray<FAB> const& src, int srccomp, int dstcomp, 
     }
 }
 
+//! Replace selected components by their absolute values using a uniform ghost width.
 template <BaseFabType FAB>
 void
 Abs (FabArray<FAB>& fa, int icomp, int numcomp, int nghost)
@@ -1307,6 +1555,7 @@ Abs (FabArray<FAB>& fa, int icomp, int numcomp, int nghost)
     Abs(fa,icomp,numcomp,IntVect(nghost));
 }
 
+//! Replace selected components by their absolute values using per-direction ghost widths.
 template <BaseFabType FAB>
 void
 Abs (FabArray<FAB>& fa, int icomp, int numcomp, const IntVect& nghost)
@@ -1343,6 +1592,13 @@ Abs (FabArray<FAB>& fa, int icomp, int numcomp, const IntVect& nghost)
     }
 }
 
+/**
+ * \brief Request that managed-memory FAB data be prefetched to the host, where
+ *        supported.
+ *
+ * \param fa          FabArray whose local FABs are prefetched.
+ * \param synchronous Whether MFIter synchronizes before returning.
+ */
 template <BaseFabType FAB>
 void
 prefetchToHost (FabArray<FAB> const& fa, const bool synchronous = true)
@@ -1358,6 +1614,13 @@ prefetchToHost (FabArray<FAB> const& fa, const bool synchronous = true)
 #endif
 }
 
+/**
+ * \brief Request that managed-memory FAB data be prefetched to the device,
+ *        where supported.
+ *
+ * \param fa          FabArray whose local FABs are prefetched.
+ * \param synchronous Whether MFIter synchronizes before returning.
+ */
 template <BaseFabType FAB>
 void
 prefetchToDevice (FabArray<FAB> const& fa, const bool synchronous = true)
@@ -1374,6 +1637,12 @@ prefetchToDevice (FabArray<FAB> const& fa, const bool synchronous = true)
 }
 
 
+/**
+ * \brief Synchronize shared nodal values using an owner mask.
+ *
+ * Masked-out values are cleared before values selected by \p msk are copied
+ * to overlapping points. Cell-centered data are unchanged.
+ */
 template <BaseFabType FAB, BaseFabType IFAB>
 void
 OverrideSync (FabArray<FAB> & fa, FabArray<IFAB> const& msk, const Periodicity& period)
@@ -1385,6 +1654,7 @@ OverrideSync (FabArray<FAB> & fa, FabArray<IFAB> const& msk, const Periodicity& 
 }
 
 
+//! Start the masked OverrideSync operation; call OverrideSync_finish() to complete it.
 template <BaseFabType FAB, BaseFabType IFAB>
 void
 OverrideSync_nowait (FabArray<FAB> & fa, FabArray<IFAB> const& msk, const Periodicity& period)
@@ -1427,11 +1697,14 @@ OverrideSync_nowait (FabArray<FAB> & fa, FabArray<IFAB> const& msk, const Period
     }
 
     fa.os_temp = std::make_unique< FabArray<FAB> > ( fa.boxArray(), fa.DistributionMap(),
-                                                     ncomp, 0, MFInfo(), fa.Factory() );
+                                                     ncomp, 0,
+                                                     MFInfo().SetArena(The_Async_Arena()),
+                                                     fa.Factory() );
     fa.os_temp->setVal(0);
     fa.os_temp->ParallelCopy_nowait(fa, period, FabArrayBase::ADD);
 }
 
+//! Finish the current masked OverrideSync_nowait() operation.
 template <BaseFabType FAB>
 void
 OverrideSync_finish (FabArray<FAB> & fa)
@@ -1446,6 +1719,7 @@ OverrideSync_finish (FabArray<FAB> & fa)
     fa.os_temp.reset();
 }
 
+//! Copy selected components of each local FAB, ghost cells included, device-to-host
 template <BaseFabType FAB>
 void
 dtoh_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src,
@@ -1464,6 +1738,7 @@ dtoh_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src,
 #endif
 }
 
+//! Copy all components of each local FAB, ghost cells included, device-to-host
 template <BaseFabType FAB>
 void
 dtoh_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src)
@@ -1471,6 +1746,7 @@ dtoh_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src)
     dtoh_memcpy(dst, src, 0, 0, dst.nComp());
 }
 
+//! Copy selected components of each local FAB, ghost cells included, host-to-device
 template <BaseFabType FAB>
 void
 htod_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src,
@@ -1489,6 +1765,7 @@ htod_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src,
 #endif
 }
 
+//! Copy all components of each local FAB, ghost cells included, host-to-device
 template <BaseFabType FAB>
 void
 htod_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src)
@@ -1496,20 +1773,30 @@ htod_memcpy (FabArray<FAB>& dst, FabArray<FAB> const& src)
     htod_memcpy(dst, src, 0, 0, dst.nComp());
 }
 
+/**
+ * \brief Return the index of an arbitrary cell at which component \p comp equals \p value.
+ *
+ * Only data owned by the calling rank is searched, including \p nghost ghost
+ * cells; no MPI communication is performed. If no match is found, the returned
+ * IntVect is IntVect::TheMinVector().
+ */
 template <BaseFabType FAB>
 IntVect
 indexFromValue (FabArray<FAB> const& mf, int comp, IntVect const& nghost,
                 typename FAB::value_type value)
 {
-    IntVect loc;
+    IntVect loc = IntVect::TheMinVector();
 
 #ifdef AMREX_USE_GPU
     if (Gpu::inLaunchRegion())
     {
-        amrex::Gpu::Buffer<int> aa({0,AMREX_D_DECL(0,0,0)});
+        constexpr int nofind = std::numeric_limits<int>::lowest();
+        amrex::Gpu::Buffer<int> aa({0,AMREX_D_DECL(nofind,nofind,nofind)});
         int* p = aa.data();
-        // This is a device ptr to 1+AMREX_SPACEDIM int zeros.
-        // The first is used as an atomic bool and the others for intvect.
+        // This is a device ptr to 1+AMREX_SPACEDIM ints.  The first is zero
+        // and used as an atomic bool.  The others hold the intvect and start
+        // at the lowest int so that they stay TheMinVector if there is no
+        // match.
         if (mf.isFusingCandidate()) {
             auto const& ma = mf.const_arrays();
             ParallelFor(mf, nghost, [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept
@@ -1526,7 +1813,9 @@ indexFromValue (FabArray<FAB> const& mf, int comp, IntVect const& nghost,
                 }
             });
         } else {
-            for (MFIter mfi(mf,MFItInfo().SetDeviceSync(false)); mfi.isValid(); ++mfi) {
+            // The result is read on the host below, so the streams used by
+            // MFIter must be synchronized even inside a NoSyncRegion.
+            for (MFIter mfi(mf,MFItInfo().SetDeviceSync(true)); mfi.isValid(); ++mfi) {
                 const Box& bx = amrex::grow(mfi.validbox(), nghost);
                 auto const& arr = mf.const_array(mfi);
                 amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
@@ -1716,9 +2005,16 @@ Dot (FabArray<FAB> const& x, int xcomp, int ncomp, IntVect const& nghost, bool l
 }
 
 /**
- * \brief Compute dot product of two FabArrays in region that mask is true
+ * \brief Compute weighted dot product of two FabArrays
  *
- * \param mask   mask
+ * The mask is a weight, not a boolean.  The result is the sum of
+ * `mask * x * y` over the region, so weights other than 0 and 1 are
+ * meaningful; the nodal solvers, for example, use a mask of 1/2 on Neumann
+ * domain boundaries.  A cell whose weight is zero contributes nothing.  The
+ * mask may be an integer or a floating-point FabArray; its values are
+ * converted to the value type of \p x.
+ *
+ * \param mask   weight of each cell
  * \param x      first FabArray
  * \param xcomp  starting component of x
  * \param y      second FabArray
@@ -1727,9 +2023,9 @@ Dot (FabArray<FAB> const& x, int xcomp, int ncomp, IntVect const& nghost, bool l
  * \param nghost number of ghost cells
  * \param local  If true, MPI communication is skipped.
  */
-template <BaseFabType IFAB, BaseFabType FAB>
+template <BaseFabType MFAB, BaseFabType FAB>
 typename FAB::value_type
-Dot (FabArray<IFAB> const& mask, FabArray<FAB> const& x, int xcomp,
+Dot (FabArray<MFAB> const& mask, FabArray<FAB> const& x, int xcomp,
      FabArray<FAB> const& y, int ycomp, int ncomp, IntVect const& nghost,
      bool local = false)
 {
@@ -1789,18 +2085,22 @@ Dot (FabArray<IFAB> const& mask, FabArray<FAB> const& x, int xcomp,
 }
 
 /**
- * \brief Compute dot product of FabArray with itself in region that mask is true
+ * \brief Compute weighted dot product of a FabArray with itself
  *
- * \param mask   mask
+ * The mask is a weight, not a boolean.  The result is the sum of
+ * `mask * x * x` over the region.  See the two-FabArray overload above for
+ * details.
+ *
+ * \param mask   weight of each cell
  * \param x      FabArray
  * \param xcomp  starting component of x
  * \param ncomp  number of components
  * \param nghost number of ghost cells
  * \param local  If true, MPI communication is skipped.
  */
-template <BaseFabType IFAB, BaseFabType FAB>
+template <BaseFabType MFAB, BaseFabType FAB>
 typename FAB::value_type
-Dot (FabArray<IFAB> const& mask, FabArray<FAB> const& x, int xcomp, int ncomp,
+Dot (FabArray<MFAB> const& mask, FabArray<FAB> const& x, int xcomp, int ncomp,
      IntVect const& nghost, bool local = false)
 {
     BL_ASSERT(x.boxArray() == mask.boxArray());
@@ -1956,6 +2256,7 @@ void ParallelCopy (MF& dst, MF const& src, int scomp, int dcomp, int ncomp,
     dst.ParallelCopy(src, scomp, dcomp, ncomp, ng_src, ng_dst, period);
 }
 
+//! Return the infinity norm, with an MPI maximum unless \p local is true.
 template <MultiFabLike MF>
 [[nodiscard]] typename MF::value_type
 norminf (MF const& mf, int scomp, int ncomp, IntVect const& nghost,
@@ -2059,6 +2360,7 @@ void ParallelCopy (Array<MF,N>& dst, Array<MF,N> const& src,
     }
 }
 
+//! Return the maximum infinity norm across the array and, unless \p local is true, across MPI ranks.
 template <MultiFabLike MF, std::size_t N>
 [[nodiscard]] typename MF::value_type
 norminf (Array<MF,N> const& mf, int scomp, int ncomp, IntVect const& nghost,
@@ -2075,6 +2377,7 @@ norminf (Array<MF,N> const& mf, int scomp, int ncomp, IntVect const& nghost,
     return r;
 }
 
+//! Return the component count of the first FabArray in \p mf.
 template <MultiFabLike MF, std::size_t N>
 requires (N > 0)
 [[nodiscard]] int nComp (Array<MF,N> const& mf)
@@ -2082,6 +2385,7 @@ requires (N > 0)
     return mf[0].nComp();
 }
 
+//! Return the grow vector of the first FabArray in \p mf.
 template <MultiFabLike MF, std::size_t N>
 requires (N > 0)
 [[nodiscard]] IntVect nGrowVect (Array<MF,N> const& mf)
@@ -2089,6 +2393,7 @@ requires (N > 0)
     return mf[0].nGrowVect();
 }
 
+//! Return the BoxArray of the first FabArray in \p mf.
 template <MultiFabLike MF, std::size_t N>
 requires (N > 0)
 [[nodiscard]] BoxArray const&
@@ -2097,6 +2402,7 @@ boxArray (Array<MF,N> const& mf)
     return mf[0].boxArray();
 }
 
+//! Return the DistributionMapping of the first FabArray in \p mf.
 template <MultiFabLike MF, std::size_t N>
 requires (N > 0)
 [[nodiscard]] DistributionMapping const&
@@ -2105,12 +2411,12 @@ DistributionMap (Array<MF,N> const& mf)
     return mf[0].DistributionMap();
 }
 
-/*
- * \brief Return a mask indicating how many duplicates are in each point
+/**
+ * \brief Return the number of overlapping grown FAB regions at each point.
  *
- * \param fa     input FabArray
- * \param nghost number of ghost cells included in counting
- * \param period periodicity
+ * \param fa     Input FabArray defining the layout.
+ * \param nghost Ghost cells included in each FAB region.
+ * \param period Periodicity used when counting overlaps.
  */
 template <class FAB>
 FabArray<BaseFab<int>>

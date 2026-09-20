@@ -1,3 +1,181 @@
+# 26.09
+
+ ## Highlights:
+
+  * Fix `Random()` returning 1.0f & add `RandomPositive` (#5643)
+    `amrex::Random()` is documented as `[0,1)` but previously it could
+    return exactly `1.0` on CUDA/HIP.
+
+  * EB state redistribution: Fix Itracker abort with vfrac fallback (#5630)
+    This PR adds a volume-fraction-based fallback pathway in the `itracker`
+    construction for EB state redistribution when the original normal-based
+    neighbor selection fails.
+
+  * Initialize/Finalize: Pop Hooks Before Calling Them (#5648)
+    `amrex::Initialize` and `amrex::Finalize` drained their hook stacks with
+    `top()()` followed by `pop()`. A hook that registers another one with
+    `ExecOnInitialize`/`ExecOnFinalize` therefore left the *calling* hook on
+    top of the stack: it ran a second time, and the following `pop()`
+    silently discarded the newly registered hook without ever running it.
+    Move the hook off the stack before calling it, so that a hook which
+    registers another one runs exactly once and the newly registered hook
+    runs as well.
+
+  * Modernize CMake CUDA to 3.25+ (native arch, device LTO) (#4773)
+
+  * STL optimization
+    Optimize STL ray-box intersection (#5609)
+    Optimize STL BVH distance traversal (#5608)
+
+  * Generalize local mask (#5575)
+    The "local" argument to Redistribute really lumps together two distinct
+    things: 1) whether to do point-to-point MPI communication for the
+    particle count exchange, and 2) whether to use a mask for the grid/tile
+    lookup. This separates these into distinct options.  It also adds a
+    heuristic to fall back to the full BoxArray search in cases where the
+    mask would be too expensive too use.
+
+ ## Other major changes:
+
+  * FFT: expose OpenBCSolver's spectral Green's function (#5627)
+
+  * FFT::R2C: add post-forward support for batch size > 1 (#5642)
+
+  * Fix compGrad on grid-aligned EBs in MLEBNodeFDLaplacian (#5623)
+
+  * Return TheMinVector from indexFromValue when the value is not found (#5626)
+
+  * Add face-centered EB factories (#5548)
+
+  * Bugfix in State Redistribution (#5613)
+
+  * Fix duplicate public attribute bug in Fortran interface (#5604)
+
+  * Add tools for performing Kahan summation, along with a stochastic heat
+    equation test that uses them. (#5587)
+
+  * SYCL: use platform default context (#5597)
+
+  * Fix MLEBABecLap EB setter updates (#5595)
+
+  * Fix tensor operators always reporting needsUpdate (#5590)
+
+  * FabArray: Enable prefetch on non-CUDA GPU backends (#5592)
+
+  * MLTensorOp/MLEBTensorOp: fix scalar bulk viscosity setters (#5589)
+
+  * fcompare: fix wrong variable name in "NaN present in B" report (#5588)
+
+  * TinyProfiler: stdout/stderr keywords for tiny_profiler.output_file (#5585)
+
+  * CMake: Remove hipcc deprecation warning (#5201)
+
+# 26.08
+
+ ## Highlights:
+
+  * Add For overloads with compile time options (#5581)
+    `ParallelFor` with `CompileTimeOptions` had no `For` counterpart, so
+    kernels with non-independent iterations (e.g., particle-to-mesh scatter
+    through `Gpu::Atomic` adds, which are plain updates on host) had no way
+    to opt out of `AMREX_PRAGMA_SIMD` while keeping the compile-time-option
+    dispatch. Under the pragma (GCC `ivdep`), GCC 15 vectorizes such
+    accumulation loops and silently drops updates from SIMD lanes that hit
+    the same address, observed in the WarpX charge/current deposition:
+    https://github.com/BLAST-WarpX/warpx/issues/7097.
+    Add the six `For(TypeList<CompileTimeOptions<...>>, ...)` overloads (1D
+    range, Box, Box + ncomp, each with and without the MT template
+    parameter), dispatching via `AnyCTO` to the pragma-free For. On GPU,
+    `For` and `ParallelFor` are identical.
+
+  * Add fconvert plotfile tool for native-to-HDF5 conversion (#5569)
+    This adds `Tools/Plotfile/fconvert`, a native AMReX plotfile
+    postprocessing tool that rewrites one or more native plotfiles as HDF5
+    plotfiles using AMReX’s existing HDF5 writer and compression
+    descriptors. It follows the existing `f*` tool conventions and is wired
+    into both CMake and GNUmake builds.
+
+  * SIMD: Vectorized Particle Reductions (ParticleReduceSIMD) (#5562)
+    Add a SIMD-vectorized CPU path for particle reductions, following the
+    single-source SIMD design (`SIMDindex`, `load_1d`, `AMReX_SIMD=ON`):
+
+  * Make the "local" and "nGrow" arguments IntVects instead of ints for Redistribute (#5520)
+    This could be useful for cases where the particle motion is anisotropic.
+
+  * Overset mask for MLEBABecLap (#5439)
+    This PR adds `overset_mask` for `MLEBABecLap`, which already exists for
+    the non-EB version.
+
+  * Add clear() to YAFluxRegister and EBFluxRegister; call it in define() (#5531)
+    YAFluxRegisterT::define() and EBFluxRegister::define() did not clear
+    existing data before reinitializing. While the internal MultiFab members
+    handle redefinition safely via their own define() calls, two Vector
+    members (m_cfp_localindex and the inner vectors of m_cfp_fab) are
+    populated using push_back without being cleared first. Calling define()
+    on an already-defined object would accumulate stale entries, with
+    m_cfp_fab holding dangling FAB* pointers into the old m_cfpatch.
+    Add a clear() method to both classes that releases all memory and resets
+    geometry/ratio/level/ncomp to defaults. call clear() at the start of
+    YAFluxRegisterT::define() so redefinition is always safe. preserve
+    m_deterministic across clear() since it is a behavioral GPU flag, not
+    geometry-dependent state.
+
+ ## Other major changes:
+
+  * ParticleHeader: Parse Grid Table (#5577)
+
+  * Fix mesh refinement bug in computeNeighborProcs (#5573)
+
+  * TinyProfiler: re-read output_file each init/finalize cycle (#5572)
+
+  * MLNodeLaplacian: update cached state after setSigma (#5564)
+
+  * Fix WriteMLMF: refinement ratio computed from bigEnd instead of length (#5558)
+
+  * PC_local_gpu: fix narrowing conversion, brittle init, and deterministic handling (#5559)
+
+  * Fix two mkconfig/mkversionheader argument-parsing bugs (#5560)
+
+  * CMake: Fix typo in host-device diags (#5555)
+
+  * CMake: ROCm/HIP `find_dependency()` (#5554)
+
+  * Add alignas to IParser node structs mirroring floating-point Parser (#5552)
+
+  * Fix CreateDirectories: check S_ISDIR on EEXIST (#5544)
+
+  * Make LayoutData::define() safe for repeated calls; fix BndryDataT redefine (#5549)
+
+  * Remove amrex::clz (#5539)
+
+  * Fix modulo bias in device Random_int rejection sampling (#5545)
+
+  * Fix AnyOf CPU signature mismatch with declaration (#5543)
+
+  * Add N <= 0 guard to FillRandom for consistency with FillRandomNormal (#5546)
+
+  * Fix latent ODR violation: drop inline from SetGrowthFactor declaration (#5547)
+
+  * define function for amrex::FFT::Stokes (#5541)
+
+  * GNUMake: add VERBOSE=QUIET option to suppress per-file build messages (#5529)
+
+  * Scan: drop C++17 feature-detection guards and std::partial_sum fallbacks (#5537)
+
+  * Remove amrex::is_integer(const char*) (#5534)
+
+  * TimeIntegrator::integrate: fix swap guard for start_step != 0 (#5536)
+
+  * Fix UB in ParmParse (#5535)
+
+  * Fortran: Add amrex_write_hdf5plotfile (#5488)
+
+  * Make memory management safer in Fortran APIs (#5487)
+
+  * fix bug in MLEBNodeFDLaplacian when all cells are regular (#5530)
+
+  * Remove BlockMutex (#5521)
+
 # 26.07
 
  ## Highlights:

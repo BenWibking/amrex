@@ -28,6 +28,229 @@
 
 namespace amrex {
 
+// Host CSR staging for AMG hierarchy construction and coarse solves.
+template <typename T, template <typename> class Allocator>
+struct AMGMatrixHelper
+{
+    //! Distributed sparse-matrix type operated on by this helper.
+    using matrix_type = SpMatrix<T,Allocator>;
+    //! Device-accessible CSR storage used by \ref matrix_type.
+    using csr_type = typename matrix_type::csr_type;
+    //! CSR storage backed by pinned host vectors.
+    using host_csr_type = CSR<T,Gpu::PinnedVector>;
+
+    //! Matrix-allocator vector type for temporary values of type \p U.
+    template <typename U>
+    using container_type = typename matrix_type::template container_type<U>;
+
+    /**
+     * \brief Reconstruct the locally owned rows of \p A with global column
+     * indices.
+     *
+     * Split local and remote CSR blocks are merged and sorted into canonical
+     * pinned-host CSR storage.
+     *
+     * \param A Distributed source matrix.
+     * \return Local rows of \p A in pinned host memory.
+     */
+    static host_csr_type copy_local_global_csr (matrix_type const& A)
+    {
+        BL_PROFILE("AMG::copy_local_global_csr()");
+        host_csr_type hlocal;
+        host_csr_type hremote;
+
+        copy_to_host(hlocal, A.m_csr);
+#ifdef AMREX_USE_MPI
+        if (A.m_split && A.m_csr_remote.nnz > 0) {
+            copy_to_host(hremote, A.m_csr_remote);
+        }
+#endif
+
+        Long const nrows = A.numLocalRows();
+        host_csr_type result;
+        result.row_offset.resize(nrows+1);
+        result.row_offset[0] = 0;
+
+        Gpu::PinnedVector<Long> row_to_remote;
+#ifdef AMREX_USE_MPI
+        if (A.m_split) {
+            row_to_remote.resize(A.m_ri_ltor.size());
+#ifdef AMREX_USE_GPU
+            Gpu::copyAsync(Gpu::deviceToHost,
+                           A.m_ri_ltor.begin(), A.m_ri_ltor.end(),
+                           row_to_remote.begin());
+            Gpu::streamSynchronize();
+#else
+            std::copy(A.m_ri_ltor.begin(), A.m_ri_ltor.end(),
+                      row_to_remote.begin());
+#endif
+        }
+#endif
+
+        Vector<std::pair<Long,T>> row_entries;
+        for (Long i = 0; i < nrows; ++i) {
+            row_entries.clear();
+            auto const local_begin = hlocal.row_offset[i];
+            auto const local_end = hlocal.row_offset[i+1];
+            row_entries.reserve(static_cast<std::size_t>(local_end-local_begin));
+            for (Long p = local_begin; p < local_end; ++p) {
+                Long col = hlocal.col_index[p];
+                if (A.m_split) {
+                    col += A.m_col_begin;
+                }
+                row_entries.emplace_back(col, hlocal.mat[p]);
+            }
+
+#ifdef AMREX_USE_MPI
+            if (A.m_split && !row_to_remote.empty() && row_to_remote[i] >= 0) {
+                auto const rr = row_to_remote[i];
+                for (Long p = hremote.row_offset[rr];
+                     p < hremote.row_offset[rr+1]; ++p)
+                {
+                    row_entries.emplace_back(A.m_remote_cols_v[hremote.col_index[p]],
+                                             hremote.mat[p]);
+                }
+            }
+#endif
+
+            std::sort(row_entries.begin(), row_entries.end(),
+                      [] (auto const& lhs, auto const& rhs) {
+                          return lhs.first < rhs.first;
+                      });
+            for (std::size_t p = 0; p < row_entries.size();) {
+                Long const col = row_entries[p].first;
+                T value = T(0);
+                do {
+                    value += row_entries[p].second;
+                    ++p;
+                } while (p < row_entries.size()
+                         && row_entries[p].first == col);
+                if (value != T(0)) {
+                    result.col_index.push_back(col);
+                    result.mat.push_back(value);
+                }
+            }
+            result.row_offset[i+1] = static_cast<Long>(result.mat.size());
+        }
+        result.nnz = static_cast<Long>(result.mat.size());
+        return result;
+    }
+
+    /**
+     * \brief Replicate all global rows of \p B in pinned host memory.
+     *
+     * In MPI builds, row lengths, values, and global column indices are
+     * gathered onto every rank. This is the correctness-first setup path.
+     *
+     * \param B Distributed right operand.
+     * \return Complete global CSR representation of \p B.
+     */
+    static host_csr_type gather_global_rows (matrix_type const& B)
+    {
+        auto local = copy_local_global_csr(B);
+
+#ifndef AMREX_USE_MPI
+        return local;
+#else
+        auto const& partition = B.partition().dataVector();
+        int const nprocs = ParallelContext::NProcsSub();
+        int const myproc = ParallelContext::MyProcSub();
+        auto const comm = ParallelContext::CommunicatorSub();
+        auto const mpi_long = ParallelDescriptor::Mpi_typemap<Long>::type();
+        auto const mpi_t = ParallelDescriptor::Mpi_typemap<T>::type();
+
+        AMREX_ALWAYS_ASSERT(static_cast<int>(partition.size()) == nprocs+1);
+
+        Vector<int> row_counts(nprocs);
+        Vector<int> row_displs(nprocs);
+        for (int p = 0; p < nprocs; ++p) {
+            auto const nr = partition[p+1] - partition[p];
+            AMREX_ALWAYS_ASSERT(nr <= std::numeric_limits<int>::max());
+            AMREX_ALWAYS_ASSERT(partition[p] <= std::numeric_limits<int>::max());
+            row_counts[p] = static_cast<int>(nr);
+            row_displs[p] = static_cast<int>(partition[p]);
+        }
+
+        Gpu::PinnedVector<Long> local_row_nnz(B.numLocalRows());
+        for (Long i = 0; i < B.numLocalRows(); ++i) {
+            local_row_nnz[i] = local.row_offset[i+1] - local.row_offset[i];
+        }
+
+        host_csr_type global;
+        Long const global_nrows = B.numGlobalRows();
+        Gpu::PinnedVector<Long> global_row_nnz(global_nrows);
+        BL_MPI_REQUIRE(MPI_Allgatherv(local_row_nnz.data(), row_counts[myproc],
+                                     mpi_long, global_row_nnz.data(),
+                                     row_counts.data(), row_displs.data(),
+                                     mpi_long, comm));
+
+        Vector<Long> nnz_counts_long(nprocs);
+        Long local_nnz = local.nnz;
+        BL_MPI_REQUIRE(MPI_Allgather(&local_nnz, 1, mpi_long,
+                                    nnz_counts_long.data(), 1, mpi_long, comm));
+
+        Vector<int> nnz_counts(nprocs);
+        Vector<int> nnz_displs(nprocs);
+        Long global_nnz = 0;
+        for (int p = 0; p < nprocs; ++p) {
+            AMREX_ALWAYS_ASSERT(nnz_counts_long[p] <=
+                                std::numeric_limits<int>::max());
+            AMREX_ALWAYS_ASSERT(global_nnz <= std::numeric_limits<int>::max());
+            nnz_counts[p] = static_cast<int>(nnz_counts_long[p]);
+            nnz_displs[p] = static_cast<int>(global_nnz);
+            global_nnz += nnz_counts_long[p];
+        }
+
+        global.resize(global_nrows, global_nnz);
+        BL_MPI_REQUIRE(MPI_Allgatherv(local.mat.data(), nnz_counts[myproc],
+                                     mpi_t, global.mat.data(),
+                                     nnz_counts.data(), nnz_displs.data(),
+                                     mpi_t, comm));
+        BL_MPI_REQUIRE(MPI_Allgatherv(local.col_index.data(),
+                                     nnz_counts[myproc], mpi_long,
+                                     global.col_index.data(),
+                                     nnz_counts.data(), nnz_displs.data(),
+                                     mpi_long, comm));
+
+        global.row_offset[0] = 0;
+        for (Long i = 0; i < global_nrows; ++i) {
+            global.row_offset[i+1] = global.row_offset[i] + global_row_nnz[i];
+        }
+        AMREX_ALWAYS_ASSERT(global.row_offset[global_nrows] == global_nnz);
+        return global;
+#endif
+    }
+
+private:
+    /**
+     * \brief Copy arbitrary CSR storage into pinned host CSR storage.
+     *
+     * \tparam V Source CSR vector template.
+     * \param dst Destination in pinned host memory.
+     * \param src Source CSR.
+     */
+    template <template<typename> class V>
+    static void copy_to_host (host_csr_type& dst, CSR<T,V> const& src)
+    {
+        dst.resize(src.nrows(), src.nnz);
+#ifdef AMREX_USE_GPU
+        Gpu::copyAsync(Gpu::deviceToHost, src.mat.begin(), src.mat.end(),
+                       dst.mat.begin());
+        Gpu::copyAsync(Gpu::deviceToHost, src.col_index.begin(),
+                       src.col_index.end(), dst.col_index.begin());
+        Gpu::copyAsync(Gpu::deviceToHost, src.row_offset.begin(),
+                       src.row_offset.end(), dst.row_offset.begin());
+        Gpu::streamSynchronize();
+#else
+        std::copy(src.mat.begin(), src.mat.end(), dst.mat.begin());
+        std::copy(src.col_index.begin(), src.col_index.end(),
+                  dst.col_index.begin());
+        std::copy(src.row_offset.begin(), src.row_offset.end(),
+                  dst.row_offset.begin());
+#endif
+    }
+};
+
 template <typename T>
 struct AMGTestAccess;
 
@@ -214,7 +437,7 @@ public: // NOLINT  Private implementation details, but public for CUDA
 
     using matrix_type = SpMatrix<T>;
     using csr_type = typename matrix_type::csr_type;
-    using helper_type = SpGEMMHelper<T,DefaultAllocator>;
+    using helper_type = AMGMatrixHelper<T,DefaultAllocator>;
     using host_csr_type = typename helper_type::host_csr_type;
 
     static constexpr int undecided = -1;
@@ -1272,9 +1495,16 @@ void AMG<T>::build_interpolation (Level& level)
     auto interpolation = SpGEMM(
         scaled_ff_matrix, strong_fc_matrix, level.coarse_partition);
     if (m_options.max_interp_elements > 0) {
-        AMREX_ALWAYS_ASSERT(!interpolation.m_split);
+        // Truncation must compare all columns in a row, including remote ones.
+        csr_type interpolation_rows;
+        if (interpolation.m_split) {
+            interpolation_rows = copy_to_device(
+                helper_type::copy_local_global_csr(interpolation));
+        } else {
+            interpolation_rows = std::move(interpolation.m_csr);
+        }
         auto truncated = truncate_interpolation(
-            interpolation.m_csr, m_options.max_interp_elements);
+            interpolation_rows, m_options.max_interp_elements);
         level.P = std::make_unique<matrix_type>(
             partition, level.coarse_partition, std::move(truncated));
     } else {
@@ -1288,8 +1518,8 @@ template <typename T>
 void AMG<T>::build_next_level (Level& level)
 {
     BL_PROFILE("AMG::build_next_level()");
-    auto coarse_matrix =
-        SpGEMM_RAP(*level.R, *level.A, *level.P, level.coarse_partition);
+    auto AP = SpGEMM(*level.A, *level.P, level.coarse_partition);
+    auto coarse_matrix = SpGEMM(*level.R, AP, level.coarse_partition);
 
     auto next = std::make_unique<Level>();
     next->owned_A =

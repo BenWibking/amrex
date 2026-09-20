@@ -2,12 +2,14 @@
 #define AMREX_GPU_TYPES_H_
 #include <AMReX_Config.H>
 
-#include <AMReX_Extension.H>
-
 #ifdef AMREX_USE_GPU
+
+#include <AMReX_Extension.H>
+#include <AMReX_GpuQualifiers.H>
 
 #ifdef AMREX_USE_SYCL
 #  include <sycl/sycl.hpp>
+#  include <cstddef>
 #endif
 
 namespace amrex {
@@ -67,7 +69,7 @@ struct Handler
     // lane index in warp
     std::size_t laneIdx () const { return item->get_sub_group().get_local_id()[0]; }
     // warp size
-    std::size_t warpDim () const { return item->get_sub_group().get_group_range()[0]; }
+    std::size_t warpDim () const { return item->get_sub_group().get_local_range()[0]; }
 
     void* sharedMemory () const { return local; }
 

@@ -35,9 +35,9 @@ void get_position_unit_cell(Real* r, const IntVect& nppc, int i_part)
     int iy_part = (i_part % (ny * nz)) % ny;
     int iz_part = (i_part % (ny * nz)) / ny;
 
-    r[0] = (0.5+ix_part)/nx;
-    r[1] = (0.5+iy_part)/ny;
-    r[2] = (0.5+iz_part)/nz;
+    r[0] = (Real(0.5)+Real(ix_part))/Real(nx);
+    r[1] = (Real(0.5)+Real(iy_part))/Real(ny);
+    r[2] = (Real(0.5)+Real(iz_part))/Real(nz);
 }
 
 class TestParticleContainer
@@ -62,14 +62,19 @@ public:
         }
     }
 
-    void RedistributeLocal (bool remove_neg=true)
+    void RedistributeLocal (bool remove_neg=true,
+                            IntVect max_cells_moved=IntVect(1))
     {
         const int lev_min = 0;
         const int lev_max = finestLevel();
         const IntVect nGrow(0);
         const bool local = true;
-        const IntVect max_cells_moved(1);
         Redistribute(lev_min, lev_max, nGrow, local, max_cells_moved, remove_neg);
+    }
+
+    bool RedistributeMaskLooksCheapForTest (IntVect max_cells_moved) const
+    {
+        return RedistributeMaskLooksCheap(0, max_cells_moved);
     }
 
     void RedistributeGlobal (bool remove_neg=true)
@@ -121,12 +126,12 @@ public:
                     ParticleType p;
                     p.id()  = ParticleType::NextID();
                     p.cpu() = ParallelDescriptor::MyProc();
-                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (iv[0] + r[0])*dx[0]);
+                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (Real(iv[0]) + r[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (iv[1] + r[1])*dx[1]);
+                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (Real(iv[1]) + r[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (iv[2] + r[2])*dx[2]);
+                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (Real(iv[2]) + r[2])*dx[2]);
 #endif
 
                     for (int i = 0; i < NSR; ++i) { p.rdata(i) = ParticleReal(p.id()); }
@@ -222,12 +227,12 @@ public:
                     amrex::ParallelFor( np, [=] AMREX_GPU_DEVICE (int i) noexcept
                     {
                         ParticleType& p = pstruct[i];
-                        p.pos(0) += static_cast<ParticleReal> (move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> (Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> (move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> (Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> (move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> (Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -238,12 +243,12 @@ public:
                     {
                         ParticleType& p = pstruct[i];
 
-                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -307,7 +312,7 @@ public:
                 {
                     for (int j = 0; j < NSR; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < NSI; ++j)
                     {
@@ -316,7 +321,7 @@ public:
                     if constexpr (NAR > 0) {
                         for (int j = 0; j < NAR; ++j)
                         {
-                            AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ptd.m_aos[i].id());
+                            AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                         }
                     }
                     if constexpr (NAI > 0) {
@@ -327,7 +332,7 @@ public:
                     }
                     for (int j = 0; j < num_rr; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < num_ii; ++j)
                     {
@@ -353,6 +358,8 @@ struct TestParams
     int sort;
     int test_level_lost = 0;
     int stable_redistribute = 0;
+    IntVect max_cells_moved = IntVect(1);
+    int expected_mask_lookup = -1;
 };
 
 void testRedistribute();
@@ -470,6 +477,8 @@ void get_test_params(TestParams& params, const std::string& prefix)
     pp.query("num_runtime_int", num_runtime_int);
     pp.query("remove_negative", remove_negative);
     pp.query("stable_redistribute", params.stable_redistribute);
+    pp.query("max_cells_moved", params.max_cells_moved);
+    pp.query("expected_mask_lookup", params.expected_mask_lookup);
 
     params.sort = 0;
     pp.query("sort", params.sort);
@@ -493,8 +502,8 @@ void testRedistribute ()
     RealBox real_box;
     for (int n = 0; n < BL_SPACEDIM; n++)
     {
-        real_box.setLo(n, 0.0);
-        real_box.setHi(n, params.size[n]);
+        real_box.setLo(n, Real(0.0));
+        real_box.setHi(n, Real(params.size[n]));
     }
 
     IntVect domain_lo(AMREX_D_DECL(0, 0, 0));
@@ -524,6 +533,11 @@ void testRedistribute ()
     TestParticleContainer pc(geom, dm, ba, rr);
     pc.setStableRedistribute(params.stable_redistribute);
 
+    if (params.expected_mask_lookup >= 0) {
+        const bool mask_lookup = pc.RedistributeMaskLooksCheapForTest(params.max_cells_moved);
+        AMREX_ALWAYS_ASSERT(mask_lookup == static_cast<bool>(params.expected_mask_lookup));
+    }
+
     IntVect nppc(params.num_ppc);
 
     amrex::Print() << "About to initialize particles \n";
@@ -542,11 +556,11 @@ void testRedistribute ()
         if (!remove_negative) {
             auto old = pc.TotalNumberOfParticles();
             pc.negateEven();
-            pc.RedistributeLocal(false);
+            pc.RedistributeLocal(false, params.max_cells_moved);
             AMREX_ALWAYS_ASSERT(old == pc.TotalNumberOfParticles(false));
             pc.negateEven();
         }
-        pc.RedistributeLocal();
+        pc.RedistributeLocal(true, params.max_cells_moved);
         if (params.sort) { pc.SortParticlesByCell(); }
         pc.checkAnswer();
     }

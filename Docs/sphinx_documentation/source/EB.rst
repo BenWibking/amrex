@@ -220,7 +220,9 @@ an STL file using:
                     int num_coarsen_opt = NumCoarsenOpt());
 
 This requires setting :cpp:`ParmParse` parameters ``eb2.geom_type = stl`` and
-``eb2.stl_file`` to specify the STL file path.
+``eb2.stl_file`` to specify the STL file path. Because an STL file is expected
+to describe a water-tight object, the embedded boundary outside the domain is
+always taken from the STL mesh itself, and ``extend_domain_face`` is ignored.
 
 **Managing IndexSpace Objects**
 
@@ -621,6 +623,17 @@ redistribution algorithm as described in Guiliani et al (2021),
 which is available on `arXiv <https://arxiv.org/abs/2112.12360>`_.
 This is an extension of the original state redistribution algorithm
 of Berger and Guiliani (2020).
+
+Each small cell is merged with enough of its neighbors that the merged
+neighborhood has a volume of at least ``target_volfrac`` (0.5 by default).
+A neighborhood never reaches across a domain boundary unless that direction
+is periodic, because the state outside a non-periodic boundary is not part of
+the solution and including it would break conservation. As a consequence, a
+small cell sitting against a non-periodic domain boundary can end up with a
+neighborhood whose volume is less than ``target_volfrac`` -- it is merged with
+everything the domain makes available, which is the best that can be done
+there. Away from domain boundaries, failing to reach ``target_volfrac``
+still indicates a problem with the geometry and aborts.
 
 
 Linear Solvers
