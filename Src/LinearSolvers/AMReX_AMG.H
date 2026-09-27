@@ -1422,16 +1422,16 @@ void AMG<T>::pmis (SpMatrix<TS>& S, SpMatrix<TS>& ST, Gpu::DeviceVector<int>& st
     Long const row_begin = s.row_begin;
 
     // Ghost weights are fixed; ghost states are gathered every sweep.
-    auto const wS  = S.gatherRemote(pw);
-    auto const wST = ST.gatherRemote(pw);
+    auto halo = S.preparePairHalo(ST);
+    Gpu::DeviceVector<T> wS, wST;
+    S.gatherRemotePair(halo, pw, wS, wST);
     auto const* AMREX_RESTRICT pwS  = wS.data();
     auto const* AMREX_RESTRICT pwST = wST.data();
 
     Gpu::DeviceVector<int> sS, sST, s2S;
 
     while (true) {
-        S.gatherRemote(ps, sS);
-        ST.gatherRemote(ps, sST);
+        S.gatherRemotePair(halo, ps, sS, sST);
         auto const* AMREX_RESTRICT psS  = sS.data();
         auto const* AMREX_RESTRICT psST = sST.data();
 
