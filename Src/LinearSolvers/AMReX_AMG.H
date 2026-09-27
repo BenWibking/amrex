@@ -13,7 +13,9 @@
 #include <AMReX_Scan.H>
 #include <AMReX_Smoother_MV.H>
 #include <AMReX_Vector.H>
+#include <AMReX_AMGMessageStats.H>
 
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -254,6 +256,9 @@ public:
     void solve (AlgVector<T>& a_sol, AlgVector<T> const& a_rhs);
 
     void setVerbose (int v) { m_verbose = v; }
+    //! Report rank-summed point-to-point sends and logical collective calls
+    //! for each setup phase and level. Instrumentation is inactive by default.
+    void setMeasureSetupMessages (bool b) { m_measure_setup_messages = b; }
     //! Prefix of the lines the solver prints, e.g. to nest them in MLMG output.
     void setPrintIndentation (std::string s) { m_print_ident = std::move(s); }
     void setMaxIter (int n) { m_maxiter = n; }
@@ -351,6 +356,16 @@ private:
     enum PointType : int { undecided = 0, fine = 1, coarse = 2 };
 
     bool m_prepared = false;
+    bool m_measure_setup_messages = false;
+    enum MessagePhase { Strength, StrengthTranspose, PMIS, Numbering,
+                        Interpolation, InterpolationTranspose, APProduct, RAPProduct,
+                        Diagnostics,
+                        NumMessagePhases };
+    static constexpr int n_message_phases = NumMessagePhases;
+    Vector<std::array<detail::AMGMessageStats,n_message_phases>> m_setup_message_stats;
+    [[nodiscard]] detail::AMGMessageStats* message_stats (int lev, int phase) {
+        return m_measure_setup_messages ? &m_setup_message_stats[lev][phase] : nullptr;
+    }
     bool m_smoothers_stale = false;
     bool m_throw_exception = false;
     int m_verbose = 0;
@@ -557,6 +572,7 @@ void AMG<T>::define (SpMatrix<T>& a_mat)
     m_mat = &a_mat;
     m_prepared = false;
     clear_levels();
+    m_setup_message_stats.clear();
     m_bproj.reset();
     m_krylov_bicgstab.reset();
     m_krylov_gmres.reset();
@@ -918,6 +934,7 @@ void AMG<T>::setup ()
 
     for (int lev = 0; lev+1 < m_max_levels; ++lev)
     {
+        if (m_measure_setup_messages) { m_setup_message_stats.emplace_back(); }
         auto& A = *m_a[lev];
         if (A.numGlobalRows() <= m_max_coarse_size) { break; }
 
@@ -931,11 +948,13 @@ void AMG<T>::setup ()
         The_Arena()->freeUnused();
         note_memory(lev, "strength release");
         if (m_p_max_elmts > 0 || m_trunc_factor > T(0)) {
+            detail::AMGMessageScope message_scope(message_stats(lev, Interpolation));
             Long nnz0 = P.numLocalNonZeros();
             P = truncate_interp(P, cpart, m_p_max_elmts, m_trunc_factor);
             note_memory(lev, "truncation");
             if (m_verbose >= 2) {
                 Long nnz[2] = {nnz0, P.numLocalNonZeros()};
+                detail::count_amg_collective();
                 ParallelAllReduce::Sum(nnz, 2, ParallelContext::CommunicatorSub());
                 amrex::Print() << m_print_ident << "AMG: level " << lev
                                << ": P truncated from " << nnz[0] << " to "
@@ -944,13 +963,17 @@ void AMG<T>::setup ()
         }
         // P 1 = 1 only to single precision, since the weights come from the
         // strength matrix; singular problems need it exactly.
-        if (m_singular) { normalize_rows(P); }
+        if (m_singular) {
+            detail::AMGMessageScope message_scope(message_stats(lev, Interpolation));
+            normalize_rows(P);
+        }
         if (m_verbose >= 2 && aggressive) {
             amrex::Print() << m_print_ident << "AMG: level " << lev
                            << ": aggressive coarsening, " << ncoarse << " -> "
                            << cpart.numGlobalRows() << " C-points\n";
         }
         if (m_verbose >= 3) {
+            detail::AMGMessageScope message_scope(message_stats(lev, Interpolation));
             // P should reproduce constants: row sums close to one.
             AlgVector<T> ones(cpart), rs(A.partition());
             ones.setVal(T(1));
@@ -961,21 +984,33 @@ void AMG<T>::setup ()
                 [q = rs.data()] AMREX_GPU_DEVICE (Long i) -> T { return q[i]; });
             T rmax = Reduce::Max<T>(rs.numLocalRows(),
                 [q = rs.data()] AMREX_GPU_DEVICE (Long i) -> T { return q[i]; });
+            detail::count_amg_collective();
             ParallelAllReduce::Sum(nzero, ParallelContext::CommunicatorSub());
+            detail::count_amg_collective();
             ParallelAllReduce::Min(rmin, ParallelContext::CommunicatorSub());
+            detail::count_amg_collective();
             ParallelAllReduce::Max(rmax, ParallelContext::CommunicatorSub());
             amrex::Print() << m_print_ident << "AMG: level " << lev << ": P row sums in ["
                            << rmin << ", " << rmax << "], " << nzero << " empty rows\n";
         }
-        auto R  = amrex::transpose(P, cpart);
+        auto R = [&] {
+            detail::AMGMessageScope message_scope(message_stats(lev, InterpolationTranspose));
+            return amrex::transpose(P, cpart);
+        }();
         note_memory(lev, "R");
         // R (A P): measured smaller and faster than (R A) P, whose
         // intermediate gathers several fine rows per coarse row.
         SpMatrix<T> Ac;
         {
-            auto AP = amrex::SpGEMM(A, P, cpart);
+            auto AP = [&] {
+                detail::AMGMessageScope message_scope(message_stats(lev, APProduct));
+                return amrex::SpGEMM(A, P, cpart);
+            }();
             note_memory(lev, "A*P");
-            Ac = amrex::SpGEMM(R, AP, cpart);
+            {
+                detail::AMGMessageScope message_scope(message_stats(lev, RAPProduct));
+                Ac = amrex::SpGEMM(R, AP, cpart);
+            }
         }
         note_memory(lev, "coarse operator");
 
@@ -997,9 +1032,13 @@ void AMG<T>::setup ()
     build_smoothers();
 
     if (m_verbose >= 1) {
+        detail::AMGMessageScope message_scope(
+            m_measure_setup_messages && !m_setup_message_stats.empty()
+                ? message_stats(int(m_setup_message_stats.size())-1, Diagnostics) : nullptr);
         Long nnz0 = 0, nnz_total = 0;
         for (int lev = 0; lev < nlev; ++lev) {
             Long nnz = m_a[lev]->numLocalNonZeros();
+            detail::count_amg_collective();
             ParallelAllReduce::Sum(nnz, ParallelContext::CommunicatorSub());
             if (lev == 0) { nnz0 = nnz; }
             nnz_total += nnz;
@@ -1011,11 +1050,45 @@ void AMG<T>::setup ()
                        << double(nnz_total)/double(std::max(nnz0,Long(1))) << "\n";
         if (m_setup_peak_bytes > 0) {
             auto peak = m_setup_peak_bytes;
+            detail::count_amg_collective();
             ParallelAllReduce::Max(peak, ParallelContext::CommunicatorSub());
             amrex::Print() << m_print_ident << "AMG: setup peak arena use = "
                            << double(peak)/double(1<<20) << " MB ("
                            << double(peak)/double(m_mat->numGlobalRows())
                            << " B per row)\n";
+        }
+    }
+
+    if (m_measure_setup_messages) {
+        static constexpr std::array<char const*,n_message_phases> phase_names = {
+            "strength", "strength-transpose", "PMIS", "numbering",
+            "interpolation", "interpolation-transpose", "A*P", "R*(A*P)",
+            "diagnostics"};
+        Vector<Long> totals(m_setup_message_stats.size() * n_message_phases * 3);
+        for (int lev = 0; lev < int(m_setup_message_stats.size()); ++lev) {
+            for (int phase = 0; phase < n_message_phases; ++phase) {
+                auto const& stats = m_setup_message_stats[lev][phase];
+                int const base = (lev*n_message_phases + phase)*3;
+                totals[base] = stats.sends;
+                totals[base+1] = stats.bytes;
+                totals[base+2] = stats.collectives;
+            }
+        }
+        if (!totals.empty()) {
+            ParallelAllReduce::Sum(totals.data(), int(totals.size()),
+                                   ParallelContext::CommunicatorSub());
+        }
+        for (int lev = 0; lev < int(m_setup_message_stats.size()); ++lev) {
+            for (int phase = 0; phase < n_message_phases; ++phase) {
+                int const base = (lev*n_message_phases + phase)*3;
+                if (totals[base] || totals[base+2]) {
+                    amrex::Print() << m_print_ident << "AMG setup messages level=" << lev
+                                   << " phase=" << phase_names[phase]
+                                   << " sends=" << totals[base]
+                                   << " bytes=" << totals[base+1]
+                                   << " collective_rank_calls=" << totals[base+2] << "\n";
+                }
+            }
         }
     }
 
@@ -1055,24 +1128,40 @@ template <typename T>
 bool AMG<T>::coarsen_level (int lev, SpMatrix<T>& A, SpMatrix<T>& P, AlgPartition& cpart,
                             bool& aggressive, Long& ncoarse)
 {
-    T const sscale = strength_scale(A);
-    auto S = create_soc(A, sscale);
-    S.setColumnPartition(S.partition());
+    T sscale;
+    SpMatrix<TS> S;
+    {
+        detail::AMGMessageScope message_scope(message_stats(lev, Strength));
+        sscale = strength_scale(A);
+        S = create_soc(A, sscale);
+        S.setColumnPartition(S.partition());
+    }
     note_memory(lev, "S");
-    auto ST = amrex::transpose(S, S.partition());
-    ST.setColumnPartition(ST.partition());
+    SpMatrix<TS> ST;
+    {
+        detail::AMGMessageScope message_scope(message_stats(lev, StrengthTranspose));
+        ST = amrex::transpose(S, S.partition());
+        ST.setColumnPartition(ST.partition());
+    }
 
     note_memory(lev, "strength");
     Gpu::DeviceVector<int> state;
     // Singular: an isolated point becomes C, so every row of P sums to one.
-    pmis(S, ST, state, m_singular);
+    {
+        detail::AMGMessageScope message_scope(message_stats(lev, PMIS));
+        pmis(S, ST, state, m_singular);
+    }
     note_memory(lev, "PMIS");
 
     Gpu::DeviceVector<Long> cidx;
-    cpart = coarse_numbering(state, cidx);
+    {
+        detail::AMGMessageScope message_scope(message_stats(lev, Numbering));
+        cpart = coarse_numbering(state, cidx);
+    }
     ncoarse = cpart.numGlobalRows();
     if (ncoarse == 0 || ncoarse == A.numGlobalRows()) { return false; }
 
+    detail::AMGMessageScope message_scope(message_stats(lev, Interpolation));
     if (lev < m_aggressive_num_levels) {
         // Second PMIS pass on the C-points connected at distance two.
         auto S2 = second_pass_strength(S, state, cidx, cpart);
@@ -1136,6 +1225,7 @@ void AMG<T>::normalize_rows (SpMatrix<T>& P)
     auto const* AMREX_RESTRICT prs = rs.data();
     Long nzero = Reduce::Sum<Long>(rs.numLocalRows(),
         [=] AMREX_GPU_DEVICE (Long i) -> Long { return prs[i] == T(0); });
+    detail::count_amg_collective();
     ParallelAllReduce::Sum(nzero, ParallelContext::CommunicatorSub());
     if (nzero > 0) {
         amrex::Abort("AMG: singular mode needs P 1 = 1, but " + std::to_string(nzero)
@@ -1165,6 +1255,7 @@ T AMG<T>::strength_scale (SpMatrix<T> const& A)
     auto const* AMREX_RESTRICT p = Ad.data();
     T dmax = Reduce::Max<T>(Ad.numLocalRows(),
         [=] AMREX_GPU_DEVICE (Long i) -> T { return std::abs(p[i]); });
+    detail::count_amg_collective();
     ParallelAllReduce::Max(dmax, ParallelContext::CommunicatorSub());
     return (dmax > T(0)) ? dmax : T(1);
 }
@@ -1387,6 +1478,7 @@ void AMG<T>::pmis (SpMatrix<TS>& S, SpMatrix<TS>& ST, Gpu::DeviceVector<int>& st
         Long nund = Reduce::Sum<Long>(nrows, [=] AMREX_GPU_DEVICE (Long i) -> Long {
             return (ps[i] == U) ? 1 : 0;
         });
+        detail::count_amg_collective();
         ParallelAllReduce::Sum(nund, ParallelContext::CommunicatorSub());
         if (nund == 0) { break; }
     }
@@ -1414,6 +1506,7 @@ void AMG<T>::pmis (SpMatrix<TS>& S, SpMatrix<TS>& ST, Gpu::DeviceVector<int>& st
                      detail::csr_row_has_state(s.csr1, s.row_map[i], psS, C))) ? 0 : 1;
         });
         Long counts[3] = {nc, ncc, nf0};
+        detail::count_amg_collective();
         ParallelAllReduce::Sum(counts, 3, ParallelContext::CommunicatorSub());
         amrex::Print() << m_print_ident << "AMG: PMIS: " << counts[0] << " C-points of "
                        << S.numGlobalRows() << ", C-C strong pairs " << counts[1]
@@ -1439,6 +1532,7 @@ AlgPartition AMG<T>::coarse_numbering (Gpu::DeviceVector<int> const& state,
     Vector<Long> counts(nprocs, nc);
 #ifdef AMREX_USE_MPI
     // One value per rank: an all-gather, not a reduction of a P-vector.
+    detail::count_amg_collective();
     ParallelAllGather::AllGather(nc, counts.data(), ParallelContext::CommunicatorSub());
 #endif
     Vector<Long> rows(nprocs+1);

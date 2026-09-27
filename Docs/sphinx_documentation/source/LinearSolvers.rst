@@ -1131,6 +1131,11 @@ is also available on its own as :cpp:`precond(x, b)` for use in other
 solvers. The setup is done on the first call to :cpp:`solve`. Parameters are
 set per solver object, so several solvers with different settings can
 coexist. The solver runs on CPUs and GPUs with any number of MPI processes.
+For setup diagnostics, :cpp:`setMeasureSetupMessages(true)` prints
+rank-summed point-to-point send calls and payload bytes for each level and
+phase. It also prints logical collective calls summed over ranks. These
+counts exclude the network messages internal to MPI collectives and the
+reduction used to assemble the report.
 The following can be tuned:
 
 - :cpp:`setInterpType`: extended+i (``MMExtI``, the default), extended
