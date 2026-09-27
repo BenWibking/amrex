@@ -48,6 +48,12 @@ namespace amrex {
  *             - `RT dotProduct(V const& v1, V const& v2)`\n
  *               returns v1 * v2. For example, `MultiFab::Dot(v1,0,v2,0,1,0)`.
  *
+ *             - `void dotProducts(V const& v,
+ *                                Vector<V const*> const& basis,
+ *                                Vector<RT>& result)` (optional)
+ *               returns the dot products with one collective reduction.
+ *               GMRES uses it for orthogonalization when available.
+ *
  *             - `void increment(V& lhs, V const& rhs, RT a)`\n
  *               lhs += a * rhs. For example, `MultiFab::Saxpy(lhs,a,rhs,0,0,1,0)`.
  *
@@ -380,6 +386,17 @@ void GMRES<V,M>::gram_schmidt_orthogonalization (int const it)
     auto& vv_1 = m_vv[it+1];
 
     Vector<RT> lhh(it+1);
+    constexpr bool batched_dots = requires (
+        M& op, V const& v, Vector<V const*> const& b, Vector<RT>& dots) {
+        op.dotProducts(v, b, dots);
+    };
+    Vector<V const*> basis;
+    if constexpr (batched_dots) {
+        basis.resize(it+1);
+        for (int j = 0; j <= it; ++j) {
+            basis[j] = &m_vv[j];
+        }
+    }
 
     for (int j = 0; j <= it; ++j) {
         m_hh (j,it) = RT(0.0);
@@ -388,8 +405,13 @@ void GMRES<V,M>::gram_schmidt_orthogonalization (int const it)
 
     for (int ncnt = 0; ncnt < 2 ; ++ncnt)
     {
-        for (int j = 0; j <= it; ++j) {
-            lhh[j] = m_linop->dotProduct(vv_1, m_vv[j]);
+        if constexpr (batched_dots) {
+            BL_PROFILE("GMRES::GramSchmidt::batched_dots");
+            m_linop->dotProducts(vv_1, basis, lhh);
+        } else {
+            for (int j = 0; j <= it; ++j) {
+                lhh[j] = m_linop->dotProduct(vv_1, m_vv[j]);
+            }
         }
 
         for (int j = 0; j <= it; ++j) {
