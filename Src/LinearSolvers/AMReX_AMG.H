@@ -817,7 +817,10 @@ void AMG<T>::vcycle (AlgVector<T>& x, AlgVector<T> const& b)
 
     if (nlev == 1) { // bottom_solve works on the level vectors
         if (&b != &m_res[0]) { m_res[0].copyAsync(b); }
-        bottom_solve();
+        {
+            BL_PROFILE("AMG::vcycle::level=0 bottom_solve");
+            bottom_solve();
+        }
         if (&x != &m_cor[0]) { x.copyAsync(m_cor[0]); }
         return;
     }
@@ -826,22 +829,45 @@ void AMG<T>::vcycle (AlgVector<T>& x, AlgVector<T> const& b)
     auto cor = [&] (int lev) -> AlgVector<T>& { return (lev == 0) ? x : m_cor[lev]; };
     auto res = [&] (int lev) -> AlgVector<T> const& { return (lev == 0) ? b : m_res[lev]; };
 
-    smooth(0, x, b, numPreSmooth(), false);
+    {
+        BL_PROFILE("AMG::vcycle::level=0 pre_smooth");
+        smooth(0, x, b, numPreSmooth(), false);
+    }
 
     for (int lev = 0; lev < bottom; ++lev) {
-        computeResidual(m_rescor[lev], *m_a[lev], cor(lev), res(lev));
-        SpMV(m_res[lev+1], m_R[lev], m_rescor[lev]);
+        std::string const level_name =
+            "AMG::vcycle::level=" + std::to_string(lev) + " ";
+        {
+            BL_PROFILE(level_name + "residual");
+            computeResidual(m_rescor[lev], *m_a[lev], cor(lev), res(lev));
+        }
+        {
+            BL_PROFILE(level_name + "restrict");
+            SpMV(m_res[lev+1], m_R[lev], m_rescor[lev]);
+        }
         if (lev+1 == bottom) {
+            BL_PROFILE(std::string("AMG::vcycle::level=") +
+                       std::to_string(bottom) + " bottom_solve");
             bottom_solve();
         } else {
+            BL_PROFILE(std::string("AMG::vcycle::level=") +
+                       std::to_string(lev+1) + " pre_smooth");
             smooth(lev+1, m_cor[lev+1], m_res[lev+1], numPreSmooth(), false);
         }
     }
 
     for (int lev = bottom-1; lev >= 0; --lev) {
-        SpMV(m_rescor[lev], m_P[lev], m_cor[lev+1]);
+        std::string const level_name =
+            "AMG::vcycle::level=" + std::to_string(lev) + " ";
+        {
+            BL_PROFILE(level_name + "prolong");
+            SpMV(m_rescor[lev], m_P[lev], m_cor[lev+1]);
+        }
         cor(lev).plusAsync(m_rescor[lev]);
-        smooth(lev, cor(lev), res(lev), numPostSmooth(), true, true);
+        {
+            BL_PROFILE(level_name + "post_smooth");
+            smooth(lev, cor(lev), res(lev), numPostSmooth(), true, true);
+        }
     }
 }
 

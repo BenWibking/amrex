@@ -1331,25 +1331,37 @@ void SpMatrix<T,Allocator>::finishComm_mv (AlgVector<T,AllocT>& y)
 
     if ( ! m_comm_mv.recv_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_mv.recv_reqs.size());
-        BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.recv_reqs.size()),
-                                   m_comm_mv.recv_reqs.data(),
-                                   mpi_statuses.data()));
+        {
+            BL_PROFILE("SpMatrix::finishComm_mv::recv_wait");
+            BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.recv_reqs.size()),
+                                       m_comm_mv.recv_reqs.data(),
+                                       mpi_statuses.data()));
+        }
     }
 
-    unpack_buffer_mv(y);
+    {
+        BL_PROFILE("SpMatrix::finishComm_mv::unpack");
+        unpack_buffer_mv(y);
+    }
 
     if ( ! m_comm_mv.send_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_mv.send_reqs.size());
-        BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.send_reqs.size()),
-                                   m_comm_mv.send_reqs.data(),
-                                   mpi_statuses.data()));
+        {
+            BL_PROFILE("SpMatrix::finishComm_mv::send_wait");
+            BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.send_reqs.size()),
+                                       m_comm_mv.send_reqs.data(),
+                                       mpi_statuses.data()));
+        }
     }
 
-    Gpu::streamSynchronize();
-    The_Comms_Arena()->free(m_comm_mv.send_buffer);
-    The_Comms_Arena()->free(m_comm_mv.recv_buffer);
-    m_comm_mv.send_reqs.clear();
-    m_comm_mv.recv_reqs.clear();
+    {
+        BL_PROFILE("SpMatrix::finishComm_mv::cleanup");
+        Gpu::streamSynchronize();
+        The_Comms_Arena()->free(m_comm_mv.send_buffer);
+        The_Comms_Arena()->free(m_comm_mv.recv_buffer);
+        m_comm_mv.send_reqs.clear();
+        m_comm_mv.recv_reqs.clear();
+    }
 #endif
 }
 
