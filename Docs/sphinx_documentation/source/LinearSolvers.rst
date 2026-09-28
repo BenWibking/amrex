@@ -1055,6 +1055,11 @@ or from existing CSR arrays with :cpp:`define`.
 The following operations are available.
 
 - :cpp:`SpMV(y, A, x)` computes :math:`y = A x`.
+  HIP builds reuse rocSPARSE descriptors, preprocessing, and workspace for
+  repeated applications of the same matrix, including applications with
+  different input and output vectors. This state belongs to the matrix;
+  replacing the matrix creates fresh state. HIP SpMV remains synchronous
+  with respect to the host.
 - :cpp:`transpose(A, col_partition)` returns :math:`A^T`, where
   ``col_partition`` is the column partition of ``A`` and becomes the row
   partition of the result.

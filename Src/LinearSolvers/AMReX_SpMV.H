@@ -28,7 +28,11 @@ template <typename T, typename I = Long>
  * \param px    Source vector (length ncols).
  */
 void SpMV (Long nrows, Long ncols, T* AMREX_RESTRICT py, CsrView<T const,I> const& A,
-           T const* AMREX_RESTRICT px)
+           T const* AMREX_RESTRICT px
+#ifdef AMREX_USE_HIP
+           , std::unique_ptr<detail::HipSpMVCache>* hip_cache = nullptr
+#endif
+           )
 {
     T const* AMREX_RESTRICT mat = A.mat;
     auto const* AMREX_RESTRICT col = A.col_index;
@@ -108,10 +112,6 @@ void SpMV (Long nrows, Long ncols, T* AMREX_RESTRICT py, CsrView<T const,I> cons
 
 #elif defined(AMREX_USE_HIP)
 
-    rocsparse_handle handle;
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_create_handle(&handle));
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_set_stream(handle, Gpu::gpuStream()));
-
     rocsparse_datatype data_type;
     if constexpr (std::is_same_v<T,float>) {
         data_type = rocsparse_datatype_f32_r;
@@ -128,145 +128,18 @@ void SpMV (Long nrows, Long ncols, T* AMREX_RESTRICT py, CsrView<T const,I> cons
     constexpr rocsparse_indextype index_type = std::is_same_v<I,int>
         ? rocsparse_indextype_i32 : rocsparse_indextype_i64;
 
-    rocsparse_spmat_descr mat_descr;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_create_csr_descr(&mat_descr, nrows, ncols, nnz,
-                                   (void*)row, (void*)col, (void*)mat,
-                                   index_type, index_type,
-                                   rocsparse_index_base_zero, data_type));
-
-    rocsparse_dnvec_descr x_descr;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_create_dnvec_descr(&x_descr, ncols, (void*)px, data_type));
-
-    rocsparse_dnvec_descr y_descr;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_create_dnvec_descr(&y_descr, nrows, (void*)py, data_type));
-
-    T alpha = T(1.0);
-    T beta = T(0.0);
-
-#if (HIP_VERSION_MAJOR >= 7)
-
-    rocsparse_spmv_descr spmv_descr;
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_create_spmv_descr(&spmv_descr));
-
-
-    rocsparse_error p_error[1] = {};
-
-    const rocsparse_spmv_alg spmv_alg = rocsparse_spmv_alg_csr_adaptive;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv_set_input(handle, spmv_descr, rocsparse_spmv_input_alg,
-                                 &spmv_alg, sizeof(spmv_alg), p_error));
-
-    const rocsparse_operation spmv_operation = rocsparse_operation_none;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv_set_input(handle, spmv_descr, rocsparse_spmv_input_operation,
-                                 &spmv_operation, sizeof(spmv_operation), p_error));
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv_set_input(handle, spmv_descr, rocsparse_spmv_input_scalar_datatype,
-                                 &data_type, sizeof(data_type), p_error));
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv_set_input(handle, spmv_descr, rocsparse_spmv_input_compute_datatype,
-                                 &data_type, sizeof(data_type), p_error));
-
-    std::size_t buffer_size = 0;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_v2_spmv_buffer_size(handle, spmv_descr, mat_descr, x_descr, y_descr,
-                                      rocsparse_v2_spmv_stage_analysis, // buffer size for analysis
-                                      &buffer_size, p_error));
-
-    void* pbuffer = nullptr;
-    if (buffer_size > 0) {
-        pbuffer = (void*)The_Arena()->alloc(buffer_size);
+    T alpha = T(1);
+    T beta = T(0);
+    // Standalone CSR views get a temporary cache; distributed matrices pass
+    // their own cache so initialization/analysis happens only on first use.
+    std::unique_ptr<detail::HipSpMVCache> temporary;
+    auto& state = hip_cache ? *hip_cache : temporary;
+    if (!state) {
+        state = std::make_unique<detail::HipSpMVCache>(
+            nrows, ncols, nnz, (void*)row, (void*)col, (void*)mat,
+            index_type, data_type, (void*)px, (void*)py, &alpha, &beta);
     }
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_v2_spmv(handle, spmv_descr, &alpha, mat_descr, x_descr, &beta, y_descr,
-                          rocsparse_v2_spmv_stage_analysis, // analysis stage
-                          buffer_size, pbuffer, p_error));
-
-    if (pbuffer) {
-        The_Arena()->free(pbuffer);
-    }
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_v2_spmv_buffer_size(handle, spmv_descr, mat_descr, x_descr, y_descr,
-                                      rocsparse_v2_spmv_stage_compute, // buffer size for compute
-                                      &buffer_size, p_error));
-
-    if (buffer_size > 0) {
-        pbuffer = (void*)The_Arena()->alloc(buffer_size);
-    } else {
-        pbuffer = nullptr;
-    }
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_v2_spmv(handle, spmv_descr, &alpha, mat_descr, x_descr, &beta, y_descr,
-                          rocsparse_v2_spmv_stage_compute, // compute stage
-                          buffer_size, pbuffer, p_error));
-
-#elif (HIP_VERSION_MAJOR == 6)
-
-    std::size_t buffer_size = 0;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv(handle, rocsparse_operation_none, &alpha, mat_descr, x_descr,
-                       &beta, y_descr, data_type, rocsparse_spmv_alg_default,
-                       rocsparse_spmv_stage_buffer_size, // buffer size stage
-                       &buffer_size, nullptr));
-
-    void* pbuffer = nullptr;
-    if (buffer_size > 0) {
-        pbuffer = (void*)The_Arena()->alloc(buffer_size);
-    }
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv(handle, rocsparse_operation_none, &alpha, mat_descr, x_descr,
-                       &beta, y_descr, data_type, rocsparse_spmv_alg_default,
-                       rocsparse_spmv_stage_preprocess, // preprocess stage
-                       &buffer_size, pbuffer));
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv(handle, rocsparse_operation_none, &alpha, mat_descr, x_descr,
-                       &beta, y_descr, data_type, rocsparse_spmv_alg_default,
-                       rocsparse_spmv_stage_compute, // compute stage
-                       &buffer_size, pbuffer));
-
-#else /* HIP_VERSION_MAJOR < 6 */
-
-    std::size_t buffer_size = 0;
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv(handle, rocsparse_operation_none, &alpha, mat_descr, x_descr,
-                       &beta, y_descr, data_type, rocsparse_spmv_alg_default,
-                       &buffer_size, nullptr));
-
-    void* pbuffer = nullptr;
-    if (buffer_size > 0) {
-        pbuffer = (void*)The_Arena()->alloc(buffer_size);
-    }
-
-    AMREX_ROCSPARSE_SAFE_CALL(
-        rocsparse_spmv(handle, rocsparse_operation_none, &alpha, mat_descr, x_descr,
-                       &beta, y_descr, data_type, rocsparse_spmv_alg_default,
-                       &buffer_size, pbuffer));
-
-#endif /* HIP_VERSION_MAJOR */
-
-    Gpu::streamSynchronize();
-
-#if (HIP_VERSION_MAJOR >= 7)
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_error(p_error[0]));
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_spmv_descr(spmv_descr));
-#endif
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_spmat_descr(mat_descr));
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_dnvec_descr(x_descr));
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_dnvec_descr(y_descr));
-    AMREX_ROCSPARSE_SAFE_CALL(rocsparse_destroy_handle(handle));
-    if (pbuffer) {
-        The_Arena()->free(pbuffer);
-    }
+    state->compute(&alpha, &beta, (void*)px, (void*)py);
 
 #elif defined(AMREX_USE_SYCL)
 
@@ -328,7 +201,11 @@ void SpMV (AlgVector<T,AllocV>& y, SpMatrix<T,AllocM> const& A,
 
     // Diagonal part
     SpMV<T,int>(y.numLocalRows(), x.numLocalRows(), y.data(), A.m_csr_local.const_view(),
-                x.data());
+                x.data()
+#ifdef AMREX_USE_HIP
+                , &Am.m_hip_spmv
+#endif
+                );
 
     Am.finishComm_mv(y);
 }

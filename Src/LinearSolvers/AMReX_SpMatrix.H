@@ -9,6 +9,7 @@
 #include <AMReX_BLProfiler.H>
 #include <AMReX_Gpu.H>
 #include <AMReX_Scan.H>
+#include <AMReX_HipSpMV.H>
 
 #if defined(AMREX_USE_CUDA)
 #  include <cusparse.h>
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <type_traits>
@@ -401,6 +403,12 @@ private:
     Long m_nnz = 0; //! total nnz including both diagonal and off-diagonal
     csr_type m_csr;             // unsplit form, empty once split
     local_csr_type m_csr_local; // diagonal block after the split
+
+#ifdef AMREX_USE_HIP
+    // Constructed on first SpMV after splitting. Move ownership together
+    // with the CSR arrays; every new matrix gets fresh rocSPARSE analysis.
+    mutable std::unique_ptr<detail::HipSpMVCache> m_hip_spmv;
+#endif
 
     mutable AlgVector<T,AllocT> m_diagonal;
 
@@ -931,6 +939,9 @@ SpMatrix<T,Allocator>::SpMatrix (AlgPartition partition, csr_type csr)
 template <typename T, template<typename> class Allocator>
 void SpMatrix<T,Allocator>::define (AlgPartition partition, int nnz_per_row)
 {
+#ifdef AMREX_USE_HIP
+    m_hip_spmv.reset();
+#endif
     m_partition = std::move(partition);
     m_row_begin = m_partition[ParallelDescriptor::MyProc()];
     m_row_end = m_partition[ParallelDescriptor::MyProc()+1];
@@ -943,6 +954,9 @@ void SpMatrix<T,Allocator>::define (AlgPartition partition, csr_type csr,
                                     CsrSorted is_sorted)
 {
     AMREX_ALWAYS_ASSERT(m_split == false);
+#ifdef AMREX_USE_HIP
+    m_hip_spmv.reset();
+#endif
 
     m_partition = std::move(partition);
     m_row_begin = m_partition[ParallelDescriptor::MyProc()];

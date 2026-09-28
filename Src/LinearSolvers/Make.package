@@ -18,6 +18,7 @@ CEXE_headers += AMReX_SpGEMM.H
 CEXE_headers += AMReX_SpMatrix.H
 CEXE_headers += AMReX_SpMatUtil.H
 CEXE_headers += AMReX_SpMV.H
+CEXE_headers += AMReX_HipSpMV.H
 
 VPATH_LOCATIONS += $(AMREX_HOME)/Src/LinearSolvers
 INCLUDE_LOCATIONS += $(AMREX_HOME)/Src/LinearSolvers

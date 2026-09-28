@@ -7,8 +7,69 @@
 
 using namespace amrex;
 
+// Exercise persistent SpMV state with changing vector allocations, rectangular
+// column partitions, populated move targets, fresh coefficients, and zero nnz.
+template <typename T>
+void check_repeated_spmv ()
+{
+    for (bool rectangular : {false, true}) {
+        Long const nr = 32 * ParallelDescriptor::NProcs();
+        Long const nc = nr + (rectangular ? 16 * ParallelDescriptor::NProcs() : 0);
+        AlgVector<T> y1(nr), y2(y1.partition());
+        AlgVector<T> x1(nc), x2(x1.partition());
+        auto make_matrix = [&] (T diagonal) {
+            SpMatrix<T> a(y1.partition(), 2);
+            a.setVal([=] AMREX_GPU_DEVICE (Long row, Long* col, T* val) {
+                col[0] = row; col[1] = (row+1) % nc;
+                val[0] = diagonal; val[1] = T(-1);
+            }, CsrSorted{false});
+            return a;
+        };
+        auto apply = [&] (SpMatrix<T> const& a, T diagonal, int iteration) {
+            auto& x = (iteration % 2) ? x1 : x2;
+            auto& y = (iteration % 2) ? y1 : y2;
+            T const scale = T(iteration+1);
+            auto* px = x.data();
+            Long const xb = x.globalBegin();
+            ParallelFor(x.numLocalRows(), [=] AMREX_GPU_DEVICE (Long i) {
+                px[i] = scale * T(xb+i+1);
+            });
+            y.setVal(T(-123));
+            SpMV(y, a, x);
+            auto* py = y.data();
+            Long const yb = y.globalBegin();
+            ParallelFor(y.numLocalRows(), [=] AMREX_GPU_DEVICE (Long i) {
+                Long const row = yb+i;
+                py[i] -= scale * (diagonal*T(row+1) - T((row+1)%nc+1));
+            });
+            AMREX_ALWAYS_ASSERT(y.norminf() == T(0));
+        };
+        auto a = make_matrix(T(2));
+        apply(a, T(2), 0);
+        apply(a, T(2), 1);
+        auto moved = std::move(a);
+        apply(moved, T(2), 2);
+        auto target = make_matrix(T(3));
+        apply(target, T(3), 3);
+        target = std::move(moved);
+        apply(target, T(2), 4);
+        target = make_matrix(T(4));
+        apply(target, T(4), 5);
+        apply(target, T(4), 6);
+
+        SpMatrix<T> zero(y1.partition(), 0);
+        y1.setVal(T(99));
+        SpMV(y1, zero, x1);
+        AMREX_ALWAYS_ASSERT(y1.norminf() == T(0));
+    }
+}
+
 int main(int argc, char *argv[]) {
   amrex::Initialize(argc, argv);
+
+  check_repeated_spmv<float>();
+  check_repeated_spmv<double>();
+  amrex::Print() << "Repeated SpMV/vector rebinding/move/replacement checks passed\n";
 
   {
     AlgVector<Real> xvec(100);

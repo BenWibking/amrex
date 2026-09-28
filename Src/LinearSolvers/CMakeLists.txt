@@ -54,6 +54,7 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        AMReX_SpMatrix.H
        AMReX_SpMatUtil.H
        AMReX_SpMV.H
+       AMReX_HipSpMV.H
        )
 
     if (D EQUAL 3)
