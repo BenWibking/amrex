@@ -2612,20 +2612,24 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
 
     Gpu::PinnedVector<Long> h_recv(ext.nrows+1);
     {
+        // Keep MPI's pointer classification away from HIP-pinned allocations.
+        // Retain pinned storage for the asynchronous host/device copies.
+        Vector<Long> mpi_send(h_send.begin(), h_send.begin()+nsend_rows);
+        Vector<Long> mpi_recv(ext.nrows);
         auto const tag = ParallelDescriptor::SeqNum();
         Vector<MPI_Request> reqs;
         reqs.reserve(nrecvs+nsends);
         Long os = 0;
         for (int i = 0; i < nrecvs; ++i) {
             reqs.push_back(MPI_REQUEST_NULL);
-            BL_MPI_REQUIRE(MPI_Irecv(h_recv.data()+os, cm.recv_counts[i], mpi_long,
+            BL_MPI_REQUIRE(MPI_Irecv(mpi_recv.data()+os, cm.recv_counts[i], mpi_long,
                                      cm.recv_from[i], tag, mpi_comm, &reqs.back()));
             os += cm.recv_counts[i];
         }
         os = 0;
         for (int i = 0; i < nsends; ++i) {
             reqs.push_back(MPI_REQUEST_NULL);
-            BL_MPI_REQUIRE(MPI_Isend(h_send.data()+os, cm.send_counts[i], mpi_long,
+            BL_MPI_REQUIRE(MPI_Isend(mpi_send.data()+os, cm.send_counts[i], mpi_long,
                                      cm.send_to[i], tag, mpi_comm, &reqs.back()));
             detail::count_amg_send(Long(cm.send_counts[i]) * sizeof(Long));
             os += cm.send_counts[i];
@@ -2634,6 +2638,7 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
             Vector<MPI_Status> stats(reqs.size());
             BL_MPI_REQUIRE(MPI_Waitall(int(reqs.size()), reqs.data(), stats.data()));
         }
+        std::copy(mpi_recv.begin(), mpi_recv.end(), h_recv.begin());
     }
 
     // Counts to offsets, in place; per-rank totals.
