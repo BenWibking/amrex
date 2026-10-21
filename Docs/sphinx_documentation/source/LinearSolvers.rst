@@ -1332,6 +1332,11 @@ or from existing CSR arrays with :cpp:`define`.
 The following operations are available.
 
 - :cpp:`SpMV(y, A, x)` computes :math:`y = A x`.
+  HIP builds reuse rocSPARSE descriptors, preprocessing, and workspace for
+  repeated applications of the same matrix, including applications with
+  different input and output vectors. This state belongs to the matrix;
+  replacing the matrix creates fresh state. HIP SpMV remains synchronous
+  with respect to the host.
 - :cpp:`transpose(A, col_partition)` returns :math:`A^T`, where
   ``col_partition`` is the column partition of ``A`` and becomes the row
   partition of the result.
@@ -1416,6 +1421,11 @@ coexist. The solver runs on CPUs and GPUs with any number of MPI processes.
 (see :ref:`sec:linearsolver:pars`). The
 enumerations below are ``AMREX_ENUM`` types, so they can be read from an
 inputs file with :cpp:`ParmParse::query_enum_case_insensitive`.
+For setup diagnostics, :cpp:`setMeasureSetupMessages(true)` prints
+rank-summed point-to-point send calls and payload bytes for each level and
+phase. It also prints logical collective calls summed over ranks. These
+counts exclude the network messages internal to MPI collectives and the
+reduction used to assemble the report.
 The following can be tuned:
 
 - :cpp:`setInterpType`: extended+i (``mm_ext_i``, the default), extended

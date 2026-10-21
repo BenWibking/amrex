@@ -4,10 +4,12 @@
 
 #include <AMReX_AlgPartition.H>
 #include <AMReX_AlgVector.H>
+#include <AMReX_AMGMessageStats.H>
 #include <AMReX_CSR.H>
 #include <AMReX_BLProfiler.H>
 #include <AMReX_Gpu.H>
 #include <AMReX_Scan.H>
+#include <AMReX_HipSpMV.H>
 
 #if defined(AMREX_USE_CUDA)
 #  include <cusparse.h>
@@ -18,7 +20,11 @@
 #  include <oneapi/mkl/spblas.hpp>
 #endif
 
+#include <algorithm>
 #include <fstream>
+#include <iterator>
+#include <map>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <type_traits>
@@ -356,6 +362,22 @@ public:
     //! As above, into \p r (reused across calls).
     template <typename U>
     void gatherRemote (U const* x, Gpu::DeviceVector<U>& r);
+    //! Reusable union-column communication plan for two matrices.
+    struct PairHalo {
+        Vector<int> send_to, send_counts, recv_from, recv_counts;
+        Gpu::DeviceVector<Long> send_indices;
+        Gpu::DeviceVector<int> first_map, second_map;
+        Long nsend = 0, nrecv = 0;
+        Long col_begin = 0;
+    };
+
+    //! Build one request plan for the union of this matrix's and \p other's
+    //! remote columns. The plan also retains the first matrix's subset.
+    PairHalo preparePairHalo (SpMatrix<T,Allocator>& other);
+    //! Gather both matrices' remote columns using the shared plan.
+    template <typename U>
+    void gatherRemotePair (PairHalo const& halo, U const* x,
+                           Gpu::DeviceVector<U>& r, Gpu::DeviceVector<U>& other_r);
 
     //! Initiate communication required to build the transpose with column partition \p col_partition.
     void startComm_tr (AlgPartition const& col_partition);
@@ -389,6 +411,12 @@ private:
     Long m_nnz = 0; //! total nnz including both diagonal and off-diagonal
     csr_type m_csr;             // unsplit form, empty once split
     local_csr_type m_csr_local; // diagonal block after the split
+
+#ifdef AMREX_USE_HIP
+    // Constructed on first SpMV after splitting. Move ownership together
+    // with the CSR arrays; every new matrix gets fresh rocSPARSE analysis.
+    mutable std::unique_ptr<detail::HipSpMVCache> m_hip_spmv;
+#endif
 
     mutable AlgVector<T,AllocT> m_diagonal;
 
@@ -465,12 +493,12 @@ public: // NOLINT  Private functions, but public for cuda
     struct CommTR {
         CsrView<T> csrt; // Own the memory inside
 
-        Vector<int> send_to;
-        Vector<std::array<int,2>> send_counts;
+        Vector<Vector<char>> send_buffers;
         Vector<MPI_Request> send_reqs;
 
         Vector<int> recv_from;
         Vector<std::array<int,2>> recv_counts;
+        Vector<Vector<char>> recv_buffers;
         Vector<MPI_Request> recv_reqs;
 
         std::array<Long,2> total_counts_recv = {0,0};
@@ -493,6 +521,9 @@ public: // NOLINT  Private functions, but public for cuda
     //! `m_csr_remote.row_offset` must hold the full offsets on entry.
     void trim_remote_rows ();
     void prepare_comm_mv (AlgPartition const& col_partition);
+    template <typename U>
+    static void gather_pair_plan (PairHalo const& halo, U const* x,
+                                  Gpu::DeviceVector<U>& r);
     void pack_buffer_mv (AlgVector<T,AllocT> const& v);
     void unpack_buffer_mv (AlgVector<T,AllocT>& v);
     void comm_tr_recv_wait();
@@ -916,6 +947,9 @@ SpMatrix<T,Allocator>::SpMatrix (AlgPartition partition, csr_type csr)
 template <typename T, template<typename> class Allocator>
 void SpMatrix<T,Allocator>::define (AlgPartition partition, int nnz_per_row)
 {
+#ifdef AMREX_USE_HIP
+    m_hip_spmv.reset();
+#endif
     m_partition = std::move(partition);
     m_row_begin = m_partition[ParallelContext::MyProcSub()];
     m_row_end = m_partition[ParallelContext::MyProcSub()+1];
@@ -928,6 +962,9 @@ void SpMatrix<T,Allocator>::define (AlgPartition partition, csr_type csr,
                                     CsrSorted is_sorted)
 {
     AMREX_ALWAYS_ASSERT(m_split == false);
+#ifdef AMREX_USE_HIP
+    m_hip_spmv.reset();
+#endif
 
     m_partition = std::move(partition);
     m_row_begin = m_partition[ParallelContext::MyProcSub()];
@@ -1297,6 +1334,7 @@ void SpMatrix<T,Allocator>::startComm_mv (AlgVector<T,AllocT> const& x)
             auto count = m_comm_mv.send_counts[isend];
             BL_MPI_REQUIRE(MPI_Isend(p_send, count, mpi_t_type, m_comm_mv.send_to[isend],
                                      mpi_tag, mpi_comm, &(m_comm_mv.send_reqs[isend])));
+            detail::count_amg_send(Long(count) * sizeof(T));
             p_send += count;
         }
         AMREX_ASSERT(p_send == m_comm_mv.send_buffer + m_comm_mv.total_counts_send);
@@ -1315,25 +1353,37 @@ void SpMatrix<T,Allocator>::finishComm_mv (AlgVector<T,AllocT>& y)
 
     if ( ! m_comm_mv.recv_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_mv.recv_reqs.size());
-        BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.recv_reqs.size()),
-                                   m_comm_mv.recv_reqs.data(),
-                                   mpi_statuses.data()));
+        {
+            BL_PROFILE("SpMatrix::finishComm_mv::recv_wait");
+            BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.recv_reqs.size()),
+                                       m_comm_mv.recv_reqs.data(),
+                                       mpi_statuses.data()));
+        }
     }
 
-    unpack_buffer_mv(y);
+    {
+        BL_PROFILE("SpMatrix::finishComm_mv::unpack");
+        unpack_buffer_mv(y);
+    }
 
     if ( ! m_comm_mv.send_reqs.empty()) {
         Vector<MPI_Status> mpi_statuses(m_comm_mv.send_reqs.size());
-        BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.send_reqs.size()),
-                                   m_comm_mv.send_reqs.data(),
-                                   mpi_statuses.data()));
+        {
+            BL_PROFILE("SpMatrix::finishComm_mv::send_wait");
+            BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_mv.send_reqs.size()),
+                                       m_comm_mv.send_reqs.data(),
+                                       mpi_statuses.data()));
+        }
     }
 
-    Gpu::streamSynchronize();
-    The_Comms_Arena()->free(m_comm_mv.send_buffer);
-    The_Comms_Arena()->free(m_comm_mv.recv_buffer);
-    m_comm_mv.send_reqs.clear();
-    m_comm_mv.recv_reqs.clear();
+    {
+        BL_PROFILE("SpMatrix::finishComm_mv::cleanup");
+        Gpu::streamSynchronize();
+        The_Comms_Arena()->free(m_comm_mv.send_buffer);
+        The_Comms_Arena()->free(m_comm_mv.recv_buffer);
+        m_comm_mv.send_reqs.clear();
+        m_comm_mv.recv_reqs.clear();
+    }
 #endif
 }
 
@@ -1397,6 +1447,7 @@ void SpMatrix<T,Allocator>::gatherRemote (U const* x, Gpu::DeviceVector<U>& r)
             auto count = m_comm_mv.send_counts[isend];
             BL_MPI_REQUIRE(MPI_Isend(p_send, count, mpi_type, m_comm_mv.send_to[isend],
                                      mpi_tag, mpi_comm, &send_reqs[isend]));
+            detail::count_amg_send(Long(count) * sizeof(U));
             p_send += count;
         }
     }
@@ -1422,6 +1473,255 @@ void SpMatrix<T,Allocator>::gatherRemote (U const* x, Gpu::DeviceVector<U>& r)
     The_Comms_Arena()->free(send_buffer);
     The_Comms_Arena()->free(recv_buffer);
 #endif
+}
+
+template <typename T, template<typename> class Allocator>
+auto SpMatrix<T,Allocator>::preparePairHalo (SpMatrix<T,Allocator>& other) -> PairHalo
+{
+    BL_PROFILE("SpMatrix::preparePairHalo");
+    PairHalo halo;
+#ifndef AMREX_USE_MPI
+    amrex::ignore_unused(other);
+#else
+    AMREX_ALWAYS_ASSERT(m_split && other.m_split);
+    AMREX_ALWAYS_ASSERT(m_col_partition == other.m_col_partition);
+    AMREX_ALWAYS_ASSERT(!m_comm_mv.prepared);
+    if (detail::spmat_comm_is_local(this->partition(), m_col_partition)) {
+        return halo;
+    }
+
+    halo.col_begin = m_col_begin;
+    Vector<Long> union_cols;
+    std::set_union(m_remote_cols_v.begin(), m_remote_cols_v.end(),
+                   other.m_remote_cols_v.begin(), other.m_remote_cols_v.end(),
+                   std::back_inserter(union_cols));
+    AMREX_ALWAYS_ASSERT(union_cols.size() < std::size_t(std::numeric_limits<int>::max()));
+    halo.nrecv = Long(union_cols.size());
+    m_comm_mv.total_counts_recv = Long(m_remote_cols_v.size());
+
+    Gpu::PinnedVector<int> first_map(m_remote_cols_v.size());
+    Gpu::PinnedVector<int> second_map(other.m_remote_cols_v.size());
+    for (std::size_t i = 0; i < first_map.size(); ++i) {
+        first_map[i] = int(std::lower_bound(union_cols.begin(), union_cols.end(),
+                                           m_remote_cols_v[i]) - union_cols.begin());
+    }
+    for (std::size_t i = 0; i < second_map.size(); ++i) {
+        second_map[i] = int(std::lower_bound(union_cols.begin(), union_cols.end(),
+                                            other.m_remote_cols_v[i]) - union_cols.begin());
+    }
+    halo.first_map.resize(first_map.size());
+    halo.second_map.resize(second_map.size());
+    Gpu::copyAsync(Gpu::hostToDevice, first_map.begin(), first_map.end(),
+                   halo.first_map.begin());
+    Gpu::copyAsync(Gpu::hostToDevice, second_map.begin(), second_map.end(),
+                   halo.second_map.begin());
+    Gpu::streamSynchronize();
+
+    int const nprocs = ParallelContext::NProcsSub();
+    auto const& cp = m_col_partition.dataVector();
+    Vector<Vector<Long>> requests(nprocs);
+    auto first_it = m_remote_cols_v.begin();
+    for (Long col : union_cols) {
+        AMREX_ALWAYS_ASSERT(col >= 0);
+        while (first_it != m_remote_cols_v.end() && *first_it < col) { ++first_it; }
+        bool const in_first = first_it != m_remote_cols_v.end() && *first_it == col;
+        int const owner = int(std::upper_bound(cp.begin(), cp.end(), col) - cp.begin()) - 1;
+        AMREX_ALWAYS_ASSERT(owner >= 0 && owner < nprocs);
+        // Negative encoding records membership in the first matrix without
+        // adding a second request message or a second field to this message.
+        requests[owner].push_back(in_first ? -col-1 : col);
+    }
+
+    Vector<int> connection(nprocs), scatter_counts(nprocs, 1);
+    for (int iproc = 0; iproc < nprocs; ++iproc) {
+        connection[iproc] = requests[iproc].empty() ? 0 : 1;
+    }
+    int num_neighbors = 0;
+    detail::count_amg_collective();
+    BL_MPI_REQUIRE(MPI_Reduce_scatter(connection.data(), &num_neighbors,
+                                      scatter_counts.data(), MPI_INT, MPI_SUM,
+                                      ParallelContext::CommunicatorSub()));
+
+    auto const tag = ParallelDescriptor::SeqNum();
+    auto const mpi_long = ParallelDescriptor::Mpi_typemap<Long>::type();
+    auto const mpi_comm = ParallelContext::CommunicatorSub();
+    Vector<MPI_Request> request_sends;
+    for (int iproc = 0; iproc < nprocs; ++iproc) {
+        if (!requests[iproc].empty()) {
+            AMREX_ALWAYS_ASSERT(requests[iproc].size() <=
+                                std::size_t(std::numeric_limits<int>::max()));
+            int const count = int(requests[iproc].size());
+            request_sends.push_back(MPI_REQUEST_NULL);
+            BL_MPI_REQUIRE(MPI_Isend(requests[iproc].data(), count, mpi_long, iproc,
+                                     tag, mpi_comm, &request_sends.back()));
+            detail::count_amg_send(Long(count) * sizeof(Long));
+            halo.recv_from.push_back(iproc);
+            halo.recv_counts.push_back(count);
+        }
+        if (!m_remote_cols_vv[iproc].empty()) {
+            m_comm_mv.recv_from.push_back(iproc);
+            m_comm_mv.recv_counts.push_back(int(m_remote_cols_vv[iproc].size()));
+        }
+    }
+
+    Vector<Vector<Long>> send_lists, first_send_lists;
+    send_lists.reserve(num_neighbors);
+    first_send_lists.reserve(num_neighbors);
+    for (int i = 0; i < num_neighbors; ++i) {
+        MPI_Status status;
+        BL_MPI_REQUIRE(MPI_Probe(MPI_ANY_SOURCE, tag, mpi_comm, &status));
+        int count;
+        BL_MPI_REQUIRE(MPI_Get_count(&status, mpi_long, &count));
+        Vector<Long> encoded(count);
+        BL_MPI_REQUIRE(MPI_Recv(encoded.data(), count, mpi_long, status.MPI_SOURCE,
+                                tag, mpi_comm, &status));
+        Vector<Long> all, first;
+        all.reserve(count);
+        for (Long col : encoded) {
+            if (col < 0) {
+                Long const decoded = -(col+1);
+                all.push_back(decoded);
+                first.push_back(decoded);
+            } else {
+                all.push_back(col);
+            }
+        }
+        halo.send_to.push_back(status.MPI_SOURCE);
+        halo.send_counts.push_back(count);
+        halo.nsend += count;
+        send_lists.push_back(std::move(all));
+        if (!first.empty()) {
+            m_comm_mv.send_to.push_back(status.MPI_SOURCE);
+            m_comm_mv.send_counts.push_back(int(first.size()));
+            m_comm_mv.total_counts_send += Long(first.size());
+            first_send_lists.push_back(std::move(first));
+        }
+    }
+
+    Gpu::PinnedVector<Long> all_indices, first_indices;
+    all_indices.reserve(halo.nsend);
+    first_indices.reserve(m_comm_mv.total_counts_send);
+    for (auto const& list : send_lists) {
+        for (Long col : list) { all_indices.push_back(col); }
+    }
+    for (auto const& list : first_send_lists) {
+        for (Long col : list) { first_indices.push_back(col); }
+    }
+    halo.send_indices.resize(halo.nsend);
+    m_comm_mv.send_indices.resize(m_comm_mv.total_counts_send);
+    Gpu::copyAsync(Gpu::hostToDevice, all_indices.begin(), all_indices.end(),
+                   halo.send_indices.begin());
+    Gpu::copyAsync(Gpu::hostToDevice, first_indices.begin(), first_indices.end(),
+                   m_comm_mv.send_indices.begin());
+    Gpu::streamSynchronize();
+
+    if (!request_sends.empty()) {
+        Vector<MPI_Status> statuses(request_sends.size());
+        BL_MPI_REQUIRE(MPI_Waitall(int(request_sends.size()), request_sends.data(),
+                                   statuses.data()));
+    }
+    // The first matrix's ordinary gathers, including later interpolation
+    // gathers, reuse the subset obtained in this one request exchange.
+    m_comm_mv.prepared = true;
+#endif
+    return halo;
+}
+
+template <typename T, template<typename> class Allocator>
+template <typename U>
+void SpMatrix<T,Allocator>::gather_pair_plan (PairHalo const& halo, U const* x,
+                                              Gpu::DeviceVector<U>& r)
+{
+    BL_PROFILE("SpMatrix::gather_pair_plan");
+#ifndef AMREX_USE_MPI
+    amrex::ignore_unused(halo, x);
+    r.clear();
+#else
+    auto const& send_to = halo.send_to;
+    auto const& send_counts = halo.send_counts;
+    auto const& send_indices = halo.send_indices;
+    auto const& recv_from = halo.recv_from;
+    auto const& recv_counts = halo.recv_counts;
+    Long const nsend = halo.nsend;
+    Long const nrecv = halo.nrecv;
+
+    auto const tag = ParallelDescriptor::SeqNum();
+    auto const mpi_type = ParallelDescriptor::Mpi_typemap<U>::type();
+    auto const mpi_comm = ParallelContext::CommunicatorSub();
+    U* recv_buffer = nrecv > 0
+        ? static_cast<U*>(The_Comms_Arena()->alloc(sizeof(U)*nrecv)) : nullptr;
+    Vector<MPI_Request> recv_reqs(recv_from.size(), MPI_REQUEST_NULL);
+    Long offset = 0;
+    for (std::size_t i = 0; i < recv_from.size(); ++i) {
+        BL_MPI_REQUIRE(MPI_Irecv(recv_buffer+offset, recv_counts[i], mpi_type,
+                                 recv_from[i], tag, mpi_comm, &recv_reqs[i]));
+        offset += recv_counts[i];
+    }
+
+    U* send_buffer = nsend > 0
+        ? static_cast<U*>(The_Comms_Arena()->alloc(sizeof(U)*nsend)) : nullptr;
+    if (nsend > 0) {
+        auto const* indices = send_indices.data();
+        Long const col_begin = halo.col_begin;
+        ParallelForOMP(nsend, [=] AMREX_GPU_DEVICE (Long i) noexcept {
+            send_buffer[i] = x[indices[i]-col_begin];
+        });
+        Gpu::streamSynchronize();
+    }
+    Vector<MPI_Request> send_reqs(send_to.size(), MPI_REQUEST_NULL);
+    offset = 0;
+    for (std::size_t i = 0; i < send_to.size(); ++i) {
+        BL_MPI_REQUIRE(MPI_Isend(send_buffer+offset, send_counts[i], mpi_type,
+                                 send_to[i], tag, mpi_comm, &send_reqs[i]));
+        detail::count_amg_send(Long(send_counts[i]) * sizeof(U));
+        offset += send_counts[i];
+    }
+
+    r.resize(nrecv);
+    if (!recv_reqs.empty()) {
+        Vector<MPI_Status> statuses(recv_reqs.size());
+        BL_MPI_REQUIRE(MPI_Waitall(int(recv_reqs.size()), recv_reqs.data(),
+                                   statuses.data()));
+        auto* dst = r.data();
+        auto const* src = recv_buffer;
+        ParallelForOMP(nrecv, [=] AMREX_GPU_DEVICE (Long i) noexcept {
+            dst[i] = src[i];
+        });
+    }
+    if (!send_reqs.empty()) {
+        Vector<MPI_Status> statuses(send_reqs.size());
+        BL_MPI_REQUIRE(MPI_Waitall(int(send_reqs.size()), send_reqs.data(),
+                                   statuses.data()));
+    }
+    Gpu::streamSynchronize();
+    The_Comms_Arena()->free(send_buffer);
+    The_Comms_Arena()->free(recv_buffer);
+#endif
+}
+
+template <typename T, template<typename> class Allocator>
+template <typename U>
+void SpMatrix<T,Allocator>::gatherRemotePair (PairHalo const& halo, U const* x,
+                                              Gpu::DeviceVector<U>& r,
+                                              Gpu::DeviceVector<U>& other_r)
+{
+    BL_PROFILE("SpMatrix::gatherRemotePair");
+    Gpu::DeviceVector<U> union_values;
+    gather_pair_plan(halo, x, union_values);
+    r.resize(halo.first_map.size());
+    other_r.resize(halo.second_map.size());
+    auto const* values = union_values.data();
+    auto const* first_map = halo.first_map.data();
+    auto const* second_map = halo.second_map.data();
+    auto* first = r.data();
+    auto* second = other_r.data();
+    ParallelForOMP(Long(r.size()), [=] AMREX_GPU_DEVICE (Long i) noexcept {
+        first[i] = values[first_map[i]];
+    });
+    ParallelForOMP(Long(other_r.size()), [=] AMREX_GPU_DEVICE (Long i) noexcept {
+        second[i] = values[second_map[i]];
+    });
+    Gpu::streamSynchronize();
 }
 
 template <typename T, template<typename> class Allocator>
@@ -1484,151 +1784,76 @@ void SpMatrix<T,Allocator>::startComm_tr (AlgPartition const& col_partition)
 
     if (m_num_neighbors < 0) { set_num_neighbors(); }
 
-    // As a sender, I need to let other processes know that how many
-    // elements I will send them.
-
-    Vector<MPI_Request> mpi_requests;
-    mpi_requests.reserve(nprocs);
+    // One packed message per peer: counts, values, column indices, row
+    // offsets, and the global row map. MPI_Pack retains datatype conversion.
+    auto const npeers = std::count_if(m_remote_cols_vv.begin(), m_remote_cols_vv.end(),
+                                     [] (auto const& cols) { return !cols.empty(); });
+    m_comm_tr.send_buffers.reserve(npeers);
+    m_comm_tr.send_reqs.reserve(npeers);
     if (m_csr_remote.nnz > 0) {
-        Long it = 0;
+        Long row_begin = 0;
         for (int iproc = 0; iproc < nprocs; ++iproc) {
+            Long const nrows = Long(m_remote_cols_vv[iproc].size());
             Long n = 0;
-            for (Long i = 0; i < Long(m_remote_cols_vv[iproc].size()); ++i) {
-                n += m_comm_tr.csrt.row_offset[it+1] - m_comm_tr.csrt.row_offset[it];
-                ++it;
+            for (Long i = 0; i < nrows; ++i) {
+                n += m_comm_tr.csrt.row_offset[row_begin+i+1]
+                   - m_comm_tr.csrt.row_offset[row_begin+i];
             }
             if (n > 0) {
-                mpi_requests.push_back(MPI_REQUEST_NULL);
-                AMREX_ALWAYS_ASSERT(n < std::numeric_limits<int>::max());
-                std::array<int,2> nn{int(n), int(m_remote_cols_vv[iproc].size())};
-                BL_MPI_REQUIRE(MPI_Isend(nn.data(), 2, MPI_INT, iproc, mpi_tag,
-                                         mpi_comm, &(mpi_requests.back())));
-                m_comm_tr.send_to.push_back(iproc);
-                m_comm_tr.send_counts.push_back(nn);
+                AMREX_ALWAYS_ASSERT(n < std::numeric_limits<int>::max()
+                                    && nrows < std::numeric_limits<int>::max());
+                std::array<int,2> nn{int(n), int(nrows)};
+                int sizes[5];
+                BL_MPI_REQUIRE(MPI_Pack_size(2, MPI_INT, mpi_comm, &sizes[0]));
+                BL_MPI_REQUIRE(MPI_Pack_size(nn[0], mpi_t, mpi_comm, &sizes[1]));
+                BL_MPI_REQUIRE(MPI_Pack_size(nn[0], mpi_long, mpi_comm, &sizes[2]));
+                BL_MPI_REQUIRE(MPI_Pack_size(nn[1]+1, mpi_long, mpi_comm, &sizes[3]));
+                BL_MPI_REQUIRE(MPI_Pack_size(nn[1], mpi_long, mpi_comm, &sizes[4]));
+                Long pack_size = 0;
+                for (int size : sizes) { pack_size += size; }
+                AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    pack_size <= std::numeric_limits<int>::max(),
+                    "SpMatrix::startComm_tr: packed message exceeds MPI int count range");
+                auto& buffer = m_comm_tr.send_buffers.emplace_back(std::size_t(pack_size));
+                int position = 0;
+                Long const nnz_begin = m_comm_tr.csrt.row_offset[row_begin];
+                BL_MPI_REQUIRE(MPI_Pack(nn.data(), 2, MPI_INT, buffer.data(),
+                                        int(buffer.size()), &position, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Pack(m_comm_tr.csrt.mat + nnz_begin, nn[0], mpi_t,
+                                        buffer.data(), int(buffer.size()), &position, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Pack(m_comm_tr.csrt.col_index + nnz_begin, nn[0],
+                                        mpi_long, buffer.data(), int(buffer.size()),
+                                        &position, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Pack(m_comm_tr.csrt.row_offset + row_begin,
+                                        nn[1]+1, mpi_long, buffer.data(),
+                                        int(buffer.size()), &position, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Pack(m_remote_cols_vv[iproc].data(), nn[1],
+                                        mpi_long, buffer.data(), int(buffer.size()),
+                                        &position, mpi_comm));
+                m_comm_tr.send_reqs.push_back(MPI_REQUEST_NULL);
+                BL_MPI_REQUIRE(MPI_Isend(buffer.data(), position, MPI_PACKED,
+                                         iproc, mpi_tag, mpi_comm,
+                                         &m_comm_tr.send_reqs.back()));
+                detail::count_amg_send(position);
             }
+            row_begin += nrows;
         }
     }
 
-    // As a receiver, m_num_neighbors is the number of processes from which
-    // I will receive data.
-
+    m_comm_tr.recv_buffers.reserve(m_num_neighbors);
+    m_comm_tr.recv_reqs.reserve(m_num_neighbors);
     for (int irecv = 0; irecv < m_num_neighbors; ++irecv) {
         MPI_Status mpi_status;
         BL_MPI_REQUIRE(MPI_Probe(MPI_ANY_SOURCE, mpi_tag, mpi_comm, &mpi_status));
-        int sender = mpi_status.MPI_SOURCE;
-        std::array<int,2> nn;
-        BL_MPI_REQUIRE(MPI_Recv(nn.data(), 2, MPI_INT, sender, mpi_tag,
-                                mpi_comm, &mpi_status));
-        m_comm_tr.recv_from.push_back(sender);
-        m_comm_tr.recv_counts.push_back(nn);
-        m_comm_tr.total_counts_recv[0] += nn[0];
-        m_comm_tr.total_counts_recv[1] += nn[1];
-    }
-
-    if (! mpi_requests.empty()) {
-        Vector<MPI_Status> mpi_statuses(mpi_requests.size());
-        BL_MPI_REQUIRE(MPI_Waitall(int(mpi_requests.size()), mpi_requests.data(),
-                                   mpi_statuses.data()));
-    }
-
-    auto const mpi_tag_m = ParallelDescriptor::SeqNum();
-    auto const mpi_tag_c = ParallelDescriptor::SeqNum();
-    auto const mpi_tag_r = ParallelDescriptor::SeqNum();
-    auto const mpi_tag_p = ParallelDescriptor::SeqNum();
-
-    // We need to send m_comm_tr.csrt.mat, col_index & row_offset. We also
-    // need to send m_remote_cols_vv, which maps row index (in transposed
-    // matrix) form local to global.
-
-    auto const nrecvs = int(m_comm_tr.recv_from.size());
-    if (nrecvs > 0) {
-        m_comm_tr.recv_buffer_mat = (T*) The_Pinned_Arena()->alloc
-            (sizeof(T) * m_comm_tr.total_counts_recv[0]);
-        m_comm_tr.recv_buffer_col_index = (Long*) The_Pinned_Arena()->alloc
-            (sizeof(Long) * m_comm_tr.total_counts_recv[0]);
-        m_comm_tr.recv_buffer_row_offset = (Long*) The_Pinned_Arena()->alloc
-            (sizeof(Long) * (m_comm_tr.total_counts_recv[1]+nrecvs));
-        m_comm_tr.recv_buffer_idx_map = (Long*) The_Pinned_Arena()->alloc
-            (sizeof(Long) * m_comm_tr.total_counts_recv[1]);
-        m_comm_tr.recv_buffer_offset.push_back({0,0,0,0});
-        m_comm_tr.recv_reqs.resize(4*nrecvs, MPI_REQUEST_NULL);
-        for (int irecv = 0; irecv < nrecvs; ++irecv) {
-            auto [os0, os1, os2, os3] = m_comm_tr.recv_buffer_offset.back();
-            auto [n0, n1] = m_comm_tr.recv_counts[irecv];
-            auto recv_from_rank = m_comm_tr.recv_from[irecv];
-            BL_MPI_REQUIRE(MPI_Irecv(m_comm_tr.recv_buffer_mat + os0,
-                                     n0,
-                                     mpi_t,
-                                     recv_from_rank,
-                                     mpi_tag_m,
-                                     mpi_comm,
-                                     &(m_comm_tr.recv_reqs[irecv*4])));
-            BL_MPI_REQUIRE(MPI_Irecv(m_comm_tr.recv_buffer_col_index + os1,
-                                     n0,
-                                     mpi_long,
-                                     recv_from_rank,
-                                     mpi_tag_c,
-                                     mpi_comm,
-                                     &(m_comm_tr.recv_reqs[irecv*4+1])));
-            BL_MPI_REQUIRE(MPI_Irecv(m_comm_tr.recv_buffer_row_offset + os2,
-                                     n1+1,
-                                     mpi_long,
-                                     recv_from_rank,
-                                     mpi_tag_r,
-                                     mpi_comm,
-                                     &(m_comm_tr.recv_reqs[irecv*4+2])));
-            BL_MPI_REQUIRE(MPI_Irecv(m_comm_tr.recv_buffer_idx_map + os3,
-                                     n1,
-                                     mpi_long,
-                                     recv_from_rank,
-                                     mpi_tag_p,
-                                     mpi_comm,
-                                     &(m_comm_tr.recv_reqs[irecv*4+3])));
-            m_comm_tr.recv_buffer_offset.push_back({os0 + n0,
-                                                    os1 + n0,
-                                                    os2 + n1+1,
-                                                    os3 + n1});
-        }
-    }
-
-    auto const nsends = int(m_comm_tr.send_to.size());
-    if (nsends > 0) {
-        m_comm_tr.send_reqs.resize(4*nsends, MPI_REQUEST_NULL);
-        Long os0 = 0, os1 = 0;
-        for (int isend = 0; isend < nsends; ++isend) {
-            auto [n0, n1] = m_comm_tr.send_counts[isend];
-            auto send_to_rank = m_comm_tr.send_to[isend];
-            BL_MPI_REQUIRE(MPI_Isend(m_comm_tr.csrt.mat + os0,
-                                     n0,
-                                     mpi_t,
-                                     send_to_rank,
-                                     mpi_tag_m,
-                                     mpi_comm,
-                                     &(m_comm_tr.send_reqs[isend*4])));
-            BL_MPI_REQUIRE(MPI_Isend(m_comm_tr.csrt.col_index + os0,
-                                     n0,
-                                     mpi_long,
-                                     send_to_rank,
-                                     mpi_tag_c,
-                                     mpi_comm,
-                                     &(m_comm_tr.send_reqs[isend*4+1])));
-            BL_MPI_REQUIRE(MPI_Isend(m_comm_tr.csrt.row_offset + os1,
-                                     n1+1,
-                                     mpi_long,
-                                     send_to_rank,
-                                     mpi_tag_r,
-                                     mpi_comm,
-                                     &(m_comm_tr.send_reqs[isend*4+2])));
-            BL_MPI_REQUIRE(MPI_Isend(m_remote_cols_vv[send_to_rank].data(),
-                                     n1,
-                                     mpi_long,
-                                     send_to_rank,
-                                     mpi_tag_p,
-                                     mpi_comm,
-                                     &(m_comm_tr.send_reqs[isend*4+3])));
-            os0 += n0;
-            os1 += n1;
-        }
+        int count;
+        BL_MPI_REQUIRE(MPI_Get_count(&mpi_status, MPI_PACKED, &count));
+        AMREX_ALWAYS_ASSERT(count > 0);
+        m_comm_tr.recv_from.push_back(mpi_status.MPI_SOURCE);
+        auto& buffer = m_comm_tr.recv_buffers.emplace_back(std::size_t(count));
+        m_comm_tr.recv_reqs.push_back(MPI_REQUEST_NULL);
+        BL_MPI_REQUIRE(MPI_Irecv(buffer.data(), count, MPI_PACKED,
+                                 mpi_status.MPI_SOURCE, mpi_tag, mpi_comm,
+                                 &m_comm_tr.recv_reqs.back()));
     }
 #else
     amrex::ignore_unused(col_partition);
@@ -1662,6 +1887,57 @@ void SpMatrix<T,Allocator>::comm_tr_recv_wait ()
         BL_MPI_REQUIRE(MPI_Waitall(int(m_comm_tr.recv_reqs.size()),
                                    m_comm_tr.recv_reqs.data(),
                                    mpi_statuses.data()));
+    }
+
+    auto const mpi_comm = ParallelContext::CommunicatorSub();
+    auto const mpi_long = ParallelDescriptor::Mpi_typemap<Long>::type();
+    auto const mpi_t = ParallelDescriptor::Mpi_typemap<T>::type();
+    int const nrecvs = int(m_comm_tr.recv_buffers.size());
+    m_comm_tr.recv_counts.reserve(nrecvs);
+    for (auto const& buffer : m_comm_tr.recv_buffers) {
+        std::array<int,2> nn;
+        int position = 0;
+        BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                  nn.data(), 2, MPI_INT, mpi_comm));
+        AMREX_ALWAYS_ASSERT(nn[0] > 0 && nn[1] > 0);
+        m_comm_tr.recv_counts.push_back(nn);
+        m_comm_tr.total_counts_recv[0] += nn[0];
+        m_comm_tr.total_counts_recv[1] += nn[1];
+    }
+    if (nrecvs > 0) {
+        m_comm_tr.recv_buffer_mat = (T*) The_Pinned_Arena()->alloc
+            (sizeof(T) * m_comm_tr.total_counts_recv[0]);
+        m_comm_tr.recv_buffer_col_index = (Long*) The_Pinned_Arena()->alloc
+            (sizeof(Long) * m_comm_tr.total_counts_recv[0]);
+        m_comm_tr.recv_buffer_row_offset = (Long*) The_Pinned_Arena()->alloc
+            (sizeof(Long) * (m_comm_tr.total_counts_recv[1]+nrecvs));
+        m_comm_tr.recv_buffer_idx_map = (Long*) The_Pinned_Arena()->alloc
+            (sizeof(Long) * m_comm_tr.total_counts_recv[1]);
+        m_comm_tr.recv_buffer_offset.push_back({0,0,0,0});
+        for (int irecv = 0; irecv < nrecvs; ++irecv) {
+            auto const& buffer = m_comm_tr.recv_buffers[irecv];
+            auto [os0, os1, os2, os3] = m_comm_tr.recv_buffer_offset.back();
+            auto [n0, n1] = m_comm_tr.recv_counts[irecv];
+            std::array<int,2> nn;
+            int position = 0;
+            BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                      nn.data(), 2, MPI_INT, mpi_comm));
+            BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                      m_comm_tr.recv_buffer_mat + os0, n0,
+                                      mpi_t, mpi_comm));
+            BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                      m_comm_tr.recv_buffer_col_index + os1, n0,
+                                      mpi_long, mpi_comm));
+            BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                      m_comm_tr.recv_buffer_row_offset + os2, n1+1,
+                                      mpi_long, mpi_comm));
+            BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), int(buffer.size()), &position,
+                                      m_comm_tr.recv_buffer_idx_map + os3, n1,
+                                      mpi_long, mpi_comm));
+            AMREX_ASSERT(position == int(buffer.size()));
+            m_comm_tr.recv_buffer_offset.push_back({os0 + n0, os1 + n0,
+                                                    os2 + n1+1, os3 + n1});
+        }
     }
 }
 
@@ -2212,6 +2488,7 @@ void SpMatrix<T,Allocator>::set_num_neighbors ()
     }
     amrex::Vector<int> reduce_scatter_counts(nprocs,1);
     m_num_neighbors = 0;
+    detail::count_amg_collective();
     BL_MPI_REQUIRE(MPI_Reduce_scatter
                    (connection.data(), &m_num_neighbors, reduce_scatter_counts.data(),
                     mpi_int, MPI_SUM, mpi_comm));
@@ -2249,6 +2526,7 @@ void SpMatrix<T,Allocator>::prepare_comm_mv (AlgPartition const& col_partition)
                                      msg_count,
                                      mpi_long, iproc, mpi_tag, mpi_comm,
                                      &(mpi_requests.back())));
+            detail::count_amg_send(Long(msg_count) * sizeof(Long));
             m_comm_mv.recv_from.push_back(iproc);
             m_comm_mv.recv_counts.push_back(msg_count);
         }
@@ -2492,27 +2770,33 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
 
     Gpu::PinnedVector<Long> h_recv(ext.nrows+1);
     {
+        // Keep MPI's pointer classification away from HIP-pinned allocations.
+        // Retain pinned storage for the asynchronous host/device copies.
+        Vector<Long> mpi_send(h_send.begin(), h_send.begin()+nsend_rows);
+        Vector<Long> mpi_recv(ext.nrows);
         auto const tag = ParallelDescriptor::SeqNum();
         Vector<MPI_Request> reqs;
         reqs.reserve(nrecvs+nsends);
         Long os = 0;
         for (int i = 0; i < nrecvs; ++i) {
             reqs.push_back(MPI_REQUEST_NULL);
-            BL_MPI_REQUIRE(MPI_Irecv(h_recv.data()+os, cm.recv_counts[i], mpi_long,
+            BL_MPI_REQUIRE(MPI_Irecv(mpi_recv.data()+os, cm.recv_counts[i], mpi_long,
                                      cm.recv_from[i], tag, mpi_comm, &reqs.back()));
             os += cm.recv_counts[i];
         }
         os = 0;
         for (int i = 0; i < nsends; ++i) {
             reqs.push_back(MPI_REQUEST_NULL);
-            BL_MPI_REQUIRE(MPI_Isend(h_send.data()+os, cm.send_counts[i], mpi_long,
+            BL_MPI_REQUIRE(MPI_Isend(mpi_send.data()+os, cm.send_counts[i], mpi_long,
                                      cm.send_to[i], tag, mpi_comm, &reqs.back()));
+            detail::count_amg_send(Long(cm.send_counts[i]) * sizeof(Long));
             os += cm.send_counts[i];
         }
         if (! reqs.empty()) {
             Vector<MPI_Status> stats(reqs.size());
             BL_MPI_REQUIRE(MPI_Waitall(int(reqs.size()), reqs.data(), stats.data()));
         }
+        std::copy(mpi_recv.begin(), mpi_recv.end(), h_recv.begin());
     }
 
     // Counts to offsets, in place; per-rank totals.
@@ -2550,26 +2834,33 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
     Gpu::DeviceVector<Long> d_send_off(nsend_rows+1);
     Gpu::copyAsync(Gpu::hostToDevice, h_send.begin(), h_send.end(), d_send_off.begin());
 
-    // Round 2: column indices and values.
-    auto const tag_c = ParallelDescriptor::SeqNum();
-    auto const tag_m = ParallelDescriptor::SeqNum();
+    // Round 2: column indices and values in one packed message per peer.
+    auto const tag = ParallelDescriptor::SeqNum();
+
+    auto packed_size = [&] (int n) {
+        int col_size, mat_size;
+        BL_MPI_REQUIRE(MPI_Pack_size(n, mpi_long, mpi_comm, &col_size));
+        BL_MPI_REQUIRE(MPI_Pack_size(n, mpi_t, mpi_comm, &mat_size));
+        if (Long(col_size) + mat_size > std::numeric_limits<int>::max()) {
+            amrex::Abort("SpMatrix::fetch_remote_rows_mm: packed message exceeds MPI int count range.");
+        }
+        return col_size + mat_size;
+    };
 
     Vector<MPI_Request> rreqs, sreqs;
+    Vector<Vector<char>> recv_buffers(nrecvs), send_buffers(nsends);
     if (ext.nnz > 0) {
         ext.col_index = (Long*)The_Pinned_Arena()->alloc(sizeof(Long)*ext.nnz);
         ext.mat = (T*)The_Comms_Arena()->alloc(sizeof(T)*ext.nnz);
-        rreqs.reserve(2*nrecvs);
-        Long os = 0;
+        rreqs.reserve(nrecvs);
         for (int i = 0; i < nrecvs; ++i) {
             if (recv_nnz[i] > 0) {
                 auto n = int(recv_nnz[i]);
+                auto& buffer = recv_buffers[i];
+                buffer.resize(packed_size(n));
                 rreqs.push_back(MPI_REQUEST_NULL);
-                BL_MPI_REQUIRE(MPI_Irecv(ext.col_index+os, n, mpi_long, cm.recv_from[i],
-                                         tag_c, mpi_comm, &rreqs.back()));
-                rreqs.push_back(MPI_REQUEST_NULL);
-                BL_MPI_REQUIRE(MPI_Irecv(ext.mat+os, n, mpi_t, cm.recv_from[i],
-                                         tag_m, mpi_comm, &rreqs.back()));
-                os += recv_nnz[i];
+                BL_MPI_REQUIRE(MPI_Irecv(buffer.data(), int(buffer.size()), MPI_PACKED,
+                                         cm.recv_from[i], tag, mpi_comm, &rreqs.back()));
             }
         }
     }
@@ -2614,17 +2905,22 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
         });
         Gpu::streamSynchronize();
 
-        sreqs.reserve(2*nsends);
+        sreqs.reserve(nsends);
         Long os = 0;
         for (int i = 0; i < nsends; ++i) {
             if (send_nnz_v[i] > 0) {
                 auto n = int(send_nnz_v[i]);
+                auto& buffer = send_buffers[i];
+                buffer.resize(packed_size(n));
+                int position = 0;
+                BL_MPI_REQUIRE(MPI_Pack(send_col+os, n, mpi_long, buffer.data(),
+                                        int(buffer.size()), &position, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Pack(send_mat+os, n, mpi_t, buffer.data(),
+                                        int(buffer.size()), &position, mpi_comm));
                 sreqs.push_back(MPI_REQUEST_NULL);
-                BL_MPI_REQUIRE(MPI_Isend(send_col+os, n, mpi_long, cm.send_to[i],
-                                         tag_c, mpi_comm, &sreqs.back()));
-                sreqs.push_back(MPI_REQUEST_NULL);
-                BL_MPI_REQUIRE(MPI_Isend(send_mat+os, n, mpi_t, cm.send_to[i],
-                                         tag_m, mpi_comm, &sreqs.back()));
+                BL_MPI_REQUIRE(MPI_Isend(buffer.data(), position, MPI_PACKED,
+                                         cm.send_to[i], tag, mpi_comm, &sreqs.back()));
+                detail::count_amg_send(position);
                 os += send_nnz_v[i];
             }
         }
@@ -2633,6 +2929,22 @@ auto SpMatrix<T,Allocator>::fetch_remote_rows_mm (SpMatrix<T,Allocator> const& B
     if (! rreqs.empty()) {
         Vector<MPI_Status> stats(rreqs.size());
         BL_MPI_REQUIRE(MPI_Waitall(int(rreqs.size()), rreqs.data(), stats.data()));
+        Long os = 0;
+        int ireq = 0;
+        for (int i = 0; i < nrecvs; ++i) {
+            if (recv_nnz[i] > 0) {
+                int count;
+                BL_MPI_REQUIRE(MPI_Get_count(&stats[ireq++], MPI_PACKED, &count));
+                auto const& buffer = recv_buffers[i];
+                int position = 0;
+                auto n = int(recv_nnz[i]);
+                BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), count, &position,
+                                          ext.col_index+os, n, mpi_long, mpi_comm));
+                BL_MPI_REQUIRE(MPI_Unpack(buffer.data(), count, &position,
+                                          ext.mat+os, n, mpi_t, mpi_comm));
+                os += recv_nnz[i];
+            }
+        }
     }
     if (! sreqs.empty()) {
         Vector<MPI_Status> stats(sreqs.size());

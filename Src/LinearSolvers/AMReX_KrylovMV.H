@@ -95,6 +95,11 @@ public:
     //! Dot product between \p vec1 and \p vec2.
     static T dotProduct (VEC const& vec1, VEC const& vec2);
 
+    //! Dot products with one collective reduction for the whole basis.
+    static void dotProducts (VEC const& vec,
+                             Vector<VEC const*> const& basis,
+                             Vector<T>& result);
+
     //! Reset \p lhs to zero.
     static void setToZero (VEC& lhs);
 
@@ -164,6 +169,21 @@ template <template <typename, typename> class S, typename T>
 T KrylovMV<S,T>::dotProduct (VEC const& vec1, VEC const& vec2)
 {
     return amrex::Dot(vec1,vec2);
+}
+
+template <template <typename, typename> class S, typename T>
+void KrylovMV<S,T>::dotProducts (VEC const& vec,
+                                Vector<VEC const*> const& basis,
+                                Vector<T>& result)
+{
+    result.resize(basis.size());
+    for (std::size_t j = 0; j < basis.size(); ++j) {
+        result[j] = amrex::Dot(vec, *basis[j], true);
+    }
+    if (!result.empty()) {
+        ParallelAllReduce::Sum(result.data(), int(result.size()),
+                               ParallelContext::CommunicatorSub());
+    }
 }
 
 template <template <typename, typename> class S, typename T>
