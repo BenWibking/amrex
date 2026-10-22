@@ -8,7 +8,7 @@
 .. _sec:Particles:Particle:
 
 The Particle
-============
+=====
 
 The particle classes can be used by including the header AMReX_Particles.H. The
 most basic particle data structure is the particle itself:
@@ -99,7 +99,7 @@ named methods. For the "extra" real and integer data, you can use the
 
 
 The ParticleContainer
-=====================
+==============
 
 One particle by itself is not very useful. To do real calculations, a
 collection of particles needs to be defined, and the location of the particles
@@ -284,7 +284,7 @@ particles, etc. See the `particle tutorials`_ for examples of this.
 .. _sec:Particles:Initializing:
 
 Initializing Particle Data
-==========================
+===================
 
 In the following code snippet, we demonstrate how to set particle initial
 conditions for both SoA and AoS data. We loop over all the tiles using
@@ -354,7 +354,7 @@ outside their parent grid).
 .. _sec:Particles:Runtime:
 
 Adding particle components at runtime
-=====================================
+==============================
 
 In addition to the components specified as template parameters, you can also
 add additional :cpp:`Real` and :cpp:`int` components at runtime. These components
@@ -407,7 +407,7 @@ are used, :cpp:`DefineAndReturnParticleTile` should be used instead:
 .. _sec:Particles:Iterating:
 
 Iterating over Particles
-========================
+=================
 
 To iterate over the particles on a given level in your container, you can use
 the :cpp:`ParIter` class, which comes in both const and non-const flavors. For
@@ -449,7 +449,7 @@ skipped. You can also access the SoA data using the :math:`ParIter` as follows:
 .. _sec:Particles:Fortran:
 
 Passing particle data into Fortran routines
-===========================================
+====================================
 
 Because the AMReX particle struct is a Plain-Old-Data type, it is interoperable
 with Fortran when the :fortran:`bind(C)` attribute is used. It is therefore
@@ -518,7 +518,7 @@ to `WarpX <https://github.com/BLAST-WarpX/warpx>`_, `Hipace++ <https://github.co
 .. _sec:Particles:Reductions:
 
 Particle Reductions
-===================
+============
 
 AMReX provides functions to compute reductions (sums, minima, maxima, and
 logical and/or) over the particles in a :cpp:`ParticleContainer`, on CPUs and
@@ -625,7 +625,7 @@ points, see ``Tests/Particles/ParticleReduceSIMD``.
 .. _sec:Particles:Interacting:
 
 Interacting with Mesh Data
-==========================
+===================
 
 It is common to want to have the mesh communicate information to the particles
 and vice versa. For example, in Particle-in-Cell calculations, the particles
@@ -730,7 +730,7 @@ mesh refinement, please see the `Electrostatic PIC tutorial <https://github.com/
 .. _sec:Particles:ShortRange:
 
 Short Range Forces
-==================
+===========
 
 In a PIC calculation, the particles don't interact with each other directly;
 they only see each other through the mesh. An alternative use case is particles
@@ -876,7 +876,7 @@ that have their own collision criteria by overloading the virtual
 .. _sec:Particles:IO:
 
 Particle I/O
-============
+=====
 
 AMReX provides routines for writing particle data to disk for analysis,
 visualization, and for checkpoint / restart. The most important methods are the
@@ -900,7 +900,7 @@ will create a plotfile called "plt00000" and write the mesh data in :cpp:`output
 The binary file format is readable by either :cpp:`yt` or :cpp:`ParaView`. See the chapter on :ref:`Chap:Visualization` for more information on visualizing AMReX datasets, including those with particles.
 
 Input parameters
-================
+=========
 
 .. _sec:Particles:parameters:
 
@@ -950,6 +950,11 @@ every particle container, including multiple containers of the same type.
 ``SetUsePrePost`` and ``SetUseUnlink`` override these options for one container
 without changing other containers or the defaults for subsequently constructed
 containers.
+
+Pre/post particle output (``particles.use_prepost=1``) supports pure runtime
+SoA containers. Call ``CheckpointPre`` before writing the checkpoint and
+``CheckpointPost`` afterwards. Counts include valid particles only, including
+when the particle data reside on a GPU.
 
 The following runtime parameters affect the behavior of virtual particles in Nyx.
 
