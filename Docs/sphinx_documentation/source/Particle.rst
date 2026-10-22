@@ -8,7 +8,7 @@
 .. _sec:Particles:Particle:
 
 The Particle
-=====
+============
 
 The particle classes can be used by including the header AMReX_Particles.H. The
 most basic particle data structure is the particle itself:
@@ -99,7 +99,7 @@ named methods. For the "extra" real and integer data, you can use the
 
 
 The ParticleContainer
-==============
+=====================
 
 One particle by itself is not very useful. To do real calculations, a
 collection of particles needs to be defined, and the location of the particles
@@ -284,7 +284,7 @@ particles, etc. See the `particle tutorials`_ for examples of this.
 .. _sec:Particles:Initializing:
 
 Initializing Particle Data
-===================
+==========================
 
 In the following code snippet, we demonstrate how to set particle initial
 conditions for both SoA and AoS data. We loop over all the tiles using
@@ -354,7 +354,7 @@ outside their parent grid).
 .. _sec:Particles:Runtime:
 
 Adding particle components at runtime
-==============================
+=====================================
 
 In addition to the components specified as template parameters, you can also
 add additional :cpp:`Real` and :cpp:`int` components at runtime. These components
@@ -407,7 +407,7 @@ are used, :cpp:`DefineAndReturnParticleTile` should be used instead:
 .. _sec:Particles:Iterating:
 
 Iterating over Particles
-=================
+========================
 
 To iterate over the particles on a given level in your container, you can use
 the :cpp:`ParIter` class, which comes in both const and non-const flavors. For
@@ -449,7 +449,7 @@ skipped. You can also access the SoA data using the :math:`ParIter` as follows:
 .. _sec:Particles:Fortran:
 
 Passing particle data into Fortran routines
-====================================
+===========================================
 
 Because the AMReX particle struct is a Plain-Old-Data type, it is interoperable
 with Fortran when the :fortran:`bind(C)` attribute is used. It is therefore
@@ -518,7 +518,7 @@ to `WarpX <https://github.com/BLAST-WarpX/warpx>`_, `Hipace++ <https://github.co
 .. _sec:Particles:Reductions:
 
 Particle Reductions
-============
+===================
 
 AMReX provides functions to compute reductions (sums, minima, maxima, and
 logical and/or) over the particles in a :cpp:`ParticleContainer`, on CPUs and
@@ -625,7 +625,7 @@ points, see ``Tests/Particles/ParticleReduceSIMD``.
 .. _sec:Particles:Interacting:
 
 Interacting with Mesh Data
-===================
+==========================
 
 It is common to want to have the mesh communicate information to the particles
 and vice versa. For example, in Particle-in-Cell calculations, the particles
@@ -730,7 +730,7 @@ mesh refinement, please see the `Electrostatic PIC tutorial <https://github.com/
 .. _sec:Particles:ShortRange:
 
 Short Range Forces
-===========
+==================
 
 In a PIC calculation, the particles don't interact with each other directly;
 they only see each other through the mesh. An alternative use case is particles
@@ -876,7 +876,7 @@ that have their own collision criteria by overloading the virtual
 .. _sec:Particles:IO:
 
 Particle I/O
-=====
+============
 
 AMReX provides routines for writing particle data to disk for analysis,
 visualization, and for checkpoint / restart. The most important methods are the
@@ -900,7 +900,7 @@ will create a plotfile called "plt00000" and write the mesh data in :cpp:`output
 The binary file format is readable by either :cpp:`yt` or :cpp:`ParaView`. See the chapter on :ref:`Chap:Visualization` for more information on visualizing AMReX datasets, including those with particles.
 
 Input parameters
-=========
+================
 
 .. _sec:Particles:parameters:
 
@@ -979,3 +979,40 @@ The following runtime parameters affect the behavior of virtual particles in Nyx
    variable is an application-specific convention - the particles have 4 extra real comps, but which one is "mass" is up
    to the user. We suggest using an :cpp:`enum` to keep these indices straight; please
    see ``amrex-tutorials/ExampleCodes/Particles/ElectrostaticPIC/ElectrosticParticleContainer.H`` for an example of this.
+
+Initializing runtime SoA particles
+---------------------------------
+
+``ParticleContainerRTSoA<>`` supports ``InitFromAsciiFile``, ``InitRandom``, and
+``InitOnePerCell``. Set the container's memory arena with ``SetArena`` and add
+all runtime components before initialization. The first ``AMREX_SPACEDIM`` real
+components hold positions. ID/CPU values are stored separately from user integer
+components.
+
+For random and one-per-cell initialization, ``ParticleInitData`` contains two
+runtime-sized vectors, ``real_array_data`` and ``int_array_data``. Real defaults
+start at the first component after the positions; integer defaults start at
+component zero. Omitted trailing fields are zero. For example, with two user
+real fields and two integer fields::
+
+    amrex::ParticleContainerRTSoA<>::ParticleInitData data;
+    data.real_array_data = {3.25, -6.5};
+    data.int_array_data = {17, -23};
+    pc.InitRandom(1000, 12345, data);
+
+ASCII initialization reads a particle count followed by records containing
+positions and ``extradata`` user real values. Remaining real fields and all
+integer fields are zero. The I/O rank reads batches of up to 4096 source records
+and distributes the particles to their owning ranks. ``Nrep`` replicates records
+with offsets of the domain length divided by the replication count in each
+direction. Each replication count must be positive.
+
+Both random generation modes populate every runtime field and allocate one ID
+per generated particle. In serialized mode the I/O rank generates positions and
+broadcasts them, and each owner allocates IDs for its accepted particles. In
+parallel mode each rank generates its share before redistribution. IDs and
+positions need not match between the two generation modes.
+
+These initializers append to existing particles and preserve the configured
+component names and arena. The initialization data type and behavior of AoS and
+compile-time SoA containers are unchanged.
