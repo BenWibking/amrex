@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <set>
 #include <utility>
 
 namespace amrex {
@@ -346,7 +347,12 @@ FabArrayBase::CPC::define (const BoxArray& ba_dst, const DistributionMapping& dm
 
         std::vector< std::pair<int,Box> > isects;
 
-        std::vector<IntVect> pshifts = m_period.shiftIntVect(ng_dst);
+        // Reach of the intersections below: src grow + dst grow + |offset|,
+        // plus one in each nodal direction, because a nodal box is one
+        // longer than the periodic length.
+        IntVect const reach = ng_src + ng_dst + ba_dst.ixType().toIntVect()
+            + amrex::max(m_offset, -m_offset);
+        std::vector<IntVect> pshifts = m_period.shiftIntVect(reach);
         for (auto& pit : pshifts) { pit += m_offset; }
 
         auto& send_tags = *m_SndTags;
@@ -829,16 +835,15 @@ FabArrayBase::define_fb_metadata (CommMetaData& cmd, const IntVect& nghost,
             // We need to fix the order so that the send and recv processes match.
             std::sort(cctv.begin(), cctv.end());
 
-            std::vector<CopyComTag> cctv_tags_cross;
-            cctv_tags_cross.reserve(cctv.size());
-
-            for (auto const& tag : cctv)
+            if (cross)
             {
-                const Box& bx = tag.dbox;
-                const IntVect& d2s = tag.sbox.smallEnd() - tag.dbox.smallEnd();
+                std::vector<CopyComTag> cctv_tags_cross;
+                cctv_tags_cross.reserve(cctv.size());
 
-                std::vector<Box> boxes;
-                if (cross) {
+                for (auto const& tag : cctv)
+                {
+                    const Box& bx = tag.dbox;
+                    const IntVect& d2s = tag.sbox.smallEnd() - tag.dbox.smallEnd();
                     const Box& dstvbx = ba[tag.dstIndex];
                     for (int dir = 0; dir < AMREX_SPACEDIM; dir++)
                     {
@@ -847,7 +852,7 @@ FabArrayBase::define_fb_metadata (CommMetaData& cmd, const IntVect& nghost,
                         lo.setBig  (dir, dstvbx.smallEnd(dir) - 1);
                         lo &= bx;
                         if (lo.ok()) {
-                            boxes.push_back(lo);
+                            cctv_tags_cross.emplace_back(lo, lo+d2s, tag.dstIndex, tag.srcIndex);
                         }
 
                         Box hi = dstvbx;
@@ -855,29 +860,18 @@ FabArrayBase::define_fb_metadata (CommMetaData& cmd, const IntVect& nghost,
                         hi.setBig  (dir, dstvbx.bigEnd(dir) + nghost[dir]);
                         hi &= bx;
                         if (hi.ok()) {
-                            boxes.push_back(hi);
-                        }
-                    }
-                } else {
-                    boxes.push_back(bx);
-                }
-
-                if (!boxes.empty())
-                {
-                    for (auto const& cross_box : boxes)
-                    {
-                        if (cross)
-                        {
-                            cctv_tags_cross.emplace_back(cross_box, cross_box+d2s,
-                                                         tag.dstIndex, tag.srcIndex);
+                            cctv_tags_cross.emplace_back(hi, hi+d2s, tag.dstIndex, tag.srcIndex);
                         }
                     }
                 }
-            }
 
-            if (!cctv_tags_cross.empty()) {
                 cctv.swap(cctv_tags_cross);
             }
+        }
+
+        if (cross) {
+            // Ranks sharing only edges or corners have nothing left to exchange.
+            std::erase_if(Tags, [] (auto const& kv) { return kv.second.empty(); });
         }
     }
 }
@@ -1196,7 +1190,10 @@ FabArrayBase::FB::define_sb (const FabArrayBase& fa)
     const IntVect& ngsrc = m_sb_snghost;
 
     std::vector<std::pair<int,Box>> isects;
-    const std::vector<IntVect>& pshifts = m_period.shiftIntVect(amrex::max(ngdst,ngsrc));
+    // Reach of the intersections below: src grow + dst grow, plus one in each
+    // nodal direction, because a nodal box is one longer than the periodic length.
+    const std::vector<IntVect>& pshifts
+        = m_period.shiftIntVect(ngdst + ngsrc + ba.ixType().toIntVect());
 
     // In almost all cases of SumBoundary, the operation is not thread
     // safe. So we will assume it's always thread unsafe, which is the
@@ -1888,9 +1885,10 @@ FabArrayBase::FPinfo::FPinfo (const FabArrayBase& srcfa,
       m_dstbdk   (dstfa.getBDKey()),
       m_dstdomain(dstdomain),
       m_dstng    (dstng),
-      m_coarsener(coarsener.clone())
+      m_coarsener(coarsener.clone()),
+      m_index_space(index_space)
 {
-    amrex::ignore_unused(fdomain,cdomain,index_space);
+    amrex::ignore_unused(fdomain,cdomain);
     BL_PROFILE("FPinfo::FPinfo()");
 
     const BoxArray& srcba = srcfa.boxArray();
@@ -2051,6 +2049,17 @@ FabArrayBase::FPinfo::FPinfo (const FabArrayBase& srcfa,
         fact_crse_patch = std::make_unique<FArrayBoxFactory>();
         fact_fine_patch = std::make_unique<FArrayBoxFactory>();
     }
+
+    keep_crse_patch = std::make_unique<FabArrayBase>(ba_crse_patch, dm_patch, 1, 0);
+    keep_crse_patch->addThisBD();
+    keep_fine_patch = std::make_unique<FabArrayBase>(ba_fine_patch, dm_patch, 1, 0);
+    keep_fine_patch->addThisBD();
+}
+
+FabArrayBase::FPinfo::~FPinfo ()
+{
+    if (keep_crse_patch) { keep_crse_patch->clearThisBD(true); }
+    if (keep_fine_patch) { keep_fine_patch->clearThisBD(true); }
 }
 
 Long
@@ -2092,9 +2101,18 @@ FabArrayBase::TheFPinfo (const FabArrayBase& srcfa,
             it->second->m_dstbdk    == dstkey    &&
             it->second->m_dstdomain == dstdomain &&
             it->second->m_dstng     == dstng     &&
-            it->second->m_dstdomain.ixType() == dstdomain.ixType() &&
-            it->second->m_coarsener->doit(it->second->m_dstdomain) == coarsener.doit(dstdomain))
+            it->second->m_index_space == index_space &&
+            it->second->m_coarsener->equals(coarsener))
         {
+#ifdef AMREX_DEBUG
+            // Catch an interpolater whose CoarseBox depends on instance state.
+            auto const& fpc = *(it->second);
+            for (int i = 0, N = static_cast<int>(fpc.ba_fine_patch.size()); i < N; ++i) {
+                if (coarsener.doit(fpc.ba_fine_patch[i]) != fpc.ba_crse_patch[i]) {
+                    amrex::Abort("FabArrayBase::TheFPinfo: CoarseBox must depend only on the interpolater class and ratio");
+                }
+            }
+#endif
             ++(it->second->m_nuse);
             m_FPinfo_stats.recordUse();
             return *(it->second);
@@ -2129,6 +2147,7 @@ FabArrayBase::flushFPinfo (bool no_assertion) const
     BL_ASSERT(no_assertion || getBDKey() == m_bdkey);
 
     std::vector<FPinfoCacheIter> others;
+    std::vector<FPinfo*> dead;
 
     auto er_it = m_TheFillPatchCache.equal_range(m_bdkey);
 
@@ -2156,13 +2175,43 @@ FabArrayBase::flushFPinfo (bool no_assertion) const
         m_FPinfo_stats.bytes -= it->second->bytes();
 #endif
         m_FPinfo_stats.recordErase(it->second->m_nuse);
-        delete it->second;
+        dead.push_back(it->second);
     }
 
     m_TheFillPatchCache.erase(er_it.first, er_it.second);
 
     for (auto const& it : others) {
         m_TheFillPatchCache.erase(it);
+    }
+
+    // ~FPinfo flushes the patch layouts' caches; erase first so the map is
+    // not modified while the iterators above are in use.
+    for (auto* p : dead) {
+        delete p;
+    }
+}
+
+void
+FabArrayBase::flushFPinfo (const EB2::IndexSpace* ispace)
+{
+    // Trivially destructible flag: safe during static destruction after Finalize.
+    if (!initialized) { return; }
+
+    std::set<FPinfo*> dead;
+    for (auto it = m_TheFillPatchCache.begin(); it != m_TheFillPatchCache.end(); ) {
+        if (it->second->m_index_space == ispace) {
+            dead.insert(it->second);
+            it = m_TheFillPatchCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto* p : dead) {
+#ifdef AMREX_MEM_PROFILING
+        m_FPinfo_stats.bytes -= p->bytes();
+#endif
+        m_FPinfo_stats.recordErase(p->m_nuse);
+        delete p;
     }
 }
 
@@ -2746,6 +2795,44 @@ FabArrayBase::ParForInfo::ParForInfo (const FabArrayBase& fa, const IntVect& ngh
     detail::build_par_for_boxes(m_hp, m_boxes, boxes);
 }
 
+FabArrayBase::ParForInfo::ParForInfo (const FabArrayBase& fa, const IntVect& stride,
+                                      const IntVect& offset)
+    : m_bat(fa.boxArray().transformer()),
+      m_kind(Kind::strided),
+      m_ng(0),
+      m_stride(stride),
+      m_offset(offset)
+{
+    Vector<Box> boxes;
+    m_ncellsmax = 0;
+    for (int K : fa.indexArray) {
+        Box const& b = fa.box(K);
+        boxes.push_back(b.ok() ? detail::strided_box(b, stride, offset) : Box());
+        m_ncellsmax = std::max(m_ncellsmax, boxes.back().numPts());
+    }
+    detail::build_par_for_boxes(m_hp, m_boxes, boxes);
+}
+
+FabArrayBase::ParForInfo::ParForInfo (const FabArrayBase& fa, RedBlack)
+    : m_bat(fa.boxArray().transformer()),
+      m_kind(Kind::redblack),
+      m_ng(0)
+{
+    const IntVect stride(AMREX_D_DECL(2,1,1));
+    Vector<Box> boxes;
+    m_ncellsmax = 0;
+    for (int K : fa.indexArray) {
+        Box const& b = fa.box(K);
+        for (int parity = 0; parity < 2; ++parity) {
+            const IntVect offset(AMREX_D_DECL(parity,0,0));
+            boxes.push_back(b.ok() ? detail::strided_box(b, stride, offset) : Box());
+            // A launch enumerates the larger of the two lattices.
+            m_ncellsmax = std::max(m_ncellsmax, boxes.back().numPts());
+        }
+    }
+    detail::build_par_for_boxes(m_hp, m_boxes, boxes);
+}
+
 FabArrayBase::ParForInfo::~ParForInfo ()
 {
     detail::destroy_par_for_boxes(m_hp, (char*)m_boxes);
@@ -2758,6 +2845,7 @@ FabArrayBase::getParForInfo (const IntVect& nghost) const
     auto er_it = m_TheParForCache.equal_range(m_bdkey);
     for (auto it = er_it.first; it != er_it.second; ++it) {
         if (it->second->m_bat        == boxArray().transformer() &&
+            it->second->m_kind       == ParForInfo::Kind::full &&
             it->second->m_ng         == nghost)
         {
             return *(it->second);
@@ -2765,6 +2853,46 @@ FabArrayBase::getParForInfo (const IntVect& nghost) const
     }
 
     ParForInfo* new_pfi = new ParForInfo(*this, nghost);
+    m_TheParForCache.insert(er_it.second,
+                            std::multimap<BDKey,ParForInfo*>::value_type(m_bdkey,new_pfi));
+    return *new_pfi;
+}
+
+FabArrayBase::ParForInfo const&
+FabArrayBase::getParForInfo (const IntVect& stride, const IntVect& offset) const
+{
+    AMREX_ASSERT(getBDKey() == m_bdkey);
+    auto er_it = m_TheParForCache.equal_range(m_bdkey);
+    for (auto it = er_it.first; it != er_it.second; ++it) {
+        if (it->second->m_bat        == boxArray().transformer() &&
+            it->second->m_kind       == ParForInfo::Kind::strided &&
+            it->second->m_stride     == stride &&
+            it->second->m_offset     == offset)
+        {
+            return *(it->second);
+        }
+    }
+
+    ParForInfo* new_pfi = new ParForInfo(*this, stride, offset);
+    m_TheParForCache.insert(er_it.second,
+                            std::multimap<BDKey,ParForInfo*>::value_type(m_bdkey,new_pfi));
+    return *new_pfi;
+}
+
+FabArrayBase::ParForInfo const&
+FabArrayBase::getParForInfoRedBlack () const
+{
+    AMREX_ASSERT(getBDKey() == m_bdkey);
+    auto er_it = m_TheParForCache.equal_range(m_bdkey);
+    for (auto it = er_it.first; it != er_it.second; ++it) {
+        if (it->second->m_bat        == boxArray().transformer() &&
+            it->second->m_kind       == ParForInfo::Kind::redblack)
+        {
+            return *(it->second);
+        }
+    }
+
+    ParForInfo* new_pfi = new ParForInfo(*this, ParForInfo::RedBlack{});
     m_TheParForCache.insert(er_it.second,
                             std::multimap<BDKey,ParForInfo*>::value_type(m_bdkey,new_pfi));
     return *new_pfi;

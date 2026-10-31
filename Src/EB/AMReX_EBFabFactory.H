@@ -88,8 +88,8 @@ public:
     [[nodiscard]] const FabArray<EBCellFlagFab>& getMultiEBCellFlagFab () const noexcept
         { return m_ebdc->getMultiEBCellFlagFab(); }
 
-    //! Level set field.
-    [[nodiscard]] const MultiFab& getLevelSet () const noexcept { return m_ebdc->getLevelSet(); }
+    //! Level set field. Not available for a face-centered factory.
+    [[nodiscard]] const MultiFab& getLevelSet () const { return m_ebdc->getLevelSet(); }
 
     //! Volume fraction.
     [[nodiscard]] const MultiFab& getVolFrac () const noexcept { return m_ebdc->getVolFrac(); }
@@ -100,7 +100,7 @@ public:
     //! Boundary centroid.
     [[nodiscard]] const MultiCutFab& getBndryCent () const noexcept { return m_ebdc->getBndryCent(); }
 
-    //! Boundary normals.
+    //! Boundary normal: unit vector in physical space pointing toward the covered part.
     [[nodiscard]] const MultiCutFab& getBndryNormal () const noexcept { return m_ebdc->getBndryNormal(); }
 
     //! Boundary area.
@@ -117,7 +117,14 @@ public:
         return m_ebdc->getFaceCent();
     }
 
-    //! Edge centroids.
+    /**
+     * \brief Edge centroids, normalized by the edge length.
+     *
+     * A cut edge stores the centroid of its fluid part, in [-0.5,0.5]; its
+     * fluid length fraction is 1-2|c|.  An uncut edge stores 1 if it is
+     * fluid and -1 if it is covered.  Check for these values before using
+     * the centroid.
+     */
     [[nodiscard]] Array<const MultiCutFab*,AMREX_SPACEDIM> getEdgeCent () const noexcept {
         return m_ebdc->getEdgeCent();
     }

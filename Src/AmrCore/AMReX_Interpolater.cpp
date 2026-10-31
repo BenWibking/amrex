@@ -27,8 +27,9 @@ namespace amrex {
  *
  * FaceConservativeLinear works in 2D and 3D on cpu and gpu.
  *
- * FaceDivFree works in 2D and 3D on cpu and gpu.
- * The algorithm is restricted to ref ratio of 2.
+ * FaceDivFree works in 2D and 3D on cpu and gpu with a ref ratio of 2 or 4
+ * in each direction. On gpu, a ref ratio other than 2 must run on the
+ * device. In 2D RZ, only a ref ratio of 2 is supported.
  */
 
 //
@@ -883,9 +884,10 @@ CellConservativeLinear::interp (const FArrayBox& crse,
 #endif
 
 #if (AMREX_SPACEDIM == 1)
-    if (crse_geom.IsSPHERICAL()) {
+    if (! crse_geom.IsCartesian()) {
         Real drf = fine_geom.CellSize(0);
         Real rlo = fine_geom.Offset(0);
+        int coord = crse_geom.Coord();
         if (do_linear_limiting) {
             AMREX_HOST_DEVICE_PARALLEL_FOR_3D_FLAG(runon, cslope_bx, i, j, k,
             {
@@ -896,16 +898,16 @@ CellConservativeLinear::interp (const FArrayBox& crse,
             AMREX_HOST_DEVICE_PARALLEL_FOR_4D_FLAG(runon, cslope_bx, ncomp, i, j, k, n,
             {
                 amrex::ignore_unused(j,k);
-                mf_cell_cons_lin_interp_mcslope_sph(i, n, tmp, crsearr, crse_comp, ncomp,
-                                                    cdomain, ratio, bcrp, drf, rlo);
+                mf_cell_cons_lin_interp_mcslope_curv(i, n, tmp, crsearr, crse_comp, ncomp,
+                                                     cdomain, ratio, bcrp, drf, rlo, coord);
             });
         }
 
         AMREX_HOST_DEVICE_PARALLEL_FOR_4D_FLAG(runon, fine_region, ncomp, i, j, k, n,
         {
             amrex::ignore_unused(j,k);
-            mf_cell_cons_lin_interp_sph(i, n, finearr, fine_comp, ctmp,
-                                        crsearr, crse_comp, ncomp, ratio, drf, rlo);
+            mf_cell_cons_lin_interp_curv(i, n, finearr, fine_comp, ctmp,
+                                         crsearr, crse_comp, ncomp, ratio, drf, rlo, coord);
         });
     } else
 #elif (AMREX_SPACEDIM == 2)
@@ -1017,12 +1019,6 @@ CellQuadratic::interp (const FArrayBox& crse,
                        int              /* actual_state */,
                        RunOn            runon)
 {
-#if (AMREX_SPACEDIM == 1)
-    amrex::ignore_unused(crse,crse_comp,fine,fine_comp,ncomp,fine_region,
-                         ratio,crse_geom,fine_geom,bcr,runon);
-    amrex::Abort("1D CellQuadratic::interp not supported");
-#else
-
     BL_PROFILE("CellQuadratic::interp()");
     AMREX_ASSERT(bcr.size() >= ncomp);
 
@@ -1043,11 +1039,13 @@ CellQuadratic::interp (const FArrayBox& crse,
     Box const& cdomain = crse_geom.Domain();
 
     // Set up temporary fab (with elixir, as needed) for coarse grid slopes
-#if (AMREX_SPACEDIM == 2)
+#if (AMREX_SPACEDIM == 1)
+    int nslp = 2; // x, x^2, in that order.
+#elif (AMREX_SPACEDIM == 2)
     int nslp = 5; // x, y, x^2, y^2, xy, in that order.
 #else  /* AMREX_SPACEDIM == 3 */
     int nslp = 9; // x, y, z, x^2, y^2, z^2, xy, xz, yz, in that order.
-#endif /* AMREX_SPACEDIM == 2 */
+#endif
     FArrayBox sfab(cslope_bx, nslp*ncomp);
 
 #ifdef AMREX_USE_GPU
@@ -1076,7 +1074,25 @@ CellQuadratic::interp (const FArrayBox& crse,
                                     cdomain, bcrp);
     });
 
-#if (AMREX_SPACEDIM == 2)
+#if (AMREX_SPACEDIM == 1)
+    if (! crse_geom.IsCartesian()) {
+
+        GeometryData const& cs_geomdata = crse_geom.data();
+        GeometryData const& fn_geomdata = fine_geom.data();
+
+        AMREX_HOST_DEVICE_PARALLEL_FOR_4D_FLAG(runon, target_fine_region, ncomp,
+                                               i, j, k, n,
+        {
+            mf_cell_quadratic_interp_curv(i, j, k, n,
+                                          finearr, fine_comp,
+                                          crsearr, crse_comp,
+                                          cslopearr,
+                                          ratio,
+                                          cs_geomdata, fn_geomdata);
+        });
+
+    } else {
+#elif (AMREX_SPACEDIM == 2)
     if (crse_geom.IsRZ()) {
 
         // Get coarse and fine geometry data.
@@ -1096,7 +1112,7 @@ CellQuadratic::interp (const FArrayBox& crse,
         });
 
     } else { /* crse_geom.IsCartesian() */
-#endif /* AMREX_SPACEDIM == 2 */
+#endif
 
         // No need for fine geometry data if using Cartesian coordinates.
         amrex::ignore_unused(fine_geom);
@@ -1112,11 +1128,9 @@ CellQuadratic::interp (const FArrayBox& crse,
                                      ratio);
         });
 
-#if (AMREX_SPACEDIM == 2)
+#if (AMREX_SPACEDIM <= 2)
     } // geom
-#endif /* AMREX_SPACEDIM == 2 */
-
-#endif /*(AMREX_SPACEDIM == 1)*/
+#endif /* AMREX_SPACEDIM <= 2 */
 }
 
 Box
@@ -1166,9 +1180,9 @@ void
 CellConservativeProtected::protect (const FArrayBox& /*crse*/,
                                     int              /*crse_comp*/,
                                     FArrayBox&       fine,
-                                    int              /*fine_comp*/,
+                                    int              fine_comp,
                                     FArrayBox&       fine_state,
-                                    int              /*state_comp*/,
+                                    int              state_comp,
                                     int              ncomp,
                                     const Box&       fine_region,
                                     const IntVect&   ratio,
@@ -1177,10 +1191,12 @@ CellConservativeProtected::protect (const FArrayBox& /*crse*/,
                                     Vector<BCRec>&   /*bcr*/,
                                     RunOn            runon)
 {
-    AMREX_ALWAYS_ASSERT(ratio.allGT(1));
+    AMREX_ALWAYS_ASSERT(ratio.allGT(1) &&
+                        fine_comp+ncomp <= fine.nComp() &&
+                        state_comp+ncomp <= fine_state.nComp());
 
 #if (AMREX_SPACEDIM == 1)
-    amrex::ignore_unused(fine,fine_state,
+    amrex::ignore_unused(fine,fine_comp,fine_state,state_comp,
                          ncomp,fine_region,ratio,
                          crse_geom,fine_geom,runon);
     amrex::Abort("1D CellConservativeProtected::protect not supported");
@@ -1217,8 +1233,8 @@ CellConservativeProtected::protect (const FArrayBox& /*crse*/,
     const Box& fnbx = fine.box();
 
     // Extract pointers to fab data
-    Array4<Real>       const&   fnarr = fine.array();
-    Array4<Real const> const& fnstarr = fine_state.const_array();
+    Array4<Real>       const&   fnarr = fine.array(fine_comp);
+    Array4<Real const> const& fnstarr = fine_state.const_array(state_comp);
 
     /*
      * Loop over coarse indices.
@@ -1357,6 +1373,7 @@ FaceDivFree::interp_arr (Array<FArrayBox*, AMREX_SPACEDIM> const& crse,
 #if (AMREX_SPACEDIM == 1)
     amrex::ignore_unused(crse,crse_comp,fine,fine_comp,ncomp,fine_region,ratio,
                          solve_mask,fine_geom,runon);
+    amrex::Abort("1D FaceDivFree::interp_arr not supported");
 #else
 
     BL_PROFILE("FaceDivFree::interp_arr()");

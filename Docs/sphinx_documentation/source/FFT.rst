@@ -125,6 +125,18 @@ batch at a given spectral point at once.
             }
         });
 
+The distributed FFT moves data between processes when it switches
+directions. :cpp:`FFT::Info::setCommStrategy` selects how:
+
+- :cpp:`FFT::CommStrategy::automatic` (default): AMReX chooses.
+- :cpp:`FFT::CommStrategy::pointtopoint`: individual messages between
+  pairs of processes.
+- :cpp:`FFT::CommStrategy::alltoallv`: one ``MPI_Alltoallv`` per exchange.
+- :cpp:`FFT::CommStrategy::alltoall`: one ``MPI_Alltoall`` per exchange.
+
+AMReX may use a different method when the requested one does not apply,
+for example on a single process.
+
 .. _sec:FFT:c2c:
 
 FFT::C2C Class
@@ -236,6 +248,10 @@ Neumann boundary in the last dimension. The last dimension is solved with a
 tridiagonal solver that can support non-uniform cell size in the
 z-direction. For most applications, :cpp:`FFT::Poisson` should be used.
 
+The Poisson solvers take an optional :cpp:`FFT::Info` argument, of which
+only the communication strategy set by :cpp:`FFT::Info::setCommStrategy`
+is used.
+
 Similar to :cpp:`FFT::R2C`, the Poisson solvers should be cached for reuse,
 and one might need to use :cpp:`std::unique_ptr<FFT::Poisson<MultiFab>>`
 because there is no default constructor.
@@ -280,6 +296,45 @@ Below is an example of using the solver.
                  rhsx, rhsy, rhsz, alpha, eta); // inputs
 
 Similar to the other FFT classes, the solver should be cached for reuse.
+
+.. _sec:FFT:crossproj:
+
+Cross-Stencil Projection
+========================
+
+:cpp:`FFT::CrossProj` projects a cell-centered velocity field onto fields
+that are divergence free with respect to a node-centered divergence. In 2D,
+the divergence at the node shared by cells :math:`(i,j)`, :math:`(i+1,j)`,
+:math:`(i,j+1)` and :math:`(i+1,j+1)` is
+
+.. math::
+
+  \frac{u_{i+1,j} + u_{i+1,j+1} - u_{i,j} - u_{i,j+1}}{2 \Delta x}
+  + \frac{v_{i,j+1} + v_{i+1,j+1} - v_{i,j} - v_{i+1,j}}{2 \Delta y}.
+
+In 3D, it is computed similarly from the 8 cells surrounding the node. The
+projected velocity has zero divergence at every node, and projecting it
+again leaves it unchanged. The class is available in 2D and 3D, and it
+currently only supports periodic boundary conditions. The domain must have
+at least 2 cells in each direction. The first :cpp:`AMREX_SPACEDIM`
+components of the :cpp:`MultiFab` are the velocity. If the output has ghost
+cells, one layer of them is filled. Below is an example of using
+it.
+
+.. highlight:: c++
+
+::
+
+    Geometry geom(...);   // periodic in all directions
+    MultiFab vel(...);    // cell-centered, AMREX_SPACEDIM components
+    MultiFab vel_proj(...);
+
+    FFT::CrossProj proj(geom);
+    proj.solve(vel_proj, vel); // vel_proj and vel can be the same MultiFab
+
+Similar to the other FFT classes, the object should be cached for reuse.
+In 2D, a multigrid solver with the same interface, :cpp:`GMG::CrossProj`,
+is described in section :ref:`sec:linearsolver:crossproj`.
 
 .. _sec:FFT:rawptr:
 

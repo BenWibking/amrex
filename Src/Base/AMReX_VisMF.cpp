@@ -21,6 +21,25 @@ namespace {
     const char *TheFabOnDiskPrefix = "FabOnDisk:";
 }
 
+#ifdef AMREX_USE_GPU
+namespace {
+    // Min and max over the valid box of every local FAB and component.  Result
+    // nc*L+n is for component n of local FAB L.  This is not inlined because
+    // nvcc does not allow extended lambdas in constructors.
+    Vector<GpuTuple<Real,Real>> device_minmax (const FabArray<FArrayBox>& mf)
+    {
+        auto const& ma = mf.const_arrays();
+        return ParReducePerBoxComp(TypeList<ReduceOpMin,ReduceOpMax>{}, TypeList<Real,Real>{},
+                                   mf, IntVect(0), mf.nComp(),
+        [=] AMREX_GPU_DEVICE (int b, int i, int j, int k, int n) noexcept -> GpuTuple<Real,Real>
+        {
+            Real const x = ma[b](i,j,k,n);
+            return {x, x};
+        });
+    }
+}
+#endif
+
 std::map<std::string, VisMF::PersistentIFStream> VisMF::persistentIFStreams;
 
 int VisMF::verbose(0);
@@ -437,13 +456,13 @@ operator>> (std::istream  &is,
       AMREX_ASSERT(hd.m_ncomp >= 0 && hd.m_ncomp < std::numeric_limits<int>::max());
       hd.m_famin.resize(hd.m_ncomp);
       hd.m_famax.resize(hd.m_ncomp);
-      for(auto famin : hd.m_famin) {
+      for(auto & famin : hd.m_famin) {
         is >> famin >> ch;
         if( ch != ',' ) {
           amrex::Error("Expected a ',' when reading hd.m_famin");
         }
       }
-      for(auto famax : hd.m_famax) {
+      for(auto & famax : hd.m_famax) {
         is >> famax >> ch;
         if( ch != ',' ) {
           amrex::Error("Expected a ',' when reading hd.m_famax");
@@ -718,17 +737,25 @@ VisMF::Header::Header (const FabArray<FArrayBox>& mf,
       m_famin.resize(m_ncomp,  std::numeric_limits<Real>::max());
       m_famax.resize(m_ncomp, -std::numeric_limits<Real>::max());
 
-      for(MFIter mfi(mf); mfi.isValid(); ++mfi) {
-        const int idx = mfi.index();
-        for(int i(0); i < m_ncomp; ++i) {
 #ifdef AMREX_USE_GPU
-            auto mm = (run_on_device) ? mf[mfi].minmax<RunOn::Device>(m_ba[idx],i)
-                                      : mf[mfi].minmax<RunOn::Host  >(m_ba[idx],i);
-#else
-            auto mm = mf[mfi].minmax<RunOn::Host>(m_ba[idx],i);
+      if (run_on_device) {
+        auto const mm = device_minmax(mf);
+        for (int L = 0; L < mf.local_size(); ++L) {
+          for(int i(0); i < m_ncomp; ++i) {
+            m_famin[i] = std::min(m_famin[i], amrex::get<0>(mm[m_ncomp*L+i]));
+            m_famax[i] = std::max(m_famax[i], amrex::get<1>(mm[m_ncomp*L+i]));
+          }
+        }
+      } else
 #endif
-            m_famin[i] = std::min(m_famin[i], mm.first);
-            m_famax[i] = std::max(m_famax[i], mm.second);
+      {
+        for(MFIter mfi(mf); mfi.isValid(); ++mfi) {
+          const int idx = mfi.index();
+          for(int i(0); i < m_ncomp; ++i) {
+              auto mm = mf[mfi].minmax<RunOn::Host>(m_ba[idx],i);
+              m_famin[i] = std::min(m_famin[i], mm.first);
+              m_famax[i] = std::max(m_famax[i], mm.second);
+          }
         }
       }
       ParallelAllReduce::Min(m_famin.dataPtr(), static_cast<int>(m_famin.size()), comm);
@@ -757,30 +784,41 @@ VisMF::Header::CalculateMinMax (const FabArray<FArrayBox>& mf,
         && (mf.arena()->isManaged() || mf.arena()->isDevice());
     amrex::ignore_unused(run_on_device);
 
-#ifdef BL_USE_MPI
     //
     // Calculate m_min and m_max on the CPU owning the fab.
     //
-    for(MFIter mfi(mf); mfi.isValid(); ++mfi) {
-        const int idx = mfi.index();
-
-        m_min[idx].resize(m_ncomp);
-        m_max[idx].resize(m_ncomp);
-
-        BL_ASSERT(mf[mfi].box().contains(m_ba[idx]));
-
-        for(int j(0); j < m_ncomp; ++j) {
 #ifdef AMREX_USE_GPU
-            auto mm = (run_on_device) ? mf[mfi].minmax<RunOn::Device>(m_ba[idx],j)
-                                      : mf[mfi].minmax<RunOn::Host  >(m_ba[idx],j);
-#else
-            auto mm = mf[mfi].minmax<RunOn::Host>(m_ba[idx],j);
+    if (run_on_device) {
+        auto const mm = device_minmax(mf);
+        for (int L = 0; L < mf.local_size(); ++L) {
+            const int idx = mf.IndexArray()[L];
+            m_min[idx].resize(m_ncomp);
+            m_max[idx].resize(m_ncomp);
+            for(int j(0); j < m_ncomp; ++j) {
+                m_min[idx][j] = amrex::get<0>(mm[m_ncomp*L+j]);
+                m_max[idx][j] = amrex::get<1>(mm[m_ncomp*L+j]);
+            }
+        }
+    } else
 #endif
-            m_min[idx][j] = mm.first;
-            m_max[idx][j] = mm.second;
+    {
+        for(MFIter mfi(mf); mfi.isValid(); ++mfi) {
+            const int idx = mfi.index();
+
+            m_min[idx].resize(m_ncomp);
+            m_max[idx].resize(m_ncomp);
+
+            BL_ASSERT(mf[mfi].box().contains(m_ba[idx]));
+
+            for(int j(0); j < m_ncomp; ++j) {
+                auto mm = mf[mfi].minmax<RunOn::Host>(m_ba[idx],j);
+                m_min[idx][j] = mm.first;
+                m_max[idx][j] = mm.second;
+            }
         }
     }
 
+#ifdef BL_USE_MPI
     Vector<int> nmtags(ParallelDescriptor::NProcs(comm), 0);
     Vector<int> offset(ParallelDescriptor::NProcs(comm), 0);
 
@@ -856,26 +894,6 @@ VisMF::Header::CalculateMinMax (const FabArray<FArrayBox>& mf,
 
                 offset[pmap[j]] += 2*m_ncomp;
             }
-        }
-    }
-#else
-    for(MFIter mfi(mf); mfi.isValid(); ++mfi) {
-        const int idx = mfi.index();
-
-        m_min[idx].resize(m_ncomp);
-        m_max[idx].resize(m_ncomp);
-
-        BL_ASSERT(mf[mfi].box().contains(m_ba[idx]));
-
-        for(int j(0); j < m_ncomp; ++j) {
-#ifdef AMREX_USE_GPU
-            auto mm = (run_on_device) ? mf[mfi].minmax<RunOn::Device>(m_ba[idx],j)
-                                      : mf[mfi].minmax<RunOn::Host  >(m_ba[idx],j);
-#else
-            auto mm = mf[mfi].minmax<RunOn::Host>(m_ba[idx],j);
-#endif
-            m_min[idx][j] = mm.first;
-            m_max[idx][j] = mm.second;
         }
     }
 #endif /*BL_USE_MPI*/
@@ -998,14 +1016,18 @@ VisMF::Write (const FabArray<FArrayBox>&    mf,
             && (mf.arena()->isManaged() || mf.arena()->isDevice());
         amrex::ignore_unused(run_on_device);
 
+#ifdef AMREX_USE_GPU
+        Vector<GpuTuple<Real,Real>> dmm;
+        if (run_on_device) { dmm = device_minmax(mf); }
+#endif
         for(MFIter mfi(*the_mf); mfi.isValid(); ++mfi) {
             const int idx(mfi.index());
 
             for(int j(0); j < mf.nComp(); ++j) {
 #ifdef AMREX_USE_GPU
                 if (run_on_device) {
-                    auto mm = mf[mfi].minmax<RunOn::Device>(mf.box(idx),j);
-                    const Real val = (mm.first + mm.second) / 2.0_rt;
+                    auto const& m = dmm[mf.nComp()*mfi.LocalIndex()+j];
+                    const Real val = (amrex::get<0>(m) + amrex::get<1>(m)) / 2.0_rt;
                     the_mf->get(mfi).setComplement<RunOn::Device>(val, mf.box(idx), j, 1);
                 } else
 #endif
@@ -1198,9 +1220,17 @@ VisMF::WriteOnlyHeader (const FabArray<FArrayBox> & mf,
     hdr.m_ncomp = 0;
     hdr.m_ngrow = IntVect{AMREX_D_DECL(0, 0, 0)};
 
-    // FabOnDisk list is uninitialized => initialize it here
+    // Keep the min and max arrays consistent with ncomp = 0 so that the header
+    // we write here can be read back.
+    hdr.m_famin.clear();
+    hdr.m_famax.clear();
+    hdr.m_min.assign(hdr.m_ba.size(), Vector<Real>{});
+    hdr.m_max.assign(hdr.m_ba.size(), Vector<Real>{});
+
+    // FabOnDisk list is uninitialized => initialize it here.  The name must not
+    // contain white space because that is how operator>> tokenizes it.
     for(VisMF::FabOnDisk & fod : hdr.m_fod){
-        fod.m_name = "Not Saved";
+        fod.m_name = "NotSaved";
         fod.m_head = -1;
     }
 
@@ -1673,6 +1703,11 @@ VisMF::Read (FabArray<FArrayBox> &mf,
 
     Vector<int> nRanksPerFile(FileReadChains.size());
     NItemsPerBin(nProcs, nRanksPerFile);
+    // There may be more files than ranks (e.g., restarting on fewer ranks than
+    // the run that wrote the data used).  Every file still needs a reader.
+    for(int & nrpf : nRanksPerFile) {
+      nrpf = std::max(nrpf, 1);
+    }
     int currentFileIndex(0);
 
     for(frcIter = FileReadChains.begin(); frcIter != FileReadChains.end(); ++frcIter) {
@@ -1699,10 +1734,13 @@ VisMF::Read (FabArray<FArrayBox> &mf,
           ++indexFileOrder;
         }
         ++currentRank;
-        currentRank = std::min(currentRank, nProcs - 1);
+        currentRank = currentRank % nProcs;
       }
       ++currentFileIndex;
     }
+
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(indexFileOrder == nBoxes,
+                                     "VisMF::Read: not all boxes are assigned a reader");
 
     DistributionMapping dmFileOrder(std::move(ranksFileOrder));
 
@@ -1751,13 +1789,18 @@ VisMF::Read (FabArray<FArrayBox> &mf,
           readRanks.push_back(*setIter);
         }
 
+        // ---- all ranks must draw the tag here, not just the readers, so that
+        // ---- the tag matches and the tag sequence stays in sync across ranks
+        const int readChainTag = ParallelDescriptor::SeqNum();
+
         if(rfrSet.contains(myProc)) {  // ---- myProc needs to read this file
           const std::string &fileName = rfrIter->first;
           std::string fullFileName(VisMF::DirName(mf_name) + fileName);
           frcIter = FileReadChains.find(fileName);
           BL_ASSERT(frcIter != FileReadChains.end());
           Vector<FabReadLink> &frc = frcIter->second;
-          for(NFilesIter nfi(std::move(fullFileName), std::move(readRanks)); nfi.ReadyToRead(); ++nfi) {
+          for(NFilesIter nfi(std::move(fullFileName), std::move(readRanks), false, readChainTag);
+              nfi.ReadyToRead(); ++nfi) {
 
               // ---- confirm the data is contiguous in the stream
               Long firstOffset(-1);
@@ -2379,10 +2422,16 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
 
     bool strip_ghost = valid_cells_only && mf.nGrowVect() != 0;
 
+    // Note that AsyncWrite always writes in the native format, ignoring fab.format.
+    std::shared_ptr<FABio> fabio(new FABio_binary(FPC::NativeRealDescriptor().clone()));
+
     int64_t total_bytes = 0;
     if (localdata.size() > 1) {
+#ifdef AMREX_USE_GPU
+        Vector<GpuTuple<Real,Real>> dmm;
+        if (run_on_device) { dmm = device_minmax(mf); }
+#endif
         char* pld = (char*)(&(localdata[1]));
-        const FABio& fio = FArrayBox::getFABio();
         for (MFIter mfi(mf); mfi.isValid(); ++mfi)
         {
             std::memcpy(pld, &total_bytes, sizeof(int64_t));
@@ -2394,15 +2443,16 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
             std::stringstream hss;
             FArrayBox valid_fab(bx, ncomp, false);
             FArrayBox const& header_fab = (strip_ghost) ? valid_fab : fab;
-            fio.write_header(hss, header_fab, ncomp);
+            fabio->write_header(hss, header_fab, ncomp);
             total_bytes += static_cast<std::streamoff>(hss.tellp());
             total_bytes += header_fab.size() * whichRD.numBytes();
 
             // compute min and max
             for (int icomp = 0; icomp < ncomp; ++icomp) {
 #ifdef AMREX_USE_GPU
-                auto mm = (run_on_device) ? fab.minmax<RunOn::Device>(bx,icomp)
-                                          : fab.minmax<RunOn::Host  >(bx,icomp);
+                const int m = ncomp*mfi.LocalIndex()+icomp;
+                auto mm = (run_on_device) ? std::make_pair(amrex::get<0>(dmm[m]), amrex::get<1>(dmm[m]))
+                                          : fab.minmax<RunOn::Host>(bx,icomp);
 #else
                 auto mm = fab.minmax<RunOn::Host>(bx,icomp);
 #endif
@@ -2468,8 +2518,6 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
         }
     }
 
-    std::shared_ptr<FABio> fabio(new FABio_binary(FPC::NativeRealDescriptor().clone()));
-
     AsyncOut::Submit([=] ()
     {
         if (myproc == io_proc)
@@ -2496,6 +2544,10 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
                 {
                     int k = -1;
                     do {
+                        if (nbytes_on_rank[rank] < 0) { // First time for this rank
+                            std::memcpy(&(nbytes_on_rank[rank]), pgd, sizeof(int64_t));
+                            pgd += sizeof(int64_t);
+                        }
                         if (lidx < std::ssize(gidx[rank])) {
                             k = gidx[rank][lidx];
                             ++lidx;
@@ -2507,11 +2559,6 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
 
                     hdr->m_min[k].resize(ncomp);
                     hdr->m_max[k].resize(ncomp);
-
-                    if (nbytes_on_rank[rank] < 0) { // First time for this rank
-                        std::memcpy(&(nbytes_on_rank[rank]), pgd, sizeof(int64_t));
-                        pgd += sizeof(int64_t);
-                    }
 
                     int64_t nbytes;
                     std::memcpy(&nbytes, pgd, sizeof(int64_t));

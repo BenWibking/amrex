@@ -34,12 +34,13 @@ namespace amrex
     }
 
     /// \ingroup amrex_utilities
-    //! Return the smallest value. This function was added to AMReX to
-    //! support GPU before `std::min` was constexpr in C++14. `std::min` can
-    //! now be used directly instead.
+    //! Return the smallest value. The arguments are reduced pairwise with the
+    //! two-argument `min` of their type, which is element-wise for types such
+    //! as `IntVect`, `RealVect` and SIMD vectors. The result is returned by
+    //! value, because such element-wise `min` overloads return a temporary.
     template <class T, class ... Ts>
     AMREX_GPU_HOST_DEVICE
-    AMREX_FORCE_INLINE constexpr const T& min (const T& a, const T& b, const Ts& ... c) noexcept
+    AMREX_FORCE_INLINE constexpr T min (const T& a, const T& b, const Ts& ... c) noexcept
     {
         return min(min(a,b),c...);
     }
@@ -56,12 +57,13 @@ namespace amrex
     }
 
     /// \ingroup amrex_utilities
-    //! Return the greatest value. This function was added to AMReX to
-    //! support GPU before `std::max` was constexpr in C++14. `std::max` can
-    //! now be used directly instead.
+    //! Return the greatest value. The arguments are reduced pairwise with the
+    //! two-argument `max` of their type, which is element-wise for types such
+    //! as `IntVect`, `RealVect` and SIMD vectors. The result is returned by
+    //! value, because such element-wise `max` overloads return a temporary.
     template <class T, class ... Ts>
     AMREX_GPU_HOST_DEVICE
-    AMREX_FORCE_INLINE constexpr const T& max (const T& a, const T& b, const Ts& ... c) noexcept
+    AMREX_FORCE_INLINE constexpr T max (const T& a, const T& b, const Ts& ... c) noexcept
     {
         return max(max(a,b),c...);
     }
@@ -113,20 +115,19 @@ namespace amrex
     }
 
     /// \ingroup amrex_utilities
-    //! Return the reference to \p lo if \p v < \p lo; return the reference to
-    //! \p hi if \p hi < \p v; otherwise return the reference to \p v. This
-    //! function was added to AMReX before switching to C++17. `std::clamp`
-    //! can now be used directly instead.
+    //! Return \p lo if \p v < \p lo; return \p hi if \p hi < \p v; otherwise
+    //! return \p v. Returns by value: CUDA 12.6 miscompiles the reference-returning
+    //! version in some EB kernels.
     template <typename T>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-    constexpr const T& Clamp (const T& v, const T& lo, const T& hi)
+    constexpr T Clamp (const T& v, const T& lo, const T& hi)
     {
         if (v < lo) {
-            return lo; // NOLINT(bugprone-return-const-ref-from-parameter)
+            return lo;
         } else if (hi < v) {
-            return hi; // NOLINT(bugprone-return-const-ref-from-parameter)
+            return hi;
         } else {
-            return v; // NOLINT(bugprone-return-const-ref-from-parameter)
+            return v;
         }
     }
 
@@ -141,7 +142,7 @@ namespace amrex
         // Reference: https://en.cppreference.com/w/cpp/types/numeric_limits/epsilon
         // The machine epsilon has to be scaled to the magnitude of the values used
         // and multiplied by the desired precision in ULPs (units in the last place)
-        return std::abs(x-y) <= std::numeric_limits<T>::epsilon() * std::abs(x+y) * ulp
+        return std::abs(x-y) <= std::numeric_limits<T>::epsilon() * std::abs(x+y) * T(ulp)
         // unless the result is subnormal
         || std::abs(x-y) < std::numeric_limits<T>::min();
     }
@@ -177,7 +178,7 @@ namespace amrex
         if (flo == T(0)) { return lo; }
         if (fhi == T(0)) { return hi; }
 
-        AMREX_ASSERT_WITH_MESSAGE(flo * fhi <= T(0),
+        AMREX_ASSERT_WITH_MESSAGE((flo < T(0)) != (fhi < T(0)),
             "Error - calling bisect but lo and hi don't bracket a root.");
 
         T mi = (lo + hi) / T(2);
@@ -189,7 +190,7 @@ namespace amrex
             mi = (lo + hi) / T(2);
             fmi = f(mi);
             if (fmi == T(0)) { break; }
-            fmi*flo < T(0) ? hi = mi : lo = mi;
+            ((fmi < T(0)) != (flo < T(0))) ? hi = mi : lo = mi;
             flo = f(lo);
             fhi = f(hi);
             ++n;
@@ -216,19 +217,19 @@ namespace amrex
      * for the first element which is not less than `v`.
      *
      * \tparam T value type.
-     * \tparam I integral index type.
+     * \tparam Index integral index type.
      * \param d pointer to a sorted array of values.
      * \param lo inclusive lower bound of the search range.
      * \param hi exclusive upper bound of the search range.
      * \param v value to be located.
      * \return an index `i` such that `d[i] <= v < d[i+1]`, with `lo <= i < hi`.
      */
-    template <typename T, std::integral I>
+    template <typename T, std::integral Index>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-    I bisect (T const* d, I lo, I hi, T const& v)
+    Index bisect (T const* d, Index lo, Index hi, T const& v)
     {
         while (hi - lo > 1) {
-            I mid = lo + (hi - lo) / 2;
+            Index mid = lo + (hi - lo) / 2;
             if (v < d[mid]) {
                 hi = mid;
             } else {

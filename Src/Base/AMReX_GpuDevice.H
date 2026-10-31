@@ -42,6 +42,7 @@ using gpuDeviceProp_t = cudaDeviceProp;
         int managedMemory;
         int concurrentManagedAccess;
         int maxParameterSize;
+        int integrated;
     };
 #endif
 }
@@ -197,6 +198,8 @@ public:
     static int maxThreadsPerBlock (int dir) noexcept { return device_prop.maxThreadsDim[dir]; }
     static int maxBlocksPerGrid (int dir) noexcept { return device_prop.maxGridSize[dir]; }
     static std::string deviceName () noexcept { return std::string(device_prop.name); }
+    //! Whether the GPU shares its memory with the host (e.g., an APU)
+    static bool isIntegrated () noexcept { return device_prop.integrated != 0; }
 #endif
 
 #ifdef AMREX_USE_CUDA
@@ -283,6 +286,22 @@ private:
     friend struct ExternalGpuStreamRegion;
 #endif
 };
+
+/**
+ * \brief Select this process's GPU before MPI is initialized.
+ *
+ * GPU-aware MPI may bind to the current GPU in \c MPI_Init. \c amrex::Initialize
+ * calls this function when it initializes MPI. An application that initializes
+ * MPI itself should call it before \c MPI_Init; \c amrex::Initialize then uses
+ * the selected GPU.
+ *
+ * The GPU is chosen from the node-local rank set by the job launcher (e.g.,
+ * \c SLURM_LOCALID). This function does nothing in CPU and SYCL builds, after
+ * MPI is initialized, or if the local rank is unknown.
+ *
+ * \return The selected GPU, or -1 if none was selected.
+ */
+int SelectDeviceBeforeMPIInit ();
 
 // Put these in amrex::Gpu
 

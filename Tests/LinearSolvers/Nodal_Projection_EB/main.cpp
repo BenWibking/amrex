@@ -1,6 +1,9 @@
 #include <AMReX.H>
 #include <AMReX_MultiFabUtil.H>
 #include <AMReX_MLNodeLaplacian.H>
+#ifdef AMREX_USE_HYPRE
+#include <AMReX_HypreMLNodeLap.H>
+#endif
 #include <AMReX_EBMultiFabUtil.H>
 #include <AMReX_EB2.H>
 #include <AMReX_EB2_IF.H>
@@ -43,8 +46,11 @@ int main (int argc, char* argv[])
         int n_cell = 128;
         int max_grid_size = 32;
         int use_hypre  = 0;
+        int use_mlhypre = 0;  // also solve with HypreMLNodeLap and compare with MLMG
+        Real mlhypre_max_diff = -1.0;  // if positive: abort if the velocity correction differs more (relative)
+        Vector<std::string> multigrid_types{"geometric"};
 
-        Real obstacle_radius = 0.10;
+        Real obstacle_radius = Real(0.10);
 
         // read parameters
         {
@@ -54,10 +60,13 @@ int main (int argc, char* argv[])
             pp.query("n_cell", n_cell);
             pp.query("max_grid_size", max_grid_size);
             pp.query("use_hypre", use_hypre);
+            pp.query("use_mlhypre", use_mlhypre);
+            pp.query("mlhypre_max_diff", mlhypre_max_diff);
+            pp.queryarr("multigrid_types", multigrid_types);
         }
 
 #ifndef AMREX_USE_HYPRE
-        if (use_hypre == 1) {
+        if (use_hypre == 1 || use_mlhypre == 1) {
             amrex::Abort("Cant use hypre if we dont build with USE_HYPRE=TRUE");
         }
 #endif
@@ -68,11 +77,15 @@ int main (int argc, char* argv[])
 
         int n_cell_y =   n_cell;
         int n_cell_x = 2*n_cell;
+#if (AMREX_SPACEDIM == 3)
         int n_cell_z =   n_cell/8;
+#endif
 
         Real ylen = 1.0;
-        Real xlen = 2.0 * ylen;
-        Real zlen = ylen / 8.0;
+        Real xlen = Real(2.0) * ylen;
+#if (AMREX_SPACEDIM == 3)
+        Real zlen = ylen / Real(8.0);
+#endif
 
         Geometry geom;
         BoxArray grids;
@@ -94,15 +107,15 @@ int main (int argc, char* argv[])
         int max_coarsening_level = 100;    // typically a huge number so MG coarsens as much as possible
 
         amrex::Vector<amrex::RealArray> obstacle_center = {
-            {AMREX_D_DECL(0.3,0.2,0.5)},
-            {AMREX_D_DECL(0.3,0.5,0.5)},
-            {AMREX_D_DECL(0.3,0.8,0.5)},
-            {AMREX_D_DECL(0.7,0.25,0.5)},
-            {AMREX_D_DECL(0.7,0.60,0.5)},
-            {AMREX_D_DECL(0.7,0.85,0.5)},
-            {AMREX_D_DECL(1.1,0.2,0.5)},
-            {AMREX_D_DECL(1.1,0.5,0.5)},
-            {AMREX_D_DECL(1.1,0.8,0.5)}};
+            {AMREX_D_DECL(Real(0.3),Real(0.2),0.5)},
+            {AMREX_D_DECL(Real(0.3),0.5,0.5)},
+            {AMREX_D_DECL(Real(0.3),Real(0.8),0.5)},
+            {AMREX_D_DECL(Real(0.7),0.25,0.5)},
+            {AMREX_D_DECL(Real(0.7),Real(0.60),0.5)},
+            {AMREX_D_DECL(Real(0.7),Real(0.85),0.5)},
+            {AMREX_D_DECL(Real(1.1),Real(0.2),0.5)},
+            {AMREX_D_DECL(Real(1.1),0.5,0.5)},
+            {AMREX_D_DECL(Real(1.1),Real(0.8),0.5)}};
 
         int direction =  2;
         Real height   = -1.0;  // Putting a negative number for height means it extends beyond the domain
@@ -114,9 +127,9 @@ int main (int argc, char* argv[])
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 0], false),
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 1], false),
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 2], false),
-            EB2::CylinderIF(0.9*obstacle_radius, height, direction, obstacle_center[ 3], false),
-            EB2::CylinderIF(0.9*obstacle_radius, height, direction, obstacle_center[ 4], false),
-            EB2::CylinderIF(0.9*obstacle_radius, height, direction, obstacle_center[ 5], false),
+            EB2::CylinderIF(Real(0.9)*obstacle_radius, height, direction, obstacle_center[ 3], false),
+            EB2::CylinderIF(Real(0.9)*obstacle_radius, height, direction, obstacle_center[ 4], false),
+            EB2::CylinderIF(Real(0.9)*obstacle_radius, height, direction, obstacle_center[ 5], false),
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 6], false),
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 7], false),
             EB2::CylinderIF(    obstacle_radius, height, direction, obstacle_center[ 8], false)};
@@ -250,13 +263,13 @@ int main (int argc, char* argv[])
 
         // Define the relative tolerance
 #ifdef AMREX_USE_FLOAT
-        Real reltol = 2.e-4;
+        Real reltol = Real(2.e-4);
 #else
         Real reltol = 1.e-8;
 #endif
 
         // Define the absolute tolerance; note that this argument is optional
-        Real abstol = 1.e-15;
+        Real abstol = Real(1.e-15);
 
         amrex::Print() << " \n********************************************************************" << '\n';
         amrex::Print() << " Let's project the initial velocity to find " << '\n';
@@ -266,9 +279,14 @@ int main (int argc, char* argv[])
         amrex::Print() << "******************************************************************** \n" << '\n';
 
         //
-        // Solve div( sigma * grad(phi) ) = RHS
+        // Solve div( sigma * grad(phi) ) = RHS, once per multigrid type
         //
-        nodal_solver.solve( {&phi}, {&rhs}, reltol, abstol);
+        for (auto const& mgt : multigrid_types) {
+            amrex::Print() << "\nMultigrid type: " << mgt << "\n";
+            nodal_solver.setMultigridType(amrex::getEnumCaseInsensitive<MultigridType>(mgt));
+            phi.setVal(0.0);
+            nodal_solver.solve( {&phi}, {&rhs}, reltol, abstol);
+        }
 
         amrex::Print() << " \n********************************************************************" << '\n';
         amrex::Print() << " Done solving the equation " << '\n';
@@ -283,10 +301,49 @@ int main (int argc, char* argv[])
         // Get fluxes from solver
         nodal_solver.getFluxes( {&fluxes} );
 
+#ifdef AMREX_USE_HYPRE
+        // The same system solved by HypreMLNodeLap (hypre or AlgMG backend,
+        // hypre_mlnodelap.backend); compare the solution and the velocity
+        // correction -sigma grad(phi) with MLMG's.
+        if (use_mlhypre == 1) {
+            MultiFab phi_h(phi.boxArray(), phi.DistributionMap(), 1, phi.nGrowVect());
+            phi_h.setVal(0.0);
+            HypreMLNodeLap hyp(matrix, "hypre_mlnodelap", mg_verbose);
+            hyp.solve({&phi_h}, {&rhs}, reltol, abstol, 200);
+
+            MultiFab fluxes_h(grids, dmap, AMREX_SPACEDIM, 1, MFInfo(), factory);
+            fluxes_h.setVal(0.0);
+            nodal_solver.getFluxes({&fluxes_h}, {&phi_h});
+
+            MultiFab dphi(phi.boxArray(), phi.DistributionMap(), 1, 0);
+            MultiFab::Copy(dphi, phi_h, 0, 0, 1, 0);
+            MultiFab::Subtract(dphi, phi, 0, 0, 1, 0);
+            MultiFab dflux(grids, dmap, AMREX_SPACEDIM, 0, MFInfo(), factory);
+            MultiFab::Copy(dflux, fluxes_h, 0, 0, AMREX_SPACEDIM, 0);
+            MultiFab::Subtract(dflux, fluxes, 0, 0, AMREX_SPACEDIM, 0);
+            Real fmax = 0.0, dfmax = 0.0;
+            for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+                fmax = std::max(fmax, fluxes.norm0(d));
+                dfmax = std::max(dfmax, dflux.norm0(d));
+            }
+            amrex::Print() << "HypreMLNodeLap vs MLMG: max |dphi| = " << dphi.norm0()
+                           << " (max |phi| = " << phi.norm0() << "), max |d(sigma grad phi)| = "
+                           << dfmax << " (max " << fmax << ")\n";
+            if (mlhypre_max_diff > Real(0.0) && !(dfmax <= mlhypre_max_diff*fmax)) {
+                amrex::Abort("HypreMLNodeLap differs from MLMG by more than mlhypre_max_diff");
+            }
+        }
+#endif
+
         //
         // Apply projection explicitly --  vel = vel - sigma * grad(phi)
         //
         MultiFab::Add( vel, fluxes, 0, 0, AMREX_SPACEDIM, 0);
+
+        // MLMG checks the solve, but not the velocity computed from it.
+        if (vel.contains_nan(0, vel.nComp(), 0)) {
+            amrex::Abort("nodal projection: projected velocity contains NaN");
+        }
 
         amrex::Print() << " ... now done with full projection operation" << '\n';
         amrex::Print() << "******************************************************************** \n" << '\n';
@@ -295,8 +352,8 @@ int main (int argc, char* argv[])
         MultiFab plotfile_mf(grids, dmap, AMREX_SPACEDIM+1, 0, MFInfo(), factory);
 
         // copy processor id into plotfile_mf
-        plotfile_mf.setVal(ParallelDescriptor::MyProc(), 0, 1);
-        plotfile_mf.setVal(ParallelDescriptor::MyProc(), 0, 1);
+        plotfile_mf.setVal(Real(ParallelDescriptor::MyProc()), 0, 1);
+        plotfile_mf.setVal(Real(ParallelDescriptor::MyProc()), 0, 1);
 
         // copy velocity into plotfile
         MultiFab::Copy(plotfile_mf, vel, 0, 1, AMREX_SPACEDIM, 0);

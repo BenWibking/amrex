@@ -37,9 +37,11 @@ public:
      *
      * \param geom Geometry describing the domain and metric information.
      * \param bc   Pair of boundary descriptors (low/high) per coordinate direction.
+     * \param info Only the communication strategy is used.
      */
     Poisson (Geometry const& geom,
-             Array<std::pair<Boundary,Boundary>,AMREX_SPACEDIM> const& bc)
+             Array<std::pair<Boundary,Boundary>,AMREX_SPACEDIM> const& bc,
+             Info const& info = Info{})
         requires (IsFabArray_v<MF>)
         : m_domain_lo(geom.Domain().smallEnd()),
           m_geom(detail::shift_geom(geom)),
@@ -52,9 +54,11 @@ public:
                 && (bc[idim].second == Boundary::periodic);
         }
         if (all_periodic) {
-            m_r2c = std::make_unique<R2C<typename MF::value_type>>(m_geom.Domain());
+            m_r2c = std::make_unique<R2C<typename MF::value_type>>
+                (m_geom.Domain(), make_solver_info(info));
         } else {
-            m_r2x = std::make_unique<R2X<typename MF::value_type>> (m_geom.Domain(), m_bc);
+            m_r2x = std::make_unique<R2X<typename MF::value_type>>
+                (m_geom.Domain(), m_bc, make_solver_info(info));
         }
     }
 
@@ -62,8 +66,9 @@ public:
      * \brief Construct a purely periodic Poisson solver.
      *
      * \param geom Periodic geometry (all directions must be periodic).
+     * \param info Only the communication strategy is used.
      */
-    explicit Poisson (Geometry const& geom)
+    explicit Poisson (Geometry const& geom, Info const& info = Info{})
         requires (IsFabArray_v<MF>)
         : m_domain_lo(geom.Domain().smallEnd()),
           m_geom(detail::shift_geom(geom)),
@@ -72,7 +77,8 @@ public:
                             std::make_pair(Boundary::periodic,Boundary::periodic))}
     {
         if (m_geom.isAllPeriodic()) {
-            m_r2c = std::make_unique<R2C<typename MF::value_type>>(m_geom.Domain());
+            m_r2c = std::make_unique<R2C<typename MF::value_type>>
+                (m_geom.Domain(), make_solver_info(info));
         } else {
             amrex::Abort("FFT::Poisson: wrong BC");
         }
@@ -91,6 +97,10 @@ public:
     void solve (MF& a_soln, MF const& a_rhs);
 
 private:
+    static Info make_solver_info (Info const& info) {
+        return Info{}.setCommStrategy(info.comm_strategy);
+    }
+
     IntVect m_domain_lo;
     Geometry m_geom;
     Array<std::pair<Boundary,Boundary>,AMREX_SPACEDIM> m_bc;
@@ -170,9 +180,11 @@ public:
      *
      * \param geom Geometry describing domain and spacing.
      * \param bc   Boundary descriptors for each direction.
+     * \param a_info Only the communication strategy is used.
      */
     PoissonHybrid (Geometry const& geom,
-                   Array<std::pair<Boundary,Boundary>,AMREX_SPACEDIM> const& bc)
+                   Array<std::pair<Boundary,Boundary>,AMREX_SPACEDIM> const& bc,
+                   Info const& a_info = Info{})
         requires (IsFabArray_v<MF>)
         : m_domain_lo(geom.Domain().smallEnd()),
           m_geom(detail::shift_geom(geom)),
@@ -196,6 +208,7 @@ public:
                             bc[2].second != Boundary::periodic);
         Info info{};
         info.setTwoDMode(true);
+        info.setCommStrategy(a_info.comm_strategy);
         if (m_geom.Domain().length(0) == 1 || m_geom.Domain().length(1) == 1) {
             info.setOneDMode(true);
         }
@@ -344,15 +357,17 @@ void Poisson<MF>::solve (MF& a_soln, MF const& a_rhs)
     auto f = [=] AMREX_GPU_DEVICE (int i, int j, int k, auto& spectral_data)
     {
         amrex::ignore_unused(j,k);
-        AMREX_D_TERM(T a = fac[0]*(i+offset[0]);,
-                     T b = fac[1]*(j+offset[1]);,
-                     T c = fac[2]*(k+offset[2]));
+        AMREX_D_TERM(T a = fac[0]*(T(i)+offset[0]);,
+                     T b = fac[1]*(T(j)+offset[1]);,
+                     T c = fac[2]*(T(k)+offset[2]));
         T k2 = AMREX_D_TERM(dxfac[0]*(std::cos(a)-T(1)),
                            +dxfac[1]*(std::cos(b)-T(1)),
                            +dxfac[2]*(std::cos(c)-T(1)));
-        if (k2 != T(0)) {
-            spectral_data /= k2;
-        }
+        // Select the denominator instead of guarding the division. An
+        // optimizing compiler may speculate a guarded division, and 0/0
+        // for the zero mode then trips amrex.fpe_trap_invalid.
+        T const k2d = (k2 != T(0)) ? k2 : T(1);
+        spectral_data /= k2d;
         spectral_data *= scale;
     };
 
@@ -389,6 +404,7 @@ Info PoissonOpenBC<MF>::make_solver_info (Info const& info)
     Info solver_info;
     solver_info.openbc_padding = info.openbc_padding;
     solver_info.openbc_padding_nfactors = info.openbc_padding_nfactors;
+    solver_info.comm_strategy = info.comm_strategy;
     return solver_info;
 }
 
@@ -412,9 +428,9 @@ void PoissonOpenBC<MF>::define_doit ()
         for (int gx = 0; gx < 2; ++gx) {
         for (int gy = 0; gy < 2; ++gy) {
         for (int gz = 0; gz < 2; ++gz) {
-            auto xg = x + 2*gx*gfac*dx;
-            auto yg = y + 2*gy*gfac*dy;
-            auto zg = z + 2*gz*gfac*dz;
+            auto xg = x + T(2*gx)*gfac*dx;
+            auto yg = y + T(2*gy)*gfac*dy;
+            auto zg = z + T(2*gz)*gfac*dz;
             r += T(1)/std::sqrt(xg*xg+yg*yg+zg*zg);
         }}}
         return fac * r;
@@ -682,16 +698,17 @@ void PoissonHybrid<MF>::solve_z (FA& spmf, TRIA const& tria, TRIC const& tric)
         for (MFIter mfi(spmf,TilingIfNotGPU()); mfi.isValid(); ++mfi)
         {
             auto const& spectral = spmf.array(mfi);
-            auto const& box = mfi.validbox();
+            auto const& box = mfi.tilebox();
             amrex::ParallelFor(box, [=] AMREX_GPU_DEVICE (int i, int j, int k)
             {
-                T a = facx*(i+offset[0]);
-                T b = facy*(j+offset[1]);
+                T a = facx*(T(i)+offset[0]);
+                T b = facy*(T(j)+offset[1]);
                 T k2 = dxfac * (std::cos(a)-T(1))
                     +  dyfac * (std::cos(b)-T(1));
-                if (k2 != T(0)) {
-                    spectral(i,j,k) /= k2;
-                }
+                // Select the denominator instead of guarding the division
+                // (see Poisson::solve): avoids a speculated 0/0.
+                T const k2d = (k2 != T(0)) ? k2 : T(1);
+                spectral(i,j,k) /= k2d;
                 spectral(i,j,k) *= scale;
             });
         }
@@ -725,8 +742,8 @@ void PoissonHybrid<MF>::solve_z (FA& spmf, TRIA const& tria, TRIC const& tric)
 
             amrex::ParallelFor(xybox, [=] AMREX_GPU_DEVICE (int i, int j, int)
             {
-                T a = facx*(i+offset[0]);
-                T b = facy*(j+offset[1]);
+                T a = facx*(T(i)+offset[0]);
+                T b = facy*(T(j)+offset[1]);
                 T k2 = dxfac * (std::cos(a)-T(1))
                     +  dyfac * (std::cos(b)-T(1));
 
@@ -788,8 +805,8 @@ void PoissonHybrid<MF>::solve_z (FA& spmf, TRIA const& tria, TRIC const& tric)
 
             amrex::LoopOnCpu(xybox, [&] (int i, int j, int)
             {
-                T a = facx*(i+offset[0]);
-                T b = facy*(j+offset[1]);
+                T a = facx*(T(i)+offset[0]);
+                T b = facy*(T(j)+offset[1]);
                 T k2 = dxfac * (std::cos(a)-T(1))
                     +  dyfac * (std::cos(b)-T(1));
 

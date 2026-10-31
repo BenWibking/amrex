@@ -328,6 +328,11 @@ public:
                 const Box&          fdomain,
                 const Box&          cdomain,
                 const EB2::IndexSpace* index_space);
+        ~FPinfo ();
+        FPinfo (FPinfo const&) = delete;
+        FPinfo (FPinfo&&) = delete;
+        FPinfo& operator= (FPinfo const&) = delete;
+        FPinfo& operator= (FPinfo&&) = delete;
 
         [[nodiscard]] Long bytes () const;
 
@@ -336,12 +341,17 @@ public:
         DistributionMapping dm_patch;
         std::unique_ptr<FabFactory<FArrayBox> > fact_crse_patch;
         std::unique_ptr<FabFactory<FArrayBox> > fact_fine_patch;
+        //! Keep the patch layouts registered so caches built for the
+        //! temporary patch FabArrays survive between FillPatch calls.
+        std::unique_ptr<FabArrayBase> keep_crse_patch;
+        std::unique_ptr<FabArrayBase> keep_fine_patch;
         //
         BDKey               m_srcbdk;
         BDKey               m_dstbdk;
         Box                 m_dstdomain;
         IntVect             m_dstng;
         std::unique_ptr<BoxConverter> m_coarsener;
+        const EB2::IndexSpace* m_index_space = nullptr;
         //
         Long                m_nuse{0};
     };
@@ -362,6 +372,9 @@ public:
                                     const EB2::IndexSpace*);
 
     void flushFPinfo (bool no_assertion=false) const;
+
+    //! Erase all FillPatch cache entries built with the given EB index space.
+    static void flushFPinfo (const EB2::IndexSpace* ispace);
 
     //
     //! coarse/fine boundary
@@ -763,7 +776,15 @@ public:
     //! For ParallelFor(FabArray)
     struct ParForInfo
     {
+        enum class Kind { full, strided, redblack };
+        struct RedBlack {};
+
+        //! One BoxIndexer per box, grown by nghost.
         ParForInfo (const FabArrayBase& fa, const IntVect& nghost);
+        //! One BoxIndexer per box over the points equal to offset modulo stride.
+        ParForInfo (const FabArrayBase& fa, const IntVect& stride, const IntVect& offset);
+        //! Two BoxIndexers per box: the points with even i, then those with odd i.
+        ParForInfo (const FabArrayBase& fa, RedBlack);
         ~ParForInfo ();
 
         int getNBlocksPerBox (int nthreads) const {
@@ -778,7 +799,10 @@ public:
         void operator= (ParForInfo &&) = delete;
 
         BATransformer m_bat;
+        Kind m_kind = Kind::full;
         IntVect m_ng;
+        IntVect m_stride{1};
+        IntVect m_offset{0};
         Long m_ncellsmax = 0;
         BoxIndexer* m_boxes = nullptr;
         char* m_hp = nullptr;
@@ -790,6 +814,22 @@ public:
      * \param nghost Grow vector describing which halo width will participate in the loop.
      */
     ParForInfo const& getParForInfo (const IntVect& nghost) const;
+
+    /**
+     * \brief Obtain metadata for launching device ParallelFor over the valid
+     * points whose index equals \p offset modulo \p stride.
+     *
+     * Each box gets one BoxIndexer. Its lower corner is the first such point
+     * and its lengths are the numbers of such points.
+     */
+    ParForInfo const& getParForInfo (const IntVect& stride, const IntVect& offset) const;
+
+    /**
+     * \brief Obtain metadata for a red-black ParallelFor over the valid region.
+     *
+     * Each box gets two BoxIndexers, over its points with even i and with odd i.
+     */
+    ParForInfo const& getParForInfoRedBlack () const;
 
     static std::multimap<BDKey,ParForInfo*> m_TheParForCache;
 

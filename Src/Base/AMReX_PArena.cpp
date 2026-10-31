@@ -1,11 +1,5 @@
 #include <AMReX_PArena.H>
 #include <AMReX_GpuDevice.H>
-#include <AMReX_GpuElixir.H>
-#include <AMReX_MemPool.H>
-
-#ifdef AMREX_USE_OMP
-#include <omp.h>
-#endif
 
 namespace amrex {
 
@@ -70,14 +64,6 @@ PArena::alloc (std::size_t nbytes)
         return The_Arena()->alloc(nbytes);
     }
 
-#elif defined(AMREX_USE_OMP)
-
-    if (omp_in_parallel()) {
-        return amrex_mempool_alloc(nbytes);
-    } else {
-        return The_Arena()->alloc(nbytes);
-    }
-
 #else
 
     return The_Arena()->alloc(nbytes);
@@ -102,15 +88,7 @@ PArena::free (void* p)
     } else
 #endif
     {
-        Elixir eli(p, The_Arena());
-    }
-
-#elif defined(AMREX_USE_OMP)
-
-    if (omp_in_parallel()) {
-        amrex_mempool_free(p);
-    } else {
-        The_Arena()->free(p);
+        Gpu::freeAsync(The_Arena(), p);
     }
 
 #else

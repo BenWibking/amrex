@@ -2,6 +2,11 @@
 #include <AMReX_ParmParse.H>
 #include <AMReX_MultiFab.H>
 #include <AMReX_Particles.H>
+#include <AMReX_TracerParticles.H>
+
+#include <cstdio>
+#include <fstream>
+#include <string>
 
 using namespace amrex;
 
@@ -31,9 +36,9 @@ void get_position_unit_cell(Real* r, const IntVect& nppc, int i_part)
                      int iy_part = (i_part % (ny * nz)) % ny;,
                      int iz_part = (i_part % (ny * nz)) / ny;)
 
-        AMREX_D_TERM(r[0] = (0.5+ix_part)/nx;,
-                     r[1] = (0.5+iy_part)/ny;,
-                     r[2] = (0.5+iz_part)/nz;)
+        AMREX_D_TERM(r[0] = (Real(0.5)+Real(ix_part))/Real(nx);,
+                     r[1] = (Real(0.5)+Real(iy_part))/Real(ny);,
+                     r[2] = (Real(0.5)+Real(iz_part))/Real(nz);)
 }
 
 class TestParticleContainer
@@ -99,12 +104,12 @@ public:
                     ParticleType p;
                     p.id()  = ParticleType::NextID();
                     p.cpu() = ParallelDescriptor::MyProc();
-                    p.pos(0) = static_cast<ParticleReal> (plo[0] + ((iv[0] - dom_lo[0]) + r[0])*dx[0]);
+                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (Real(iv[0] - dom_lo[0]) + r[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                    p.pos(1) = static_cast<ParticleReal> (plo[1] + ((iv[1] - dom_lo[1]) + r[1])*dx[1]);
+                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (Real(iv[1] - dom_lo[1]) + r[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                    p.pos(2) = static_cast<ParticleReal> (plo[2] + ((iv[2] - dom_lo[2]) + r[2])*dx[2]);
+                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (Real(iv[2] - dom_lo[2]) + r[2])*dx[2]);
 #endif
 
                     for (int i = 0; i < NSR; ++i) { p.rdata(i) = ParticleReal(p.id()); }
@@ -198,12 +203,12 @@ public:
                     [=] AMREX_GPU_DEVICE (size_t i) noexcept
                     {
                         ParticleType& p = pstruct[i];
-                        p.pos(0) += static_cast<ParticleReal> (move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> (Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> (move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> (Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> (move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> (Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -214,12 +219,12 @@ public:
                     {
                         ParticleType& p = pstruct[i];
 
-                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -278,7 +283,7 @@ public:
                 {
                     for (int j = 0; j < NSR; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < NSI; ++j)
                     {
@@ -286,7 +291,7 @@ public:
                     }
                     for (int j = 0; j < NAR; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < NAI; ++j)
                     {
@@ -294,7 +299,7 @@ public:
                     }
                     for (int j = 0; j < num_rr; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < num_ii; ++j)
                     {
@@ -349,6 +354,71 @@ void get_test_params(TestParams& params, const std::string& prefix)
     pp.query("sort", params.sort);
 }
 
+// Exercise particle routines that communicate internally, from inside a pushed
+// ParallelContext sub-communicator. Each sub-communicator uses a different
+// particle count so that results leaking across sub-communicators are detected.
+void testSubCommInitAndCount (const Geometry& geom, const DistributionMapping& dm,
+                              const BoxArray& ba, int task_me)
+{
+    BL_PROFILE("testSubCommInitAndCount");
+
+    const Long icount = 1000 + 37*task_me;
+    const ULong iseed = 451;
+
+    for (bool serialize : {false, true})
+    {
+        TestParticleContainer pc(geom, dm, ba);
+        TestParticleContainer::ParticleInitData pdata = {{}, {}, {}, {}};
+        pc.InitRandom(icount, iseed, pdata, serialize);
+
+        AMREX_ALWAYS_ASSERT(pc.TotalNumberOfParticles() == icount);
+
+        const auto np_local  = pc.NumberOfParticlesInGrid(0, true, true);
+        const auto np_global = pc.NumberOfParticlesInGrid(0, true, false);
+        AMREX_ALWAYS_ASSERT(np_global.size() == ba.size());
+
+        Long np_sum = 0;
+        for (int i = 0; i < static_cast<int>(np_global.size()); ++i) {
+            np_sum += np_global[i];
+            if (dm[i] == ParallelDescriptor::MyProc()) {
+                AMREX_ALWAYS_ASSERT(np_global[i] == np_local[i]);
+            }
+        }
+        AMREX_ALWAYS_ASSERT(np_sum == icount);
+    }
+
+    {
+        TracerParticleContainer tpc(geom, dm, ba);
+        TracerParticleContainer::ParticleInitData pdata = {{AMREX_D_DECL(0.0, 0.0, 0.0)}, {}, {}, {}};
+        tpc.InitRandom(icount, iseed, pdata, false);
+
+        MultiFab mf(ba, dm, 1, 1);
+        mf.setVal(0.0);
+
+        const std::string basename = "ParallelContextTimestamp_task" + std::to_string(task_me);
+        const int nfiles = std::min(64, ParallelContext::NProcsSub());
+        if (ParallelContext::IOProcessorSub()) {
+            for (int i = 0; i < nfiles; ++i) {
+                std::remove(amrex::Concatenate(basename + '_', i, 2).c_str());
+            }
+        }
+        ParallelDescriptor::Barrier(ParallelContext::CommunicatorSub());
+
+        tpc.Timestamp(basename, mf, 0, 0.0, {});
+
+        ParallelDescriptor::Barrier(ParallelContext::CommunicatorSub());
+        if (ParallelContext::IOProcessorSub()) {
+            Long nlines = 0;
+            for (int i = 0; i < nfiles; ++i) {
+                std::ifstream ifs(amrex::Concatenate(basename + '_', i, 2));
+                std::string line;
+                while (std::getline(ifs, line)) { ++nlines; }
+            }
+            AMREX_ALWAYS_ASSERT(nlines == icount);
+        }
+    }
+}
+
 void testParallelContext ()
 {
     BL_PROFILE("testParallelContext");
@@ -385,8 +455,8 @@ void testParallelContext ()
         RealBox real_box;
         for (int n = 0; n < BL_SPACEDIM; n++)
         {
-            Real physlo = (n == 0) ? task_me*hs[n] : 0.0;
-            Real physhi = (n == 0) ? task_me*hs[n] + hs[n] : params.size[n];
+            Real physlo = (n == 0) ? Real(task_me)*Real(hs[n]) : Real(0.0);
+            Real physhi = (n == 0) ? Real(task_me)*Real(hs[n]) + Real(hs[n]) : Real(params.size[n]);
             real_box.setLo(n, physlo);
             real_box.setHi(n, physhi);
         }
@@ -458,6 +528,8 @@ void testParallelContext ()
                 AMREX_ALWAYS_ASSERT(np_old == pc.TotalNumberOfParticles());
             }
         }
+
+        testSubCommInitAndCount(geom, dm, ba, task_me);
     }
 
     ParallelContext::pop();

@@ -1,6 +1,7 @@
 #ifndef AMREX_EB_TRIGEOMOPS_K_H_
 #define AMREX_EB_TRIGEOMOPS_K_H_
 #include <AMReX_Config.H>
+#include <AMReX_Algorithm.H>
 #include <AMReX_Math.H>
 #include <AMReX_REAL.H>
 
@@ -197,11 +198,24 @@ namespace amrex::tri_geom_ops
             return(all_ok);
         }
         //================================================================================
-        AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE int lineseg_tri_intersect(const Real v1[3], const Real v2[3],
-                const Real t1[3], const Real t2[3], const Real t3[3])
+        //returns 0 if the segment intersects the triangle and 1 otherwise.  if
+        //ambiguous is given, it is set to true when the answer may be wrong
+        //due to roundoff: the segment reaches the triangle's plane where the
+        //line passes within roundoff of an edge or a vertex, or the segment
+        //lies in the plane.  it is left unchanged otherwise.
+        AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE int lineseg_tri_intersect(const Real p1[3], const Real p2[3],
+                const Real q1[3], const Real q2[3], const Real q3[3], bool* ambiguous = nullptr)
         {
             //see plucker coordinates based method
             //https://members.loria.fr/SLazard/ARC-Visi3D/Pant-project/files/Line_Triangle.html
+
+            //the operators below are translation invariant.  putting q1 at the
+            //origin avoids cancellation for geometries far away from the origin.
+            const Real v1[3]={p1[0]-q1[0],p1[1]-q1[1],p1[2]-q1[2]};
+            const Real v2[3]={p2[0]-q1[0],p2[1]-q1[1],p2[2]-q1[2]};
+            const Real t1[3]={Real(0.0),Real(0.0),Real(0.0)};
+            const Real t2[3]={q2[0]-q1[0],q2[1]-q1[1],q2[2]-q1[2]};
+            const Real t3[3]={q3[0]-q1[0],q3[1]-q1[1],q3[2]-q1[2]};
 
             Real S1,S2,S3;
             Real tri_area,area1,area2;
@@ -212,7 +226,20 @@ namespace amrex::tri_geom_ops
             //we are assuming there are no intersections initially
             int no_intersections=1;
 
-            Real eps = std::numeric_limits<Real>::epsilon();
+            //the tolerances must follow the size of the objects, because the
+            //side operators scale as length^3 and the areas as length^2.  one
+            //factor is the triangle's own size, so that a long line segment
+            //does not inflate the tolerance past the triangle's scale.
+            Real len_t=Real(0.0), len_v=Real(0.0);
+            for(int i=0;i<3;i++)
+            {
+                len_t=amrex::max(len_t,std::abs(t2[i]),std::abs(t3[i]));
+                len_v=amrex::max(len_v,std::abs(v1[i]),std::abs(v2[i]));
+            }
+            Real len=amrex::max(len_t,len_v);
+            constexpr Real eps_r = std::numeric_limits<Real>::epsilon();
+            Real eps_area = eps_r*len*len_t;
+            Real eps = eps_area*len;
 
             //coplanar (S1,S2,S3 = 0)
             if(std::abs(S1) < eps && std::abs(S2) < eps && std::abs(S3) < eps)
@@ -227,7 +254,7 @@ namespace amrex::tri_geom_ops
                 area1=(triangle_area(t1,t2,v1)+triangle_area(t2,t3,v1)+triangle_area(t3,t1,v1));
                 area2=(triangle_area(t1,t2,v2)+triangle_area(t2,t3,v2)+triangle_area(t3,t1,v2));
 
-                if( std::abs(area1-tri_area)>eps || std::abs(area2-tri_area)>eps )
+                if( std::abs(area1-tri_area)>eps_area || std::abs(area2-tri_area)>eps_area )
                 {
                     no_intersections = 0;
                 }
@@ -292,6 +319,32 @@ namespace amrex::tri_geom_ops
                 if(ls_s1*ls_s2 > 0)
                 {
                     no_intersections=0;
+                }
+            }
+
+            if(ambiguous)
+            {
+                const Real tol = Real(64.0)*eps;
+                const bool z1 = std::abs(S1) < tol;
+                const bool z2 = std::abs(S2) < tol;
+                const bool z3 = std::abs(S3) < tol;
+                const int nz = int(z1) + int(z2) + int(z3);
+                //near an edge only counts if the line crosses within the edge's span
+                const bool near_edge_or_vertex = (nz >= 2) ||
+                    (z1 && S2*S3 > Real(0.0)) ||
+                    (z2 && S3*S1 > Real(0.0)) ||
+                    (z3 && S1*S2 > Real(0.0));
+                if(near_edge_or_vertex)
+                {
+                    const Real n[3] = {t2[1]*t3[2]-t2[2]*t3[1],
+                                       t2[2]*t3[0]-t2[0]*t3[2],
+                                       t2[0]*t3[1]-t2[1]*t3[0]};
+                    const Real d1 = n[0]*v1[0] + n[1]*v1[1] + n[2]*v1[2];
+                    const Real d2 = n[0]*v2[0] + n[1]*v2[1] + n[2]*v2[2];
+                    const Real tol_d = Real(64.0)*eps_r*len_t*len_t*len;
+                    //both ends strictly on the same side: the segment misses the plane
+                    const bool misses = (d1 > tol_d && d2 > tol_d) || (d1 < -tol_d && d2 < -tol_d);
+                    if(!misses) { *ambiguous = true; }
                 }
             }
 

@@ -1456,8 +1456,8 @@ BaseFab<T>::getVal  (T*             data,
                      int            n,
                      int            numcomp) const noexcept
 {
-    const int loc      = this->domain.index(pos);
-    const Long sz    = this->domain.numPts();
+    const Long loc = this->domain.index(pos);
+    const Long sz  = this->domain.numPts();
 
     AMREX_ASSERT(!(this->dptr == nullptr));
     AMREX_ASSERT(n >= 0 && n + numcomp <= this->nvar);
@@ -1601,9 +1601,11 @@ BaseFab<T>::define ()
     if (this->nvar == 0) { return; }
     AMREX_ASSERT(std::numeric_limits<Long>::max()/this->nvar > this->domain.numPts());
 
-    this->truesize  = this->nvar*this->domain.numPts();
+    // set the members after alloc, which may throw
+    const Long n = this->nvar*this->domain.numPts();
+    this->dptr = static_cast<T*>(this->alloc(n*sizeof(T)));
+    this->truesize  = n;
     this->ptr_owner = true;
-    this->dptr = static_cast<T*>(this->alloc(this->truesize*sizeof(T)));
 #ifdef AMREX_USE_GPU
     this->alloc_stream = Gpu::gpuStream();
 #endif
@@ -1658,7 +1660,14 @@ BaseFab<T>::BaseFab (const BaseFab<T>& rhs, MakeType make_type, int scomp, int n
     {
         this->dptr = nullptr;
         define();
-        this->copy<RunOn::Device>(rhs, this->domain, scomp, this->domain, 0, ncomp);
+#ifdef AMREX_USE_GPU
+        if (Gpu::inLaunchRegion() && arena()->isDeviceAccessible()) {
+            this->copy<RunOn::Device>(rhs, this->domain, scomp, this->domain, 0, ncomp);
+        } else
+#endif
+        {
+            this->copy<RunOn::Host>(rhs, this->domain, scomp, this->domain, 0, ncomp);
+        }
     } else if (make_type == amrex::make_alias) {
         ; // nothing to do
     } else {
@@ -1814,7 +1823,7 @@ BaseFab<T>::elixir () noexcept
         o = this->ptr_owner;
         this->ptr_owner = false;
         if (o && this->dptr) {
-            if (this->nvar > 1) {
+            if (this->nvar > 0) {
                 amrex::update_fab_stats(-this->truesize/this->nvar, -this->truesize, sizeof(T));
             } else {
                 amrex::update_fab_stats(0, -this->truesize, sizeof(T));
@@ -1850,7 +1859,7 @@ BaseFab<T>::clear ()
             this->free(this->dptr);
 #endif
 
-            if (this->nvar > 1) {
+            if (this->nvar > 0) {
                 amrex::update_fab_stats(-this->truesize/this->nvar, -this->truesize, sizeof(T));
             } else {
                 amrex::update_fab_stats(0, -this->truesize, sizeof(T));
@@ -1870,7 +1879,7 @@ BaseFab<T>::release () noexcept
     if (this->dptr && this->ptr_owner) {
         r.reset(this->dptr);
         this->ptr_owner = false;
-        if (this->nvar > 1) {
+        if (this->nvar > 0) {
             amrex::update_fab_stats(-this->truesize/this->nvar, -this->truesize, sizeof(T));
         } else {
             amrex::update_fab_stats(0, -this->truesize, sizeof(T));
@@ -1998,6 +2007,32 @@ BaseFab<T>::abs (const Box& subbox, int comp, int numcomp) noexcept
     });
 }
 
+namespace detail {
+
+// CPU reduction of f(i,j,k,n) over bx and ncomp components with the
+// partial accumulators of Reduce::detail::reduce_row.
+template <typename Op, typename T, typename F>
+AMREX_ATTRIBUTE_FLATTEN_FOR
+T basefab_reduce_cpu (Box const& bx, int ncomp, T const& init, F const& f) noexcept
+{
+    using Tup = GpuTuple<T>;
+    Tup rem{init};
+    Reduce::detail::Lanes<Tup> acc;
+    Reduce::detail::lanes_set<0>(acc, rem);
+    auto const lo = amrex::lbound(bx);
+    auto const hi = amrex::ubound(bx);
+    for (int n = 0; n < ncomp; ++n) {
+    for (int k = lo.z; k <= hi.z; ++k) {
+    for (int j = lo.y; j <= hi.y; ++j) {
+        Reduce::detail::reduce_row<Op>(lo.x, hi.x, acc, rem,
+            [&] (int i) { return Tup{static_cast<T>(f(i,j,k,n))}; });
+    }}}
+    Reduce::detail::lanes_fold<0,Tup,Op>(acc, rem);
+    return amrex::get<0>(rem);
+}
+
+}
+
 template <class T>
 template <RunOn run_on>
 Real
@@ -2031,12 +2066,11 @@ BaseFab<T>::norminfmask (const Box& subbox, const BaseFab<int>& mask,
     } else
 #endif
     {
-        amrex::LoopOnCpu(subbox, ncomp, [=,&r] (int i, int j, int k, int n) noexcept
+        r = detail::basefab_reduce_cpu<ReduceOpMax>(subbox, ncomp, Real(0.0),
+        [=] (int i, int j, int k, int n) noexcept
         {
-            if (m(i,j,k)) {
-                Real t = static_cast<Real>(std::abs(a(i,j,k,n+scomp)));
-                r = amrex::max(r,t);
-            }
+            auto const t = a(i,j,k,n+scomp);
+            return static_cast<Real>(m(i,j,k) ? std::abs(t) : T(0));
         });
     }
     return r;
@@ -2114,20 +2148,22 @@ BaseFab<T>::norm (const Box& subbox, int p, int comp, int numcomp) const
 #endif
     {
         if (p == 0) {
-            amrex::LoopOnCpu(subbox, numcomp, [=,&nrm] (int i, int j, int k, int n) noexcept
+            nrm = detail::basefab_reduce_cpu<ReduceOpMax>(subbox, numcomp, Real(0.0),
+            [=] (int i, int j, int k, int n) noexcept
             {
-                Real t = static_cast<Real>(std::abs(a(i,j,k,n+comp)));
-                nrm = amrex::max(nrm,t);
+                return static_cast<Real>(std::abs(a(i,j,k,n+comp)));
             });
         } else if (p == 1) {
-            amrex::LoopOnCpu(subbox, numcomp, [=,&nrm] (int i, int j, int k, int n) noexcept
+            nrm = detail::basefab_reduce_cpu<ReduceOpSum>(subbox, numcomp, Real(0.0),
+            [=] (int i, int j, int k, int n) noexcept
             {
-                nrm += std::abs(a(i,j,k,n+comp));
+                return static_cast<Real>(std::abs(a(i,j,k,n+comp)));
             });
         } else if (p == 2) {
-            amrex::LoopOnCpu(subbox, numcomp, [=,&nrm] (int i, int j, int k, int n) noexcept
+            nrm = detail::basefab_reduce_cpu<ReduceOpSum>(subbox, numcomp, Real(0.0),
+            [=] (int i, int j, int k, int n) noexcept
             {
-                nrm += a(i,j,k,n+comp)*a(i,j,k,n+comp);
+                return static_cast<Real>(a(i,j,k,n+comp)*a(i,j,k,n+comp));
             });
         } else {
             amrex::Error("BaseFab<T>::norm: wrong p");
@@ -2166,12 +2202,11 @@ BaseFab<T>::min (const Box& subbox, int comp) const noexcept
     } else
 #endif
     {
-        T r = std::numeric_limits<T>::max();
-        amrex::LoopOnCpu(subbox, [=,&r] (int i, int j, int k) noexcept
+        return detail::basefab_reduce_cpu<ReduceOpMin>(subbox, 1, std::numeric_limits<T>::max(),
+        [=] (int i, int j, int k, int) noexcept
         {
-            r = amrex::min(r, a(i,j,k));
+            return a(i,j,k);
         });
-        return r;
     }
 }
 
@@ -2204,12 +2239,11 @@ BaseFab<T>::max (const Box& subbox, int comp) const noexcept
     } else
 #endif
     {
-        T r = std::numeric_limits<T>::lowest();
-        amrex::LoopOnCpu(subbox, [=,&r] (int i, int j, int k) noexcept
+        return detail::basefab_reduce_cpu<ReduceOpMax>(subbox, 1, std::numeric_limits<T>::lowest(),
+        [=] (int i, int j, int k, int) noexcept
         {
-            r = amrex::max(r, a(i,j,k));
+            return a(i,j,k);
         });
-        return r;
     }
 }
 
@@ -2243,15 +2277,19 @@ BaseFab<T>::minmax (const Box& subbox, int comp) const noexcept
     } else
 #endif
     {
-        T rmax = std::numeric_limits<T>::lowest();
-        T rmin = std::numeric_limits<T>::max();
-        amrex::LoopOnCpu(subbox, [=,&rmin,&rmax] (int i, int j, int k) noexcept
-        {
-            auto const x = a(i,j,k);
-            rmin = amrex::min(rmin, x);
-            rmax = amrex::max(rmax, x);
-        });
-        return std::make_pair(rmin,rmax);
+        using MM = GpuTuple<T,T>;
+        MM rem{std::numeric_limits<T>::max(), std::numeric_limits<T>::lowest()};
+        Reduce::detail::Lanes<MM> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        auto const lo = amrex::lbound(subbox);
+        auto const hi = amrex::ubound(subbox);
+        for (int k = lo.z; k <= hi.z; ++k) {
+        for (int j = lo.y; j <= hi.y; ++j) {
+            Reduce::detail::reduce_row<ReduceOpMin,ReduceOpMax>(lo.x, hi.x, acc, rem,
+                [&] (int i) { auto const x = a(i,j,k); return MM{x,x}; });
+        }}
+        Reduce::detail::lanes_fold<0,MM,ReduceOpMin,ReduceOpMax>(acc, rem);
+        return std::make_pair(amrex::get<0>(rem), amrex::get<1>(rem));
     }
 }
 
@@ -2284,12 +2322,11 @@ BaseFab<T>::maxabs (const Box& subbox, int comp) const noexcept
     } else
 #endif
     {
-        T r = 0;
-        amrex::LoopOnCpu(subbox, [=,&r] (int i, int j, int k) noexcept
+        return detail::basefab_reduce_cpu<ReduceOpMax>(subbox, 1, T(0),
+        [=] (int i, int j, int k, int) noexcept
         {
-            r = amrex::max(r, std::abs(a(i,j,k)));
+            return std::abs(a(i,j,k));
         });
-        return r;
     }
 }
 
@@ -2792,9 +2829,10 @@ BaseFab<T>::dot (const Box& xbx, int xcomp,
     } else
 #endif
     {
-        AMREX_LOOP_4D(xbx, numcomp, i, j, k, n,
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(xbx, numcomp, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
-            r += xa(i,j,k,n+xcomp) * ya(i+offset.x,j+offset.y,k+offset.z,n+ycomp);
+            return xa(i,j,k,n+xcomp) * ya(i+offset.x,j+offset.y,k+offset.z,n+ycomp);
         });
     }
 
@@ -2845,10 +2883,11 @@ BaseFab<T>::dotmask (const BaseFab<int>& mask, const Box& xbx, int xcomp,
     } else
 #endif
     {
-        AMREX_LOOP_4D(xbx, numcomp, i, j, k, n,
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(xbx, numcomp, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
             int m = static_cast<int>(static_cast<bool>(ma(i,j,k)));
-            r += xa(i,j,k,n+xcomp) * ya(i+offset.x,j+offset.y,k+offset.z,n+ycomp) * m;
+            return xa(i,j,k,n+xcomp) * ya(i+offset.x,j+offset.y,k+offset.z,n+ycomp) * m;
         });
     }
 
@@ -3061,10 +3100,12 @@ BaseFab<T>::lockAdd (const BaseFab<T>& src, const Box& srcbox, const Box& destbo
         auto const& slo = amrex::lbound(srcbox);
         Dim3 const offset{.x = slo.x-dlo.x, .y = slo.y-dlo.y, .z = slo.z-dlo.z};
 
+        // The lock dimension must be a property of the destination fab, not of
+        // destbox, so that concurrent calls into the same fab use the same locks.
         int planedim;
         int nplanes;
         int plo;
-        if (len.z == 1) {
+        if (amrex::length(this->domain).z == 1) {
             planedim = 1;
             nplanes = len.y;
             plo = dlo.y;
@@ -3888,9 +3929,10 @@ BaseFab<T>::sum (const Box& bx, DestComp dcomp, NumComps ncomp) const noexcept
     } else
 #endif
     {
-        amrex::LoopOnCpu(bx, ncomp.n, [=,&r] (int i, int j, int k, int n) noexcept
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(bx, ncomp.n, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
-            r += a(i,j,k,n+dcomp.i);
+            return a(i,j,k,n+dcomp.i);
         });
     }
 
@@ -3928,9 +3970,10 @@ BaseFab<T>::dot (const BaseFab<T>& src, const Box& bx, SrcComp scomp, DestComp d
     } else
 #endif
     {
-        amrex::LoopOnCpu(bx, ncomp.n, [=,&r] (int i, int j, int k, int n) noexcept
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(bx, ncomp.n, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
-            r += d(i,j,k,n+dcomp.i) * s(i,j,k,n+scomp.i);
+            return d(i,j,k,n+dcomp.i) * s(i,j,k,n+scomp.i);
         });
     }
 
@@ -3974,9 +4017,10 @@ BaseFab<T>::dot (const Box& bx, DestComp dcomp, NumComps ncomp) const noexcept
     } else
 #endif
     {
-        amrex::LoopOnCpu(bx, ncomp.n, [=,&r] (int i, int j, int k, int n) noexcept
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(bx, ncomp.n, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
-            r += a(i,j,k,n+dcomp.i)*a(i,j,k,n+dcomp.i);
+            return a(i,j,k,n+dcomp.i)*a(i,j,k,n+dcomp.i);
         });
     }
 
@@ -4018,10 +4062,11 @@ BaseFab<T>::dotmask (const BaseFab<T>& src, const Box& bx, const BaseFab<int>& m
     } else
 #endif
     {
-        amrex::LoopOnCpu(bx, ncomp.n, [=,&r] (int i, int j, int k, int n) noexcept
+        r = detail::basefab_reduce_cpu<ReduceOpSum>(bx, ncomp.n, T(0),
+        [=] (int i, int j, int k, int n) noexcept
         {
             int mi = static_cast<int>(static_cast<bool>(m(i,j,k)));
-            r += d(i,j,k,n+dcomp.i)*s(i,j,k,n+scomp.i)*mi;
+            return d(i,j,k,n+dcomp.i)*s(i,j,k,n+scomp.i)*mi;
         });
     }
 

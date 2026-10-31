@@ -10,6 +10,12 @@
 #include <cub/cub.cuh> // for Clang
 #endif
 
+#ifdef AMREX_USE_SYCL
+#  include <AMReX_Reduce.H>
+#  include <mkl_version.h>
+#  include <oneapi/mkl/spblas.hpp>
+#endif
+
 #include <algorithm>
 #include <concepts>
 #include <climits>
@@ -28,14 +34,16 @@ namespace amrex {
  * \brief Lightweight non-owning CSR view that can point to host or device buffers.
  *
  * The template parameter \p T controls constness of the value array; the
- * column/row arrays follow suit.
+ * column/row arrays follow suit. \p Index is the type of both the column
+ * indices and the row offsets.
  */
-template <typename T>
+template <typename T, typename Index = Long>
 struct CsrView {
-    using U = std::conditional_t<std::is_const_v<T>, Long const, Long>;
+    using index_type = Index;
+    using CI = std::conditional_t<std::is_const_v<T>, Index const, Index>;
     T* AMREX_RESTRICT mat = nullptr;
-    U* AMREX_RESTRICT col_index = nullptr;
-    U* AMREX_RESTRICT row_offset = nullptr;
+    CI* AMREX_RESTRICT col_index = nullptr;
+    CI* AMREX_RESTRICT row_offset = nullptr;
     Long nnz = 0;
     Long nrows = 0;
 };
@@ -45,12 +53,14 @@ struct CsrView {
  *
  * @tparam T Value type stored in the matrix.
  * @tparam V Vector-like container template (e.g., PODVector, Gpu::DeviceVector).
+ * @tparam Index Index type of both the column indices and the row offsets.
  */
-template <typename T, template <typename> class V>
+template <typename T, template <typename> class V, typename Index = Long>
 struct CSR {
+    using index_type = Index;
     V<T> mat;
-    V<Long> col_index;
-    V<Long> row_offset;
+    V<Index> col_index;
+    V<Index> row_offset;
     Long nnz = 0;
 
     //! Number of logical rows represented by the CSR offset array.
@@ -75,24 +85,24 @@ struct CSR {
     }
 
     //! Mutable view of the underlying buffers.
-    CsrView<T> view () {
-        return CsrView<T>{mat.data(), col_index.data(), row_offset.data(),
-                          nnz, Long(row_offset.size())-1};
+    CsrView<T,Index> view () {
+        return CsrView<T,Index>{mat.data(), col_index.data(), row_offset.data(),
+                                nnz, Long(row_offset.size())-1};
     }
 
     //! Const view of the underlying buffers.
-    [[nodiscard]] CsrView<T const> view () const {
-        return CsrView<T const>{.mat = mat.data(),
-                                .col_index = col_index.data(),
-                                .row_offset = row_offset.data(),
-                                .nnz = nnz,
-                                .nrows = Long(row_offset.size())-1};
+    [[nodiscard]] CsrView<T const,Index> view () const {
+        return CsrView<T const,Index>{.mat = mat.data(),
+                                      .col_index = col_index.data(),
+                                      .row_offset = row_offset.data(),
+                                      .nnz = nnz,
+                                      .nrows = Long(row_offset.size())-1};
     }
 
     //! Convenience alias for view() const.
-    [[nodiscard]] CsrView<T const> const_view () const {
-        return CsrView<T const>{mat.data(), col_index.data(), row_offset.data(),
-                                nnz, Long(row_offset.size())-1};
+    [[nodiscard]] CsrView<T const,Index> const_view () const {
+        return CsrView<T const,Index>{mat.data(), col_index.data(), row_offset.data(),
+                                      nnz, Long(row_offset.size())-1};
     }
 
     /**
@@ -106,7 +116,8 @@ struct CSR {
     void sort_on_host ();
 };
 
-template <typename C, typename T, template<typename> class AD, template<typename> class AS>
+template <typename C, typename T, template<typename> class AD, template<typename> class AS,
+          typename Index>
 requires (std::same_as<C,Gpu::HostToDevice> ||
           std::same_as<C,Gpu::DeviceToHost> ||
           std::same_as<C,Gpu::DeviceToDevice>)
@@ -117,7 +128,7 @@ requires (std::same_as<C,Gpu::HostToDevice> ||
  * \param dst Destination CSR that will be resized and filled.
  * \param src Source CSR whose buffers are copied verbatim.
  */
-void duplicateCSR (C c, CSR<T,AD>& dst, CSR<T,AS> const& src)
+void duplicateCSR (C c, CSR<T,AD,Index>& dst, CSR<T,AS,Index> const& src)
 {
     dst.mat.resize(src.mat.size());
     dst.col_index.resize(src.col_index.size());
@@ -137,17 +148,17 @@ void duplicateCSR (C c, CSR<T,AD>& dst, CSR<T,AS> const& src)
     dst.nnz = src.nnz;
 }
 
-template <typename T, template <typename> class V>
-void CSR<T,V>::sort ()
+template <typename T, template <typename> class V, typename Index>
+void CSR<T,V,Index>::sort ()
 {
     if (nnz <= 0) { return; }
 
 #ifdef AMREX_USE_GPU
 
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
-
     // The function is synchronous. If that is no longer the case, we might
     // need to update SpMatrix::define.
+
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
 
     constexpr int nthreads = 256;
     constexpr int nwarps_per_block = nthreads / Gpu::Device::warp_size;
@@ -158,9 +169,58 @@ void CSR<T,V>::sort ()
     int nblocks = (nr + nwarps_per_block-1) / nwarps_per_block;
     auto const& stream = Gpu::gpuStream();
 
+#else
+
+    AMREX_ALWAYS_ASSERT(nrows() < Long(std::numeric_limits<int>::max()));
+
+    auto nr = int(nrows());
+
+#endif
+
     auto* pmat = mat.data();
     auto* pcol = col_index.data();
     auto* prow = row_offset.data();
+
+    // Short rows (the common case on fine AMG levels): one thread per row,
+    // insertion sort in registers. Longer rows are left to the backend-specific
+    // code below. All kernels skip rows that are already sorted.
+    // The cap keeps the per-thread arrays at ~256 bytes for wide value types.
+    constexpr int SHORT_ROW = std::clamp(int(256/(sizeof(Index)+sizeof(T))), 4, 16);
+    ParallelFor(nr, [=] AMREX_GPU_DEVICE (int r) noexcept
+    {
+        Long const b = prow[r];
+        int const len = int(prow[r+1] - b);
+        if (len <= 1 || len > SHORT_ROW) { return; }
+        Index keys[SHORT_ROW];
+        bool sorted = true;
+        for (int i = 0; i < len; ++i) {
+            keys[i] = pcol[b+i];
+            if (i > 0) { sorted = sorted && (keys[i-1] <= keys[i]); }
+        }
+        if (sorted) { return; }
+        T vals[SHORT_ROW];
+        for (int i = 0; i < len; ++i) {
+            vals[i] = pmat[b+i];
+        }
+        for (int i = 1; i < len; ++i) {
+            Index const k = keys[i];
+            T const v = vals[i];
+            int j = i - 1;
+            while (j >= 0 && keys[j] > k) {
+                keys[j+1] = keys[j];
+                vals[j+1] = vals[j];
+                --j;
+            }
+            keys[j+1] = k;
+            vals[j+1] = v;
+        }
+        for (int i = 0; i < len; ++i) {
+            pcol[b+i] = keys[i];
+            pmat[b+i] = vals[i];
+        }
+    });
+
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
 
     Gpu::Buffer<int> needs_fallback({0});
     auto* d_needs_fallback = needs_fallback.data();
@@ -196,14 +256,14 @@ void CSR<T,V>::sort ()
         if (len <= ITEMS_PER_WARP)
         {
 #if defined(AMREX_USE_CUDA)
-            using WarpSort = cub::WarpMergeSort<Long, ITEMS_PER_THREAD, Gpu::Device::warp_size, T>;
+            using WarpSort = cub::WarpMergeSort<Index, ITEMS_PER_THREAD, Gpu::Device::warp_size, T>;
             __shared__ typename WarpSort::TempStorage temp_storage[nwarps_per_block];
 #elif defined(AMREX_USE_HIP)
-            using WarpSort = rocprim::warp_sort<Long, Gpu::Device::warp_size, T>;
+            using WarpSort = rocprim::warp_sort<Index, Gpu::Device::warp_size, T>;
             __shared__ typename WarpSort::storage_type temp_storage[nwarps_per_block];
 #endif
 
-            Long keys[ITEMS_PER_THREAD];
+            Index keys[ITEMS_PER_THREAD];
             T values[ITEMS_PER_THREAD];
 
             #pragma unroll
@@ -213,7 +273,7 @@ void CSR<T,V>::sort ()
                     keys[i] = pcol[b + idx];
                     values[i] = pmat[b + idx];
                 } else {
-                    keys[i] = std::numeric_limits<Long>::max();
+                    keys[i] = std::numeric_limits<Index>::max();
                     values[i] = T{};
                 }
             }
@@ -221,7 +281,7 @@ void CSR<T,V>::sort ()
             AMREX_HIP_OR_CUDA(
                 WarpSort{}.sort(keys, values, temp_storage[wid]),
                 WarpSort(temp_storage[wid]).Sort(
-                    keys, values, [](Long x, Long y) {return x < y;}));
+                    keys, values, [](Index x, Index y) {return x < y;}));
 
             #pragma unroll
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -242,7 +302,10 @@ void CSR<T,V>::sort ()
 
     if (*h_needs_fallback)
     {
-        V<Long> col_index_out(col_index.size());
+        // The item count of the segmented sort below is 32-bit.
+        AMREX_ALWAYS_ASSERT(nnz < Long(std::numeric_limits<int>::max()));
+
+        V<Index> col_index_out(col_index.size());
         V<T> mat_out(mat.size());
         auto* d_col_out = col_index_out.data();
         auto* d_val_out = mat_out.data();
@@ -253,7 +316,7 @@ void CSR<T,V>::sort ()
                                 rocprim::segmented_radix_sort_pairs,
                                 cub::DeviceSegmentedRadixSort::SortPairs)
                             (nullptr, temp_bytes, pcol, d_col_out, pmat, d_val_out,
-                             nnz, nr, prow, prow+1, 0, int(sizeof(Long)*CHAR_BIT),
+                             nnz, nr, prow, prow+1, 0, int(sizeof(Index)*CHAR_BIT),
                              stream));
 
         auto* d_temp = (void*) The_Arena()->alloc(temp_bytes);
@@ -262,7 +325,7 @@ void CSR<T,V>::sort ()
                                 rocprim::segmented_radix_sort_pairs,
                                 cub::DeviceSegmentedRadixSort::SortPairs)
                             (d_temp, temp_bytes, pcol, d_col_out, pmat, d_val_out,
-                             nnz, nr, prow, prow+1, 0, int(sizeof(Long)*CHAR_BIT),
+                             nnz, nr, prow, prow+1, 0, int(sizeof(Index)*CHAR_BIT),
                              stream));
 
         std::swap(col_index, col_index_out);
@@ -278,12 +341,42 @@ void CSR<T,V>::sort ()
 
 #elif defined(AMREX_USE_SYCL)
 
-    // xxxxx TODO SYCL: Let's not worry about performance for now.
-    CSR<T,Gpu::PinnedVector> h_csr;
-    duplicateCSR(Gpu::deviceToHost, h_csr, *this);
-    Gpu::streamSynchronize();
-    h_csr.sort_on_host();
-    duplicateCSR(Gpu::hostToDevice, *this, h_csr);
+    Gpu::Buffer<int> needs_fallback({0});
+    auto* d_needs_fallback = needs_fallback.data();
+
+    ParallelFor(nr, [=] AMREX_GPU_DEVICE (int r) noexcept
+    {
+        Long const b = prow[r];
+        Long const e = prow[r+1];
+        if (e - b <= SHORT_ROW) { return; }
+        for (Long i = b+1; i < e; ++i) {
+            if (pcol[i-1] > pcol[i]) {
+                Gpu::Atomic::AddNoRet(d_needs_fallback, 1);
+                return;
+            }
+        }
+    });
+
+    auto* h_needs_fallback = needs_fallback.copyToHost();
+
+    if (*h_needs_fallback)
+    {
+        // Longer unsorted rows: let oneMKL sort the whole matrix on the device.
+        Long const ncols = 1 + Long(Reduce::Max<Index>(nnz, pcol));
+        auto& q = Gpu::Device::streamQueue();
+        oneapi::mkl::sparse::matrix_handle_t handle{};
+        oneapi::mkl::sparse::init_matrix_handle(&handle);
+#if defined(INTEL_MKL_VERSION) && (INTEL_MKL_VERSION < 20250300)
+        oneapi::mkl::sparse::set_csr_data(q, handle, Index(nr), Index(ncols),
+                                          oneapi::mkl::index_base::zero, prow, pcol, pmat);
+#else
+        oneapi::mkl::sparse::set_csr_data(q, handle, Index(nr), Index(ncols), Index(nnz),
+                                          oneapi::mkl::index_base::zero, prow, pcol, pmat);
+#endif
+        oneapi::mkl::sparse::sort_matrix(q, handle, {}).wait();
+        oneapi::mkl::sparse::release_matrix_handle(q, &handle).wait();
+    }
+
     Gpu::streamSynchronize();
 
 #endif
@@ -295,8 +388,8 @@ void CSR<T,V>::sort ()
 #endif
 }
 
-template <typename T, template <typename> class V>
-void CSR<T,V>::sort_on_host ()
+template <typename T, template <typename> class V, typename Index>
+void CSR<T,V,Index>::sort_on_host ()
 {
     if (nnz <= 0) { return; }
 
@@ -308,12 +401,12 @@ void CSR<T,V>::sort_on_host ()
 #pragma omp parallel
 #endif
     {
-        V<Long> lcols;
-        V<T   > lvals;
-        V<int > perm;
+        V<Index> lcols;
+        V<T> lvals;
+        V<int> perm;
 
-        Long scols[SMALL];
-        T    svals[SMALL];
+        Index scols[SMALL];
+        T svals[SMALL];
 
 #ifdef AMREX_USE_OMP
 #pragma omp for
@@ -381,6 +474,62 @@ void CSR<T,V>::sort_on_host ()
         }
     }
 }
+
+// CsrIndex is a helper class for cuSPARSE, because many cuSparse functions
+// such as cusparseSpGEMM do not support 64-bit integers.
+template <typename Index, template <typename> class V>
+struct CsrIndex
+{
+    V<Index> col_index;
+    V<Index> row_offset;
+
+    template <typename T, typename J>
+    void copyFrom (CsrView<T,J> const& csr)
+    {
+        AMREX_ALWAYS_ASSERT(csr.nnz < Long(std::numeric_limits<Index>::max()) &&
+                            csr.nrows < Long(std::numeric_limits<Index>::max()));
+
+        col_index.resize(csr.nnz);
+        row_offset.resize(csr.nrows+1);
+
+        auto N = static_cast<Index>(std::max(col_index.size(), row_offset.size()));
+        auto lnnz = static_cast<Index>(col_index.size());
+        auto lnro = static_cast<Index>(row_offset.size());
+        auto* col_dst = col_index.data();
+        auto* row_dst = row_offset.data();
+        auto const* col_src = csr.col_index;
+        auto const* row_src = csr.row_offset;
+        ParallelFor(N, [=] AMREX_GPU_DEVICE (Index i)
+        {
+            if (i < lnnz) { col_dst[i] = static_cast<Index>(col_src[i]); }
+            if (i < lnro) { row_dst[i] = static_cast<Index>(row_src[i]); }
+        });
+    }
+
+    template <typename T, typename J>
+    void copyTo (CsrView<T,J> const& csr) const
+    {
+        static_assert(!std::is_const_v<T>);
+        auto N = static_cast<Index>(std::max(col_index.size(), row_offset.size()));
+        auto lnnz = static_cast<Index>(col_index.size());
+        auto lnro = static_cast<Index>(row_offset.size());
+        auto const* col_src = col_index.data();
+        auto const* row_src = row_offset.data();
+        auto* col_dst = csr.col_index;
+        auto* row_dst = csr.row_offset;
+        ParallelFor(N, [=] AMREX_GPU_DEVICE (Index i)
+        {
+            if (i < lnnz) { col_dst[i] = static_cast<J>(col_src[i]); }
+            if (i < lnro) { row_dst[i] = static_cast<J>(row_src[i]); }
+        });
+    }
+
+    template <typename T, template <typename> class U, typename J>
+    void copyTo (CSR<T,U,J>& csr) const
+    {
+        copyTo(csr.view());
+    }
+};
 
 }
 

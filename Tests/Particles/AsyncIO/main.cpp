@@ -22,6 +22,7 @@ struct TestParams {
   int max_grid_size;
   int nppc;
   int nlevs;
+  int nsteps;
   bool verbose;
 };
 
@@ -43,9 +44,9 @@ void get_position_unit_cell(Real* r, const IntVect& nppc, int i_part)
     int iy_part = (i_part % (ny * nz)) % ny;
     int iz_part = (i_part % (ny * nz)) / ny;
 
-    r[0] = (0.5+ix_part)/nx;
-    r[1] = (0.5+iy_part)/ny;
-    r[2] = (0.5+iz_part)/nz;
+    r[0] = (Real(0.5)+Real(ix_part))/Real(nx);
+    r[1] = (Real(0.5)+Real(iy_part))/Real(ny);
+    r[2] = (Real(0.5)+Real(iz_part))/Real(nz);
 }
 
 class MyParticleContainer
@@ -93,12 +94,12 @@ public:
                     ParticleType p;
                     p.id()  = ParticleType::NextID();
                     p.cpu() = ParallelDescriptor::MyProc();
-                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (iv[0] + r[0])*dx[0]);
+                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (Real(iv[0]) + r[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (iv[1] + r[1])*dx[1]);
+                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (Real(iv[1]) + r[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (iv[2] + r[2])*dx[2]);
+                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (Real(iv[2]) + r[2])*dx[2]);
 #endif
 
                     if constexpr (NSR > 0) {
@@ -256,7 +257,7 @@ void test_async_io(TestParams& parms)
 
     myPC.InitParticles(IntVect(AMREX_D_DECL(2, 2, 2)));
 
-    for (int step = 0; step < 4000; ++step)
+    for (int step = 0; step < parms.nsteps; ++step)
     {
         myPC.AssignDensity(0, partMF, 0, 1, nlevs-1);
 
@@ -264,7 +265,7 @@ void test_async_io(TestParams& parms)
             MultiFab::Copy(*density[lev], *partMF[lev], 0, 0, 1, 0);
         }
 
-        if (step % 1000 == 0) {
+        if (step % std::max(parms.nsteps/4, 1) == 0) {
             Vector<std::string> varnames;
             varnames.push_back("density");
 
@@ -311,6 +312,9 @@ int main(int argc, char* argv[])
   if (parms.nppc < 1 && ParallelDescriptor::IOProcessor()) {
     amrex::Abort("Must specify at least one particle per cell");
   }
+
+  parms.nsteps = 4000;
+  pp.query("nsteps", parms.nsteps);
 
   parms.verbose = false;
   pp.query("verbose", parms.verbose);

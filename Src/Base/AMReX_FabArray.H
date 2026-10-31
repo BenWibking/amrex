@@ -941,9 +941,9 @@ public:
      * \param mem LayoutData whose local entries are incremented by the number
      *            of bytes owned by the corresponding FAB.
      */
-    template <std::integral I>
-    requires (BaseFabType<FAB> && (sizeof(I) >= sizeof(Long)))
-    void capacityOfFabs (LayoutData<I>& mem) const;
+    template <std::integral Int>
+    requires (BaseFabType<FAB> && (sizeof(Int) >= sizeof(Long)))
+    void capacityOfFabs (LayoutData<Int>& mem) const;
 
     /**
     * \brief Returns the sum of component "comp"
@@ -1509,6 +1509,14 @@ public:
      * \param period periodic length if it's non-zero
      */
     void OverrideSync (int scomp, int ncomp, const Periodicity& period);
+    /**
+     * \brief Split-phase version of OverrideSync.
+     *
+     * OverrideSync_nowait starts the synchronization and OverrideSync_finish
+     * completes it.  On GPUs, the two calls must be made within the same
+     * external-stream region (if any), because the temporary storage created
+     * by OverrideSync_nowait is released in a stream-ordered fashion.
+     */
     void OverrideSync_nowait (const Periodicity& period = Periodicity::NonPeriodic());
     void OverrideSync_nowait (int scomp, int ncomp, const Periodicity& period);
     void OverrideSync_finish ();
@@ -1709,7 +1717,7 @@ public:
 
     /**
      * \ingroup amrex_fabarray_communication
-     * \brief Return infinity norm
+     * \brief Return infinity norm.  A NaN counts as infinity.
      *
      * \param comp           starting component
      * \param ncomp          number of components
@@ -1727,7 +1735,7 @@ public:
 
     /**
      * \ingroup amrex_fabarray_communication
-     * \brief Return infinity norm in masked region
+     * \brief Return infinity norm in masked region.  A NaN counts as infinity.
      *
      * \param mask   only mask=true region is included
      * \param comp   starting component
@@ -1749,6 +1757,9 @@ protected:
     DataAllocator m_dallocator;
     std::unique_ptr<detail::SingleChunkArena> m_single_chunk_arena;
     Long m_single_chunk_size = 0;
+
+    //! Free the cached Array4s so that they are rebuilt by the next arrays() call.
+    void clear_arrays ();
 
     //! has define() been called?
     bool define_function_called = false;
@@ -1831,7 +1842,7 @@ private:
     requires (BaseFabType<F>)
     void build_arrays () const;
 
-    void clear_arrays ();
+    void clear_fab_caches ();
 
 #ifdef AMREX_USE_GPU
     std::map<std::uint64_t,
@@ -2119,7 +2130,16 @@ FabArray<FAB>::build_arrays () const
         m_arrays.dp = (A*)m_dp_arrays;
         m_const_arrays.dp = (AC*)m_dp_arrays + n;
         Gpu::htod_memcpy_async(m_dp_arrays, m_hp_arrays, n*2*sizeof(A));
-        if (!Gpu::inNoSyncRegion()) {
+        // The pinned buffer is not modified after this point and is freed
+        // in stream order by clear_arrays(), so kernels launched on the
+        // current stream are correctly ordered after the copy without a
+        // host sync. MFIter and StreamIter synchronize the current stream
+        // before switching to other streams, so we only need to sync here
+        // if we are already inside a multi-stream MFIter loop, where later
+        // iterations may use the arrays on a different stream.
+        if (!Gpu::inNoSyncRegion() && Gpu::numGpuStreams() > 1 &&
+            MFIter::currentDepth() > 0)
+        {
             Gpu::streamSynchronize();
         }
 #endif
@@ -2131,8 +2151,14 @@ void
 FabArray<FAB>::clear_arrays ()
 {
 #ifdef AMREX_USE_GPU
-    The_Pinned_Arena()->free(m_hp_arrays);
-    The_Arena()->free(m_dp_arrays);
+    // The host-to-device copy of the Array4s issued in build_arrays() is
+    // asynchronous and is not synchronized when we are in a NoSync region.
+    // Use stream-ordered frees so that the pinned and device buffers are not
+    // reused before the copy and any kernels using them have completed.
+    if (m_hp_arrays) {
+        Gpu::freeAsync(The_Pinned_Arena(), m_hp_arrays);
+        Gpu::freeAsync(The_Arena(), m_dp_arrays);
+    }
     m_dp_arrays = nullptr;
 #else
     std::free(m_hp_arrays);
@@ -2140,6 +2166,18 @@ FabArray<FAB>::clear_arrays ()
     m_hp_arrays = nullptr;
     m_arrays.hp = nullptr;
     m_const_arrays.hp = nullptr;
+}
+
+template <class FAB>
+void
+FabArray<FAB>::clear_fab_caches ()
+{
+    clear_arrays();
+#ifdef AMREX_USE_GPU
+    m_fb_local_copy_handler.clear();
+    m_recv_copy_handler.clear();
+    m_send_copy_handler.clear();
+#endif
 }
 
 template <class FAB>
@@ -2156,6 +2194,7 @@ FabArray<FAB>::release (int K)
                 updateMemUsage(t, -nbytes, nullptr);
             }
         }
+        clear_fab_caches();
         return std::exchange(m_fabs_v[li], nullptr);
     } else {
         return nullptr;
@@ -2176,6 +2215,7 @@ FabArray<FAB>::release (const MFIter& mfi)
                 updateMemUsage(t, -nbytes, nullptr);
             }
         }
+        clear_fab_caches();
         return std::exchange(m_fabs_v[li], nullptr);
     } else {
         return nullptr;
@@ -2656,6 +2696,7 @@ FabArray<FAB>::setFab (int boxno, std::unique_ptr<FAB> elem)
         m_factory->destroy(m_fabs_v[li]);
     }
     m_fabs_v[li] = elem.release();
+    clear_fab_caches();
 }
 
 template <class FAB>
@@ -2679,6 +2720,7 @@ FabArray<FAB>::setFab (int boxno, FAB&& elem)
         m_factory->destroy(m_fabs_v[li]);
     }
     m_fabs_v[li] = new FAB(std::move(elem));
+    clear_fab_caches();
 }
 
 template <class FAB>
@@ -2700,6 +2742,7 @@ FabArray<FAB>::setFab (const MFIter& mfi, std::unique_ptr<FAB> elem)
         m_factory->destroy(m_fabs_v[li]);
     }
     m_fabs_v[li] = elem.release();
+    clear_fab_caches();
 }
 
 template <class FAB>
@@ -2723,6 +2766,7 @@ FabArray<FAB>::setFab (const MFIter& mfi, FAB&& elem)
         m_factory->destroy(m_fabs_v[li]);
     }
     m_fabs_v[li] = new FAB(std::move(elem));
+    clear_fab_caches();
 }
 
 template <class FAB>
@@ -2880,14 +2924,14 @@ FabArray<FAB>::setDomainBndry (value_type val,
 }
 
 template <class FAB>
-template <std::integral I>
-requires (BaseFabType<FAB> && (sizeof(I) >= sizeof(Long)))
+template <std::integral Int>
+requires (BaseFabType<FAB> && (sizeof(Int) >= sizeof(Long)))
 void
-FabArray<FAB>::capacityOfFabs (LayoutData<I>& mem) const
+FabArray<FAB>::capacityOfFabs (LayoutData<Int>& mem) const
 {
     AMREX_ASSERT(amrex::isMFIterSafe(*this, mem));
     for (MFIter mfi(*this, MFItInfo{}.DisableDeviceSync()); mfi.isValid(); ++mfi) {
-        mem[mfi] += static_cast<I>((*this)[mfi].nBytesOwned());
+        mem[mfi] += static_cast<Int>((*this)[mfi].nBytesOwned());
     }
 }
 
@@ -2902,7 +2946,9 @@ FabArray<FAB>::sum (int comp, IntVect const& nghost, bool local) const
     using T = typename FAB::value_type;
     auto sm = T(0.0);
 #ifdef AMREX_USE_GPU
-    if (Gpu::inLaunchRegion()) {
+    if (Gpu::inLaunchRegion())
+#endif
+    {
         auto const& ma = this->const_arrays();
         sm = ParReduce(TypeList<ReduceOpSum>{}, TypeList<T>{}, *this, nghost,
         [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept
@@ -2910,9 +2956,9 @@ FabArray<FAB>::sum (int comp, IntVect const& nghost, bool local) const
         {
             return ma[box_no](i,j,k,comp);
         });
-    } else
-#endif
-    {
+    }
+#ifdef AMREX_USE_GPU
+    else {
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (!system::regtest_reduction) reduction(+:sm)
 #endif
@@ -2928,6 +2974,7 @@ FabArray<FAB>::sum (int comp, IntVect const& nghost, bool local) const
             sm += tmp; // Do it this way so that it does not break regression tests.
         }
     }
+#endif
 
     if (!local) {
         ParallelAllReduce::Sum(sm, ParallelContext::CommunicatorSub());
@@ -4177,6 +4224,7 @@ FabArray<FAB>::norminf (int comp, int ncomp, IntVect const& nghost, bool local,
     using RT = typename F::value_type;
 
     auto nm0 = RT(0.0);
+    Math::detail::AbsNanToInf<RT> const absinf{};
 
 #ifdef AMREX_USE_EB
     if ( this->is_cell_centered() && this->hasEBFabFactory() && ignore_covered )
@@ -4184,26 +4232,26 @@ FabArray<FAB>::norminf (int comp, int ncomp, IntVect const& nghost, bool local,
         const auto& ebfactory = dynamic_cast<EBFArrayBoxFactory const&>(this->Factory());
         auto const& flags = ebfactory.getMultiEBCellFlagFab();
 #ifdef AMREX_USE_GPU
-        if (Gpu::inLaunchRegion()) {
-            auto const& flagsma = flags.const_arrays();
-            auto const& ma = this->const_arrays();
-            nm0 = ParReduce(TypeList<ReduceOpMax>{}, TypeList<RT>{}, *this, nghost,
-            [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept -> GpuTuple<RT>
-            {
-                if (flagsma[box_no](i,j,k).isCovered()) {
-                    return RT(0.0);
-                } else {
-                    auto tmp = RT(0.0);
-                    auto const& a = ma[box_no];
-                    for (int n = 0; n < ncomp; ++n) {
-                        tmp = amrex::max(tmp, std::abs(a(i,j,k,comp+n)));
-                    }
-                    return tmp;
-                }
-            });
-        } else
+        if (Gpu::inLaunchRegion())
 #endif
         {
+            auto const& flagsma = flags.const_arrays();
+            auto const& ma = this->const_arrays();
+            nm0 = ParReduce(TypeList<ReduceOpMax>{}, TypeList<RT>{}, *this, nghost, ncomp,
+            [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k, int n) noexcept -> GpuTuple<RT>
+            {
+#ifdef AMREX_USE_GPU
+                return flagsma[box_no](i,j,k).isCovered() ? RT(0.0) : absinf(ma[box_no](i,j,k,comp+n));
+#else // unconditional load so that the loop vectorizes; zero covered
+      // values before any arithmetic
+                RT v = ma[box_no](i,j,k,comp+n);
+                v = flagsma[box_no](i,j,k).isCovered() ? RT(0.0) : v;
+                return absinf(v);
+#endif
+            });
+        }
+#ifdef AMREX_USE_GPU
+        else {
 #ifdef AMREX_USE_OMP
 #pragma omp parallel reduction(max:nm0)
 #endif
@@ -4215,27 +4263,30 @@ FabArray<FAB>::norminf (int comp, int ncomp, IntVect const& nghost, bool local,
                     AMREX_LOOP_4D(bx, ncomp, i, j, k, n,
                     {
                         if (!flag(i,j,k).isCovered()) {
-                            nm0 = std::max(nm0, std::abs(a(i,j,k,comp+n)));
+                            nm0 = std::max(nm0, absinf(a(i,j,k,comp+n)));
                         }
                     });
                 }
             }
         }
+#endif
     }
     else
 #endif
     {
 #ifdef AMREX_USE_GPU
-        if (Gpu::inLaunchRegion()) {
+        if (Gpu::inLaunchRegion())
+#endif
+        {
             auto const& ma = this->const_arrays();
             nm0 = ParReduce(TypeList<ReduceOpMax>{}, TypeList<RT>{}, *this, nghost, ncomp,
             [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k, int n) noexcept -> GpuTuple<RT>
             {
-                return std::abs(ma[box_no](i,j,k,comp+n));
+                return absinf(ma[box_no](i,j,k,comp+n));
             });
-        } else
-#endif
-        {
+        }
+#ifdef AMREX_USE_GPU
+        else {
 #ifdef AMREX_USE_OMP
 #pragma omp parallel reduction(max:nm0)
 #endif
@@ -4244,11 +4295,14 @@ FabArray<FAB>::norminf (int comp, int ncomp, IntVect const& nghost, bool local,
                 auto const& a = this->const_array(mfi);
                 AMREX_LOOP_4D(bx, ncomp, i, j, k, n,
                 {
-                    nm0 = std::max(nm0, std::abs(a(i,j,k,comp+n)));
+                    nm0 = std::max(nm0, absinf(a(i,j,k,comp+n)));
                 });
             }
         }
+#endif
     }
+
+    nm0 = std::max(nm0, RT(0.0)); // ParReduce returns lowest() if this rank has no boxes
 
     if (!local) {
         ParallelAllReduce::Max(nm0, ParallelContext::CommunicatorSub());
@@ -4269,28 +4323,29 @@ FabArray<FAB>::norminf (FabArray<IFAB> const& mask, int comp, int ncomp,
     using RT = typename F::value_type;
 
     auto nm0 = RT(0.0);
+    Math::detail::AbsNanToInf<RT> const absinf{};
 
 #ifdef AMREX_USE_GPU
-    if (Gpu::inLaunchRegion()) {
-        auto const& ma = this->const_arrays();
-        auto const& maskma = mask.const_arrays();
-        nm0 = ParReduce(TypeList<ReduceOpMax>{}, TypeList<RT>{}, *this, IntVect(nghost),
-        [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept -> GpuTuple<RT>
-        {
-            if (maskma[box_no](i,j,k)) {
-                auto tmp = RT(0.0);
-                auto const& a = ma[box_no];
-                for (int n = 0; n < ncomp; ++n) {
-                    tmp = amrex::max(tmp, std::abs(a(i,j,k,comp+n)));
-                }
-                return tmp;
-            } else {
-                return RT(0.0);
-            }
-        });
-    } else
+    if (Gpu::inLaunchRegion())
 #endif
     {
+        auto const& ma = this->const_arrays();
+        auto const& maskma = mask.const_arrays();
+        nm0 = ParReduce(TypeList<ReduceOpMax>{}, TypeList<RT>{}, *this, IntVect(nghost), ncomp,
+        [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k, int n) noexcept -> GpuTuple<RT>
+        {
+#ifdef AMREX_USE_GPU
+            return maskma[box_no](i,j,k) ? absinf(ma[box_no](i,j,k,comp+n)) : RT(0.0);
+#else // unconditional load so that the loop vectorizes; zero masked
+      // values before any arithmetic, which could trap on garbage
+            RT v = ma[box_no](i,j,k,comp+n);
+            v = maskma[box_no](i,j,k) ? v : RT(0.0);
+            return absinf(v);
+#endif
+        });
+    }
+#ifdef AMREX_USE_GPU
+    else {
 #ifdef AMREX_USE_OMP
 #pragma omp parallel reduction(max:nm0)
 #endif
@@ -4301,11 +4356,14 @@ FabArray<FAB>::norminf (FabArray<IFAB> const& mask, int comp, int ncomp,
             AMREX_LOOP_4D(bx, ncomp, i, j, k, n,
             {
                 if (mskfab(i,j,k)) {
-                    nm0 = std::max(nm0, std::abs(a(i,j,k,comp+n)));
+                    nm0 = std::max(nm0, absinf(a(i,j,k,comp+n)));
                 }
             });
         }
     }
+#endif
+
+    nm0 = std::max(nm0, RT(0.0)); // ParReduce returns lowest() if this rank has no boxes
 
     if (!local) {
         ParallelAllReduce::Max(nm0, ParallelContext::CommunicatorSub());

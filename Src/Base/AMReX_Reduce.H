@@ -1,6 +1,7 @@
 #ifndef AMREX_REDUCE_H_
 #define AMREX_REDUCE_H_
 #include <AMReX_Config.H>
+#include <AMReX.H>
 
 #include <AMReX_Concepts.H>
 #include <AMReX_Gpu.H>
@@ -14,6 +15,7 @@
 #include <concepts>
 #include <functional>
 #include <limits>
+#include <utility>
 
 namespace amrex {
 
@@ -206,68 +208,100 @@ bool AnyOf (BoxND<dim> const& box, P const& pred);
 /// \cond DOXYGEN_IGNORE
 namespace Reduce::detail {
 
+// CPU reductions keep nacc partial accumulators so that the inner loop
+// vectorizes.
+inline constexpr int nacc = 8;
+
+// Pragmas for the loop over the nacc accumulators. With GCC, `unroll 4`
+// keeps it vectorizable and novector plus a full unroll keeps it scalar on
+// purpose. Clang needs neither, and nvcc does not know them.
+#if defined(AMREX_CXX_GCC) && !defined(__CUDACC__)
+#define AMREX_PRAGMA_NACC_VECTORIZE _Pragma("GCC unroll 4")
+#if __GNUC__ >= 14
+#define AMREX_PRAGMA_NACC_NOVECTOR _Pragma("GCC novector")
+#else
+#define AMREX_PRAGMA_NACC_NOVECTOR
+#endif
+#define AMREX_PRAGMA_NACC_SCALAR AMREX_PRAGMA_NACC_NOVECTOR _Pragma("GCC unroll 8")
+#else
+#define AMREX_PRAGMA_NACC_VECTORIZE
+#define AMREX_PRAGMA_NACC_NOVECTOR
+#define AMREX_PRAGMA_NACC_SCALAR
+#endif
+static_assert(nacc == 8, "The AMREX_PRAGMA_NACC unroll factors assume nacc == 8");
+
+// Split a 1D range into chunks of a multiple of nacc, enough for all threads.
+template <std::integral N>
+std::pair<N,N> chunks_1d (N n)
+{
+    auto const nthreads = OpenMP::get_max_threads();
+    N const chunk = std::max(static_cast<N>(nacc), static_cast<N>((n / (4*nthreads) / nacc) * nacc));
+    N const nchunks = n / chunk + ((n % chunk != 0) ? 1 : 0);
+    return {chunk, nchunks};
+}
+
 #ifdef AMREX_USE_GPU
 #ifdef AMREX_USE_SYCL
-    template <std::size_t I, typename T, typename P>
+    template <std::size_t Idx, typename T, typename P>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void for_each_parallel (T& d, T const& s, Gpu::Handler const& h)
     {
-        P().parallel_update(amrex::get<I>(d), amrex::get<I>(s), h);
+        P().parallel_update(amrex::get<Idx>(d), amrex::get<Idx>(s), h);
     }
 
-    template <std::size_t I, typename T, typename P, typename P1, typename... Ps>
+    template <std::size_t Idx, typename T, typename P, typename P1, typename... Ps>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void for_each_parallel (T& d, T const& s, Gpu::Handler const& h)
     {
-        P().parallel_update(amrex::get<I>(d), amrex::get<I>(s), h);
-        for_each_parallel<I+1,T,P1,Ps...>(d, s, h);
+        P().parallel_update(amrex::get<Idx>(d), amrex::get<Idx>(s), h);
+        for_each_parallel<Idx+1,T,P1,Ps...>(d, s, h);
     }
 #else
-    template <std::size_t I, typename T, typename P>
+    template <std::size_t Idx, typename T, typename P>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void for_each_parallel (T& d, T const& s)
     {
-        P().parallel_update(amrex::get<I>(d), amrex::get<I>(s));
+        P().parallel_update(amrex::get<Idx>(d), amrex::get<Idx>(s));
     }
 
-    template <std::size_t I, typename T, typename P, typename P1, typename... Ps>
+    template <std::size_t Idx, typename T, typename P, typename P1, typename... Ps>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void for_each_parallel (T& d, T const& s)
     {
-        P().parallel_update(amrex::get<I>(d), amrex::get<I>(s));
-        for_each_parallel<I+1,T,P1,Ps...>(d, s);
+        P().parallel_update(amrex::get<Idx>(d), amrex::get<Idx>(s));
+        for_each_parallel<Idx+1,T,P1,Ps...>(d, s);
     }
 #endif
 #endif
 
-    template <std::size_t I, typename T, typename P>
+    template <std::size_t Idx, typename T, typename P>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     void for_each_local (T& d, T const& s)
     {
-        P().local_update(amrex::get<I>(d), amrex::get<I>(s));
+        P().local_update(amrex::get<Idx>(d), amrex::get<Idx>(s));
     }
 
-    template <std::size_t I, typename T, typename P, typename P1, typename... Ps>
+    template <std::size_t Idx, typename T, typename P, typename P1, typename... Ps>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     void for_each_local (T& d, T const& s)
     {
-        P().local_update(amrex::get<I>(d), amrex::get<I>(s));
-        for_each_local<I+1,T,P1,Ps...>(d, s);
+        P().local_update(amrex::get<Idx>(d), amrex::get<Idx>(s));
+        for_each_local<Idx+1,T,P1,Ps...>(d, s);
     }
 
-    template <std::size_t I, typename T, typename P>
+    template <std::size_t Idx, typename T, typename P>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     constexpr void for_each_init (T& t)
     {
-        P().init(amrex::get<I>(t));
+        P().init(amrex::get<Idx>(t));
     }
 
-    template <std::size_t I, typename T, typename P, typename P1, typename... Ps>
+    template <std::size_t Idx, typename T, typename P, typename P1, typename... Ps>
     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     constexpr void for_each_init (T& t)
     {
-        P().init(amrex::get<I>(t));
-        for_each_init<I+1,T,P1,Ps...>(t);
+        P().init(amrex::get<Idx>(t));
+        for_each_init<Idx+1,T,P1,Ps...>(t);
     }
 }
 /// \endcond
@@ -428,6 +462,90 @@ struct ReduceOpLogicalOr
     constexpr void init (T& t) const noexcept { t = false; }
 };
 
+/// \cond DOXYGEN_IGNORE
+namespace Reduce::detail {
+// Whether the accumulator loop of a CPU reduction over Ps is vectorized.
+// A lone min or max stays scalar with GCC 14 or newer on x86 without
+// SSE4.1, where the vector form is slower. Older GCC has no novector.
+template <typename... Ps>
+inline constexpr bool vectorize_nacc_loop =
+#if defined(AMREX_CXX_GCC) && !defined(__CUDACC__) && (__GNUC__ >= 14) && \
+    (defined(__x86_64__) || defined(__i386__)) && !defined(__SSE4_1__)
+    sizeof...(Ps) != 1 ||
+    !((std::is_same_v<Ps,ReduceOpMin> || std::is_same_v<Ps,ReduceOpMax>) && ...);
+#else
+    true;
+#endif
+
+// The nacc partial accumulators of a CPU reduction. GCC keeps them in
+// vector registers only when each tuple member has its own array, clang
+// only when each lane holds a whole tuple.
+template <typename Tup> struct Lanes;
+
+template <typename... Ts>
+struct Lanes<GpuTuple<Ts...>>
+{
+#ifdef AMREX_CXX_GCC
+    GpuTuple<GpuArray<Ts,nacc>...> data;
+    template <int K> auto& get (int lane) noexcept { return amrex::get<K>(data)[lane]; }
+    template <int K> [[nodiscard]] auto const& get (int lane) const noexcept { return amrex::get<K>(data)[lane]; }
+#else
+    GpuTuple<Ts...> data[nacc];
+    template <int K> auto& get (int lane) noexcept { return amrex::get<K>(data[lane]); }
+    template <int K> [[nodiscard]] auto const& get (int lane) const noexcept { return amrex::get<K>(data[lane]); }
+#endif
+};
+
+template <int K, typename Tup>
+AMREX_FORCE_INLINE
+void lanes_set (Lanes<Tup>& acc, Tup const& v)
+{
+    for (int lane = 0; lane < nacc; ++lane) { acc.template get<K>(lane) = amrex::get<K>(v); }
+    if constexpr (K+1 < GpuTupleSize<Tup>::value) { lanes_set<K+1>(acc, v); }
+}
+
+template <int K, typename Tup, typename P, typename... Ps>
+AMREX_FORCE_INLINE
+void lanes_update (Lanes<Tup>& acc, int lane, Tup const& s)
+{
+    P().local_update(acc.template get<K>(lane), amrex::get<K>(s));
+    if constexpr (sizeof...(Ps) > 0) { lanes_update<K+1,Tup,Ps...>(acc, lane, s); }
+}
+
+template <int K, typename Tup, typename P, typename... Ps>
+AMREX_FORCE_INLINE
+void lanes_fold (Lanes<Tup> const& acc, Tup& r)
+{
+    for (int lane = 0; lane < nacc; ++lane) { P().local_update(amrex::get<K>(r), acc.template get<K>(lane)); }
+    if constexpr (sizeof...(Ps) > 0) { lanes_fold<K+1,Tup,Ps...>(acc, r); }
+}
+
+// One row of a CPU reduction over the ops Ps: full blocks of nacc cells go
+// into the lanes, the rest into rem. value(i) is the tuple for cell i.
+template <typename... Ps, typename Tup, std::integral N, typename F>
+AMREX_FORCE_INLINE
+void reduce_row (N ilo, N ihi, Lanes<Tup>& acc, Tup& rem, F const& value)
+{
+    N i = ilo;
+    AMREX_PRAGMA_NACC_NOVECTOR
+    for (; i + (nacc-1) <= ihi; i += nacc) {
+        if constexpr (vectorize_nacc_loop<Ps...>) {
+            AMREX_PRAGMA_NACC_VECTORIZE
+            for (int lane = 0; lane < nacc; ++lane) { lanes_update<0,Tup,Ps...>(acc, lane, value(static_cast<N>(i+lane))); }
+        } else {
+            AMREX_PRAGMA_NACC_SCALAR
+            for (int lane = 0; lane < nacc; ++lane) { lanes_update<0,Tup,Ps...>(acc, lane, value(static_cast<N>(i+lane))); }
+        }
+    }
+    AMREX_PRAGMA_NACC_NOVECTOR
+    for (; i <= ihi; ++i) { for_each_local<0,Tup,Ps...>(rem, value(i)); }
+}
+}
+#undef AMREX_PRAGMA_NACC_VECTORIZE
+#undef AMREX_PRAGMA_NACC_NOVECTOR
+#undef AMREX_PRAGMA_NACC_SCALAR
+/// \endcond
+
 template <typename... Ps> class ReduceOps;
 
 #ifdef AMREX_USE_GPU
@@ -569,8 +687,8 @@ namespace Reduce::detail {
     struct iterate_box {};
     struct iterate_box_comp {};
 
-    template <typename I, typename F, typename T, typename... Ps>
-    requires (std::same_as<iterate_box,I>)
+    template <typename Tag, typename F, typename T, typename... Ps>
+    requires (std::same_as<iterate_box,Tag>)
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void mf_call_f (F const& f, int ibox, int i, int j, int k, int, T& r) noexcept
     {
@@ -578,8 +696,8 @@ namespace Reduce::detail {
         Reduce::detail::for_each_local<0, T, Ps...>(r, pr);
     }
 
-    template <typename I, typename F, typename T, typename... Ps>
-    requires (std::same_as<iterate_box_comp,I>)
+    template <typename Tag, typename F, typename T, typename... Ps>
+    requires (std::same_as<iterate_box_comp,Tag>)
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     void mf_call_f (F const& f, int ibox, int i, int j, int k, int ncomp, T& r) noexcept
     {
@@ -600,8 +718,8 @@ public:
 /// \cond DOXYGEN_IGNORE
 
     // This is public for CUDA
-    template <typename I, typename MF, typename D, typename F>
-    void eval_mf (I, MF const& mf, IntVect const& nghost, int ncomp, D& reduce_data, F const& f)
+    template <typename Tag, typename MF, typename D, typename F>
+    void eval_mf (Tag, MF const& mf, IntVect const& nghost, int ncomp, D& reduce_data, F const& f)
     {
         using ReduceTuple = typename D::Type;
         const int nboxes = mf.local_size();
@@ -623,7 +741,8 @@ public:
 
 #ifdef AMREX_USE_SYCL
             // device reduce needs local(i.e., shared) memory
-            constexpr std::size_t shared_mem_bytes = sizeof(unsigned long long)*Gpu::Device::warp_size;
+            constexpr std::size_t shared_mem_bytes = sizeof(ReduceTuple)
+                * std::max(Gpu::Device::warp_size, AMREX_GPU_MAX_THREADS/Gpu::Device::warp_size);
             amrex::launch<AMREX_GPU_MAX_THREADS>(nblocks_ec, shared_mem_bytes, stream,
                           [=] AMREX_GPU_DEVICE (Gpu::Handler const& gh) noexcept
             {
@@ -648,7 +767,7 @@ public:
                     BoxIndexer const& indexer = dp_boxes[ibox];
                     if (icell < indexer.numPts()) {
                         auto [i, j, k] = indexer(icell);
-                        Reduce::detail::mf_call_f<I, F, ReduceTuple, Ps...>
+                        Reduce::detail::mf_call_f<Tag, F, ReduceTuple, Ps...>
                             (f, ibox, i, j, k, ncomp, r);
                     }
                 }
@@ -662,9 +781,10 @@ public:
     }
 
     // This is public for CUDA
-    template <typename I, int dim, typename D, typename F>
-    void eval_box (I, BoxND<dim> const& box, int ncomp, D& reduce_data, F const& f)
+    template <typename Tag, int dim, typename D, typename F>
+    void eval_box (Tag, BoxND<dim> const& box, int ncomp, D& reduce_data, F const& f)
     {
+        if (box.isEmpty()) { return; }
         using ReduceTuple = typename D::Type;
         auto const& stream = Gpu::gpuStream();
         auto dp = reduce_data.devicePtr(stream);
@@ -678,7 +798,8 @@ public:
         reduce_data.updateMaxStreamIndex(stream);
 #ifdef AMREX_USE_SYCL
         // device reduce needs local(i.e., shared) memory
-        constexpr std::size_t shared_mem_bytes = sizeof(unsigned long long)*Gpu::Device::warp_size;
+        constexpr std::size_t shared_mem_bytes = sizeof(ReduceTuple)
+            * std::max(Gpu::Device::warp_size, AMREX_GPU_MAX_THREADS/Gpu::Device::warp_size);
         amrex::launch<AMREX_GPU_MAX_THREADS>(nblocks_ec, shared_mem_bytes, stream,
         [=] AMREX_GPU_DEVICE (Gpu::Handler const& gh) noexcept
         {
@@ -703,7 +824,7 @@ public:
             {
                 auto iv = indexer.intVect(icell);
                 amrex::ignore_unused(f,ncomp,ixtype); // work around first-capture
-                if constexpr (std::is_same_v<Reduce::detail::iterate_box,I>) {
+                if constexpr (std::is_same_v<Reduce::detail::iterate_box,Tag>) {
                     auto pr = Reduce::detail::call_f_intvect_box(f, iv, ixtype);
                     Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(r, pr);
                 } else {
@@ -772,6 +893,13 @@ public:
                     return f(li, i, j, k, n);
                 });
             }
+        } else if (ncomp == 1) {
+            // Without the loop over components, the kernel reads memory faster.
+            eval_mf(Reduce::detail::iterate_box{}, mf, nghost, 0, reduce_data,
+            [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept -> ReduceTuple
+            {
+                return f(box_no, i, j, k, 0);
+            });
         } else {
             eval_mf(Reduce::detail::iterate_box_comp{},
                     mf, nghost, ncomp, reduce_data, std::forward<F>(f));
@@ -787,7 +915,16 @@ public:
     template <std::integral N, typename D, typename F, int dim>
     void eval (BoxND<dim> const& box, N ncomp, D & reduce_data, F const& f)
     {
-        eval_box(Reduce::detail::iterate_box_comp{}, box, ncomp, reduce_data, f);
+        if (ncomp == 1) {
+            // Without the loop over components, the kernel reads memory faster.
+            eval_box(Reduce::detail::iterate_box{}, box, 0, reduce_data,
+            [=] AMREX_GPU_DEVICE (IntVectND<dim> const& iv) noexcept
+            {
+                return Reduce::detail::call_f_intvect_n(f, iv, 0);
+            });
+        } else {
+            eval_box(Reduce::detail::iterate_box_comp{}, box, ncomp, reduce_data, f);
+        }
     }
 
     template <std::integral N, typename D, typename F>
@@ -799,13 +936,15 @@ public:
         auto dp = reduce_data.devicePtr(stream);
         int& nblocks = reduce_data.nBlocks(stream);
         constexpr int nitems_per_thread = 4;
-        int nblocks_ec = (n + nitems_per_thread*AMREX_GPU_MAX_THREADS-1)
+        Long nblocks_ec_long = (Long(n) + nitems_per_thread*AMREX_GPU_MAX_THREADS-1)
             / (nitems_per_thread*AMREX_GPU_MAX_THREADS);
-        nblocks_ec = std::min(nblocks_ec, reduce_data.maxBlocks());
+        int nblocks_ec = static_cast<int>(std::min<Long>(nblocks_ec_long,
+                                                         reduce_data.maxBlocks()));
         reduce_data.updateMaxStreamIndex(stream);
 #ifdef AMREX_USE_SYCL
         // device reduce needs local(i.e., shared) memory
-        constexpr std::size_t shared_mem_bytes = sizeof(unsigned long long)*Gpu::Device::warp_size;
+        constexpr std::size_t shared_mem_bytes = sizeof(ReduceTuple)
+            * std::max(Gpu::Device::warp_size, AMREX_GPU_MAX_THREADS/Gpu::Device::warp_size);
         amrex::launch<AMREX_GPU_MAX_THREADS>(nblocks_ec, shared_mem_bytes, stream,
         [=] AMREX_GPU_DEVICE (Gpu::Handler const& gh) noexcept
         {
@@ -823,12 +962,12 @@ public:
             if (threadIdx.x == 0 && static_cast<int>(blockIdx.x) >= nblocks) {
                 dst = r;
             }
-            for (N i = N(AMREX_GPU_MAX_THREADS)*blockIdx.x+threadIdx.x,
-                 stride = N(AMREX_GPU_MAX_THREADS)*gridDim.x;
-                 i < n;
+            for (Long i = Long(AMREX_GPU_MAX_THREADS)*blockIdx.x+threadIdx.x,
+                 stride = Long(AMREX_GPU_MAX_THREADS)*gridDim.x;
+                 i < Long(n);
                  i += stride)
             {
-                auto pr = f(i);
+                auto pr = f(N(i));
                 Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(r,pr);
             }
 #ifdef AMREX_USE_SYCL
@@ -874,7 +1013,8 @@ public:
             int maxblocks = reduce_data.maxBlocks();
 #ifdef AMREX_USE_SYCL
             // device reduce needs local(i.e., shared) memory
-            constexpr std::size_t shared_mem_bytes = sizeof(unsigned long long)*Gpu::Device::warp_size;
+            constexpr std::size_t shared_mem_bytes = sizeof(ReduceTuple)
+                * std::max(Gpu::Device::warp_size, AMREX_GPU_MAX_THREADS/Gpu::Device::warp_size);
 #ifndef AMREX_NO_SYCL_REDUCE_WORKAROUND
             // xxxxx SYCL todo: reduce bug workaround
             Gpu::DeviceVector<ReduceTuple> dtmp(1);
@@ -1048,13 +1188,14 @@ bool AnyOf (N n, T const* v, P const& pred)
     [=] AMREX_GPU_DEVICE (Gpu::Handler const& gh) noexcept {
         int* has_any = &(static_cast<int*>(gh.sharedMemory())[num_ints-1]);
         if (gh.threadIdx() == 0) { *has_any = *dp; }
-        gh.sharedBarrier();
+        gh.syncThreads();
 
         if (!(*has_any))
         {
             int r = false;
-            for (N i = AMREX_GPU_MAX_THREADS*gh.blockIdx()+gh.threadIdx(), stride = AMREX_GPU_MAX_THREADS*gh.gridDim();
-                 i < n && !r; i += stride)
+            for (Long i = Long(AMREX_GPU_MAX_THREADS)*gh.blockIdx()+gh.threadIdx(),
+                 stride = Long(AMREX_GPU_MAX_THREADS)*gh.gridDim();
+                 i < Long(n) && !r; i += stride)
             {
                 r = pred(v[i]) ? 1 : 0;
             }
@@ -1074,8 +1215,9 @@ bool AnyOf (N n, T const* v, P const& pred)
         if (!has_any)
         {
             int r = false;
-            for (N i = AMREX_GPU_MAX_THREADS*blockIdx.x+threadIdx.x, stride = AMREX_GPU_MAX_THREADS*gridDim.x;
-                 i < n && !r; i += stride)
+            for (Long i = Long(AMREX_GPU_MAX_THREADS)*blockIdx.x+threadIdx.x,
+                 stride = Long(AMREX_GPU_MAX_THREADS)*gridDim.x;
+                 i < Long(n) && !r; i += stride)
             {
                 r = pred(v[i]) ? 1 : 0;
             }
@@ -1105,7 +1247,7 @@ bool AnyOf (BoxND<dim> const& box, P const& pred)
     [=] AMREX_GPU_DEVICE (Gpu::Handler const& gh) noexcept {
         int* has_any = &(static_cast<int*>(gh.sharedMemory())[num_ints-1]);
         if (gh.threadIdx() == 0) { *has_any = *dp; }
-        gh.sharedBarrier();
+        gh.syncThreads();
 
         if (!(*has_any))
         {
@@ -1241,11 +1383,22 @@ private:
     static void call_f_box (BoxND<dim> const& box, typename D::Type & r, F const& f) noexcept
     {
         using ReduceTuple = typename D::Type;
-        For(box,
-            [&] (IntVectND<dim> iv) {
-                auto pr = Reduce::detail::call_f_intvect(f, iv);
-                Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(r, pr);
+        ReduceTuple rem;
+        Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rem);
+        Reduce::detail::Lanes<ReduceTuple> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        int const ilo = box.smallEnd(0);
+        int const ihi = box.bigEnd(0);
+        BoxND<dim> rows = box;
+        rows.setBig(0, ilo);
+        For(rows, [&] (IntVectND<dim> iv) {
+            Reduce::detail::reduce_row<Ps...>(ilo, ihi, acc, rem, [&] (int i) {
+                iv[0] = i;
+                return Reduce::detail::call_f_intvect(f, iv);
             });
+        });
+        Reduce::detail::lanes_fold<0, ReduceTuple, Ps...>(acc, r);
+        Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(r, rem);
     }
 
     template <typename D, typename F, int dim>
@@ -1267,11 +1420,16 @@ public:
     {
         using ReduceTuple = typename D::Type;
 #ifdef AMREX_USE_OMP
-#pragma omp parallel
+#pragma omp parallel if (!system::regtest_reduction)
 #endif
         {
-            ReduceTuple rr;
-            Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rr);
+            // The partial accumulators break the dependency chain so that
+            // the i loop can vectorize. They live across the MFIter loop so
+            // that they stay in vector registers.
+            ReduceTuple rem;
+            Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rem);
+            Reduce::detail::Lanes<ReduceTuple> acc;
+            Reduce::detail::lanes_set<0>(acc, rem);
             for (MFIter mfi(mf,true); mfi.isValid(); ++mfi) {
                 Box const& b = mfi.growntilebox(nghost);
                 const int li = mfi.LocalIndex();
@@ -1279,12 +1437,13 @@ public:
                 const auto hi = amrex::ubound(b);
                 for (int k = lo.z; k <= hi.z; ++k) {
                 for (int j = lo.y; j <= hi.y; ++j) {
-                for (int i = lo.x; i <= hi.x; ++i) {
-                    Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, f(li,i,j,k));
-                }}}
+                    Reduce::detail::reduce_row<Ps...>(lo.x, hi.x, acc, rem,
+                        [&] (int i) { return f(li,i,j,k); });
+                }}
             }
-            Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(
-                reduce_data.reference(OpenMP::get_thread_num()), rr);
+            auto& rr = reduce_data.reference(OpenMP::get_thread_num());
+            Reduce::detail::lanes_fold<0, ReduceTuple, Ps...>(acc, rr);
+            Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, rem);
         }
     }
 
@@ -1294,11 +1453,13 @@ public:
     {
         using ReduceTuple = typename D::Type;
 #ifdef AMREX_USE_OMP
-#pragma omp parallel
+#pragma omp parallel if (!system::regtest_reduction)
 #endif
         {
-            ReduceTuple rr;
-            Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rr);
+            ReduceTuple rem;
+            Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rem);
+            Reduce::detail::Lanes<ReduceTuple> acc;
+            Reduce::detail::lanes_set<0>(acc, rem);
             for (MFIter mfi(mf,true); mfi.isValid(); ++mfi) {
                 Box const& b = mfi.growntilebox(nghost);
                 const int li = mfi.LocalIndex();
@@ -1307,12 +1468,13 @@ public:
                 for (int n = 0; n < ncomp; ++n) {
                 for (int k = lo.z; k <= hi.z; ++k) {
                 for (int j = lo.y; j <= hi.y; ++j) {
-                for (int i = lo.x; i <= hi.x; ++i) {
-                    Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, f(li,i,j,k,n));
-                }}}}
+                    Reduce::detail::reduce_row<Ps...>(lo.x, hi.x, acc, rem,
+                        [&] (int i) { return f(li,i,j,k,n); });
+                }}}
             }
-            Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(
-                reduce_data.reference(OpenMP::get_thread_num()), rr);
+            auto& rr = reduce_data.reference(OpenMP::get_thread_num());
+            Reduce::detail::lanes_fold<0, ReduceTuple, Ps...>(acc, rr);
+            Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, rem);
         }
     }
 
@@ -1331,28 +1493,40 @@ public:
     void eval (BoxND<dim> const& box, N ncomp, D & reduce_data, F const& f)
     {
         using ReduceTuple = typename D::Type;
-        ReduceTuple rr;
-        Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rr);
-        For(box, ncomp,
-            [&] (IntVectND<dim> iv, int n) {
-                auto pr = Reduce::detail::call_f_intvect_n(f, iv, n);
-                Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, pr);
+        ReduceTuple rem;
+        Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rem);
+        Reduce::detail::Lanes<ReduceTuple> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        int const ilo = box.smallEnd(0);
+        int const ihi = box.bigEnd(0);
+        BoxND<dim> rows = box;
+        rows.setBig(0, ilo);
+        For(rows, ncomp, [&] (IntVectND<dim> iv, int n) {
+            Reduce::detail::reduce_row<Ps...>(ilo, ihi, acc, rem, [&] (int i) {
+                iv[0] = i;
+                return Reduce::detail::call_f_intvect_n(f, iv, n);
             });
-        Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(
-             reduce_data.reference(OpenMP::get_thread_num()), rr);
+        });
+        auto& rr = reduce_data.reference(OpenMP::get_thread_num());
+        Reduce::detail::lanes_fold<0, ReduceTuple, Ps...>(acc, rr);
+        Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, rem);
     }
 
     template <std::integral N, typename D, typename F>
     void eval (N n, D & reduce_data, F const& f)
     {
         using ReduceTuple = typename D::Type;
-        ReduceTuple rr;
-        Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rr);
-        for (N i = 0; i < n; ++i) {
-            Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, f(i));
+        ReduceTuple rem;
+        Reduce::detail::for_each_init<0, ReduceTuple, Ps...>(rem);
+        Reduce::detail::Lanes<ReduceTuple> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        if (n > 0) {
+            Reduce::detail::reduce_row<Ps...>(N(0), static_cast<N>(n-1), acc, rem,
+                [&] (N i) { return f(i); });
         }
-        Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(
-             reduce_data.reference(OpenMP::get_thread_num()), rr);
+        auto& rr = reduce_data.reference(OpenMP::get_thread_num());
+        Reduce::detail::lanes_fold<0, ReduceTuple, Ps...>(acc, rr);
+        Reduce::detail::for_each_local<0, ReduceTuple, Ps...>(rr, rem);
     }
 
     template <typename D>
@@ -1383,12 +1557,24 @@ template <typename T, std::integral N, typename F>
 requires (!std::same_as<T*,std::decay_t<F>>)
 T Sum (N n, F const& f, T init_val)
 {
+    auto const cn = Reduce::detail::chunks_1d(n);
+    N const chunk = cn.first;
+    N const nchunks = cn.second;
     T r = init_val;
 #ifdef AMREX_USE_OMP
 #pragma omp parallel for reduction(+:r)
 #endif
-    for (N i = 0; i < n; ++i) {
-        r += f(i);
+    for (N ic = 0; ic < nchunks; ++ic) {
+        N const ib = ic*chunk;
+        N const ie = (n - ib < chunk) ? n : ib + chunk;
+        using Tup = GpuTuple<T>;
+        Tup rem{};
+        Reduce::detail::Lanes<Tup> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        Reduce::detail::reduce_row<ReduceOpSum>(ib, static_cast<N>(ie-1), acc, rem,
+            [&] (N i) { return Tup{f(i)}; });
+        Reduce::detail::lanes_fold<0,Tup,ReduceOpSum>(acc, rem);
+        r += amrex::get<0>(rem);
     }
     return r;
 }
@@ -1403,12 +1589,24 @@ template <typename T, std::integral N, typename F>
 requires (!std::same_as<T*,std::decay_t<F>>)
 T Min (N n, F const& f, T init_val)
 {
+    auto const cn = Reduce::detail::chunks_1d(n);
+    N const chunk = cn.first;
+    N const nchunks = cn.second;
     T r = init_val;
 #ifdef AMREX_USE_OMP
 #pragma omp parallel for reduction(min:r)
 #endif
-    for (N i = 0; i < n; ++i) {
-        r = std::min(r,f(i));
+    for (N ic = 0; ic < nchunks; ++ic) {
+        N const ib = ic*chunk;
+        N const ie = (n - ib < chunk) ? n : ib + chunk;
+        using Tup = GpuTuple<T>;
+        Tup rem{init_val};
+        Reduce::detail::Lanes<Tup> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        Reduce::detail::reduce_row<ReduceOpMin>(ib, static_cast<N>(ie-1), acc, rem,
+            [&] (N i) { return Tup{f(i)}; });
+        Reduce::detail::lanes_fold<0,Tup,ReduceOpMin>(acc, rem);
+        r = std::min(r, amrex::get<0>(rem));
     }
     return r;
 }
@@ -1423,12 +1621,24 @@ template <typename T, std::integral N, typename F>
 requires (!std::same_as<T*,std::decay_t<F>>)
 T Max (N n, F const& f, T init_val)
 {
+    auto const cn = Reduce::detail::chunks_1d(n);
+    N const chunk = cn.first;
+    N const nchunks = cn.second;
     T r = init_val;
 #ifdef AMREX_USE_OMP
 #pragma omp parallel for reduction(max:r)
 #endif
-    for (N i = 0; i < n; ++i) {
-        r = std::max(r,f(i));
+    for (N ic = 0; ic < nchunks; ++ic) {
+        N const ib = ic*chunk;
+        N const ie = (n - ib < chunk) ? n : ib + chunk;
+        using Tup = GpuTuple<T>;
+        Tup rem{init_val};
+        Reduce::detail::Lanes<Tup> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        Reduce::detail::reduce_row<ReduceOpMax>(ib, static_cast<N>(ie-1), acc, rem,
+            [&] (N i) { return Tup{f(i)}; });
+        Reduce::detail::lanes_fold<0,Tup,ReduceOpMax>(acc, rem);
+        r = std::max(r, amrex::get<0>(rem));
     }
     return r;
 }
@@ -1443,15 +1653,26 @@ template <typename T, std::integral N, typename F>
 requires (!std::same_as<T*,std::decay_t<F>>)
 std::pair<T,T> MinMax (N n, F const& f)
 {
+    auto const cn = Reduce::detail::chunks_1d(n);
+    N const chunk = cn.first;
+    N const nchunks = cn.second;
     T r_min = std::numeric_limits<T>::max();
     T r_max = std::numeric_limits<T>::lowest();
 #ifdef AMREX_USE_OMP
 #pragma omp parallel for reduction(min:r_min) reduction(max:r_max)
 #endif
-    for (N i = 0; i < n; ++i) {
-        T tmp = f(i);
-        r_min = std::min(r_min,tmp);
-        r_max = std::max(r_max,tmp);
+    for (N ic = 0; ic < nchunks; ++ic) {
+        N const ib = ic*chunk;
+        N const ie = (n - ib < chunk) ? n : ib + chunk;
+        using Tup = GpuTuple<T,T>;
+        Tup rem{std::numeric_limits<T>::max(), std::numeric_limits<T>::lowest()};
+        Reduce::detail::Lanes<Tup> acc;
+        Reduce::detail::lanes_set<0>(acc, rem);
+        Reduce::detail::reduce_row<ReduceOpMin,ReduceOpMax>(ib, static_cast<N>(ie-1), acc, rem,
+            [&] (N i) { T const tmp = f(i); return Tup{tmp,tmp}; });
+        Reduce::detail::lanes_fold<0,Tup,ReduceOpMin,ReduceOpMax>(acc, rem);
+        r_min = std::min(r_min, amrex::get<0>(rem));
+        r_max = std::max(r_max, amrex::get<1>(rem));
     }
     return std::make_pair(r_min,r_max);
 }

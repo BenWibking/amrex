@@ -2,6 +2,8 @@
 #define BL_PROFILER_H_
 #include <AMReX_Config.H>
 
+#include <AMReX_Extension.H>
+
 #define BL_PROFILE_PASTE2(x, y) x##y
 #define BL_PROFILE_PASTE(x, y) BL_PROFILE_PASTE2(x, y)
 
@@ -412,12 +414,24 @@ inline std::string BLProfiler::CommStats::CFTToString(CommFuncType cft) {
 #define BL_PROFILE_VAR_START(vname) bl_profiler_##vname.start();
 #define BL_PROFILE_VAR_STOP(vname) bl_profiler_##vname.stop();
 
+#define BL_PROFILE_GPU_SYNC(fname)                    \
+    AMREX_WARNING_PUSH_COUNTER                        \
+    BL_PROFILE_GPU_SYNC_IMPL(fname, __COUNTER__)      \
+    AMREX_WARNING_POP
+#define BL_PROFILE_GPU_SYNC_IMPL(funame, counter) amrex::BLProfiler BL_PROFILE_PASTE(bl_profiler_, counter)((funame));
+#define BL_PROFILE_VAR_GPU_SYNC(fname, vname) BL_PROFILE_VAR(fname, vname)
+#define BL_PROFILE_VAR_NS_GPU_SYNC(fname, vname) BL_PROFILE_VAR_NS(fname, vname)
+
 #define BL_PROFILE_INIT_PARAMS(ptl,wall,wfabs)  \
     amrex::BLProfiler::InitParams(ptl,wall, wfabs);
 #define BL_PROFILE_ADD_STEP(snum)  amrex::BLProfiler::AddStep(snum);
 #define BL_PROFILE_SET_RUN_TIME(rtime)  amrex::BLProfiler::SetRunTime(rtime);
 
-#define BL_PROFILE_REGION(rname) amrex::BLProfileRegion bl_profile_region_##vname((rname));
+#define BL_PROFILE_REGION(rname)                                      \
+    AMREX_WARNING_PUSH_COUNTER                                       \
+    amrex::BLProfileRegion BL_PROFILE_PASTE(bl_profile_region_, __COUNTER__)((rname)); \
+    AMREX_WARNING_POP
+#define BL_PROFILE_REGION_GPU_SYNC(rname) BL_PROFILE_REGION(rname)
 
 #define BL_PROFILE_REGION_START(rname) amrex::BLProfiler::RegionStart(rname);
 #define BL_PROFILE_REGION_STOP(rname)  amrex::BLProfiler::RegionStop(rname);
@@ -484,7 +498,10 @@ inline std::string BLProfiler::CommStats::CFTToString(CommFuncType cft) {
 #define BL_TINY_PROFILE_MEMORYINITIALIZE()  amrex::TinyProfiler::MemoryInitialize()
 #define BL_TINY_PROFILE_MEMORYFINALIZE()    amrex::TinyProfiler::MemoryFinalize()
 
-#define BL_PROFILE(fname) BL_PROFILE_IMPL(fname, __COUNTER__)
+#define BL_PROFILE(fname)                       \
+    AMREX_WARNING_PUSH_COUNTER                  \
+    BL_PROFILE_IMPL(fname, __COUNTER__)         \
+    AMREX_WARNING_POP
 #define BL_PROFILE_IMPL(funame, counter)  amrex::TinyProfiler BL_PROFILE_PASTE(tiny_profiler_, counter)((funame)); \
     amrex::ignore_unused(BL_PROFILE_PASTE(tiny_profiler_, counter));
 
@@ -496,10 +513,35 @@ inline std::string BLProfiler::CommStats::CFTToString(CommFuncType cft) {
 #define BL_PROFILE_VAR_NS(fname, vname)                   amrex::TinyProfiler tiny_profiler_##vname(fname, false)
 #define BL_PROFILE_VAR_START(vname)                       tiny_profiler_##vname.start()
 #define BL_PROFILE_VAR_STOP(vname)                        tiny_profiler_##vname.stop()
+#ifdef AMREX_USE_GPU
+#define BL_PROFILE_GPU_SYNC(fname)                        \
+    AMREX_WARNING_PUSH_COUNTER                            \
+    BL_PROFILE_GPU_SYNC_IMPL(fname, __COUNTER__)          \
+    AMREX_WARNING_POP
+#define BL_PROFILE_GPU_SYNC_IMPL(funame, counter) amrex::TinyProfiler BL_PROFILE_PASTE(tiny_profiler_, counter)((funame), true, true); \
+    amrex::ignore_unused(BL_PROFILE_PASTE(tiny_profiler_, counter));
+#define BL_PROFILE_VAR_GPU_SYNC(fname, vname)             amrex::TinyProfiler tiny_profiler_##vname((fname), true, true)
+#define BL_PROFILE_VAR_NS_GPU_SYNC(fname, vname)          amrex::TinyProfiler tiny_profiler_##vname((fname), false, true)
+#else
+#define BL_PROFILE_GPU_SYNC(fname)                        BL_PROFILE(fname)
+#define BL_PROFILE_VAR_GPU_SYNC(fname, vname)             BL_PROFILE_VAR(fname, vname)
+#define BL_PROFILE_VAR_NS_GPU_SYNC(fname, vname)          BL_PROFILE_VAR_NS(fname, vname)
+#endif
 #define BL_PROFILE_INIT_PARAMS(ptl,wall,wfabs)
 #define BL_PROFILE_ADD_STEP(snum)
 #define BL_PROFILE_SET_RUN_TIME(rtime)
-#define BL_PROFILE_REGION(rname)          amrex::TinyProfileRegion tiny_profile_region_##vname((rname))
+#define BL_PROFILE_REGION(rname)                                      \
+    AMREX_WARNING_PUSH_COUNTER                                       \
+    amrex::TinyProfileRegion BL_PROFILE_PASTE(tiny_profile_region_, __COUNTER__)((rname)); \
+    AMREX_WARNING_POP
+#ifdef AMREX_USE_GPU
+#define BL_PROFILE_REGION_GPU_SYNC(rname)                             \
+    AMREX_WARNING_PUSH_COUNTER                                       \
+    amrex::TinyProfileRegion BL_PROFILE_PASTE(tiny_profile_region_, __COUNTER__)((rname), true); \
+    AMREX_WARNING_POP
+#else
+#define BL_PROFILE_REGION_GPU_SYNC(rname) BL_PROFILE_REGION(rname)
+#endif
 #define BL_PROFILE_REGION_START(rname)
 #define BL_PROFILE_REGION_STOP(rname)
 //#define BL_PROFILE_REGION_START(rname)    amrex::TinyProfiler::StartRegion(rname)
@@ -561,10 +603,14 @@ class BLProfiler
 #define BL_PROFILE_VAR_NS(fname, vname)
 #define BL_PROFILE_VAR_START(vname)
 #define BL_PROFILE_VAR_STOP(vname)
+#define BL_PROFILE_GPU_SYNC(fname)
+#define BL_PROFILE_VAR_GPU_SYNC(fname, vname)
+#define BL_PROFILE_VAR_NS_GPU_SYNC(fname, vname)
 #define BL_PROFILE_INIT_PARAMS(ptl,wall,wfabs)
 #define BL_PROFILE_ADD_STEP(snum)
 #define BL_PROFILE_SET_RUN_TIME(rtime)
 #define BL_PROFILE_REGION(rname)
+#define BL_PROFILE_REGION_GPU_SYNC(rname)
 #define BL_PROFILE_REGION_START(rname)
 #define BL_PROFILE_REGION_STOP(rname)
 #define BL_PROFILE_REGION_VAR(fname, rvname)
@@ -576,6 +622,24 @@ class BLProfiler
 #define BL_TRACE_PROFILE_SETFLUSHSIZE(fsize)
 #define BL_PROFILE_CHANGE_FORT_INT_NAME(fname, intname)
 
+#endif
+
+// ============================================================
+// Without the tiny profiler, stub the parts of its API that
+// may be called in any build
+// ============================================================
+
+#ifndef AMREX_TINY_PROFILING
+namespace amrex {
+
+class TinyProfiler
+{
+  public:
+    //! Without the tiny profiler, there is no active profiler
+    [[nodiscard]] static const char* CurrentName () noexcept { return nullptr; }
+};
+
+}
 #endif
 
 // ============================================================

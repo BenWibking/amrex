@@ -55,6 +55,7 @@ public:
     template <typename U> friend class OpenBCSolver;
     template <typename U> friend class Poisson;
     template <typename U> friend class PoissonHybrid;
+    template <typename U> friend class CrossProj;
 
     /**
      * \brief Constructor
@@ -458,14 +459,14 @@ private:
     // Comm meta-data. In the forward phase, we start with (x,y,z),
     // transpose to (y,x,z) and then (z,x,y). In the backward phase, we
     // perform inverse transpose.
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_x2y; // (x,y,z) -> (y,x,z)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_y2x; // (y,x,z) -> (x,y,z)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_y2z; // (y,x,z) -> (z,x,y)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_z2y; // (z,x,y) -> (y,x,z)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_x2z; // (x,y,z) -> (z,x,y)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_z2x; // (z,x,y) -> (x,y,z)
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_x2z_half; // for openbc
-    std::unique_ptr<MultiBlockCommMetaData> m_cmd_z2x_half; // for openbc
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_x2y; // (x,y,z) -> (y,x,z)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_y2x; // (y,x,z) -> (x,y,z)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_y2z; // (y,x,z) -> (z,x,y)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_z2y; // (z,x,y) -> (y,x,z)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_x2z; // (x,y,z) -> (z,x,y)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_z2x; // (z,x,y) -> (x,y,z)
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_x2z_half; // for openbc
+    std::unique_ptr<detail::TransposeMetaData> m_cmd_z2x_half; // for openbc
     Swap01 m_dtos_x2y{};
     Swap01 m_dtos_y2x{};
     Swap02 m_dtos_y2z{};
@@ -493,6 +494,12 @@ private:
 
     std::unique_ptr<R2C<T,D,C>> m_r2c_sub;
     detail::SubHelper m_sub_helper;
+
+    //! Processes that own data, used by the collective strategies only.
+    //! MPI_COMM_NULL on processes that own none.
+    int m_nprocs_active = 0;
+    MPI_Comm m_comm_active = MPI_COMM_NULL;
+    bool m_owns_comm_active = false; // true if it must be freed
 
     Info m_info;
 
@@ -652,32 +659,46 @@ R2C<T,D,C>::R2C (Box const& domain, Info const& info)
         // make copiers
         //
 
+        m_nprocs_active = detail::count_active_procs({&m_rx, &m_cx, &m_cy, &m_cz});
+
 #if (AMREX_SPACEDIM >= 2)
         if (! m_cy.empty()) {
             // comm meta-data between x and y phases
-            m_cmd_x2y = std::make_unique<MultiBlockCommMetaData>
-                (m_cy, m_spectral_domain_y, m_cx, IntVect(0), m_dtos_x2y);
-            m_cmd_y2x = std::make_unique<MultiBlockCommMetaData>
-                (m_cx, m_spectral_domain_x, m_cy, IntVect(0), m_dtos_y2x);
+            m_cmd_x2y = detail::make_transpose
+                (m_nprocs_active, m_cy, m_spectral_domain_y, m_cx, IntVect(0), m_dtos_x2y);
+            m_cmd_y2x = detail::make_transpose
+                (m_nprocs_active, m_cx, m_spectral_domain_x, m_cy, IntVect(0), m_dtos_y2x);
         }
 #endif
 #if (AMREX_SPACEDIM == 3)
         if (! m_cz.empty() ) {
             if (m_slab_decomp) {
                 // comm meta-data between xy and z phases
-                m_cmd_x2z = std::make_unique<MultiBlockCommMetaData>
-                    (m_cz, m_spectral_domain_z, m_cx, IntVect(0), m_dtos_x2z);
-                m_cmd_z2x = std::make_unique<MultiBlockCommMetaData>
-                    (m_cx, m_spectral_domain_x, m_cz, IntVect(0), m_dtos_z2x);
+                m_cmd_x2z = detail::make_transpose
+                    (m_nprocs_active, m_cz, m_spectral_domain_z, m_cx, IntVect(0), m_dtos_x2z);
+                m_cmd_z2x = detail::make_transpose
+                    (m_nprocs_active, m_cx, m_spectral_domain_x, m_cz, IntVect(0), m_dtos_z2x);
             } else {
                 // comm meta-data between y and z phases
-                m_cmd_y2z = std::make_unique<MultiBlockCommMetaData>
-                    (m_cz, m_spectral_domain_z, m_cy, IntVect(0), m_dtos_y2z);
-                m_cmd_z2y = std::make_unique<MultiBlockCommMetaData>
-                    (m_cy, m_spectral_domain_y, m_cz, IntVect(0), m_dtos_z2y);
+                m_cmd_y2z = detail::make_transpose
+                    (m_nprocs_active, m_cz, m_spectral_domain_z, m_cy, IntVect(0), m_dtos_y2z);
+                m_cmd_z2y = detail::make_transpose
+                    (m_nprocs_active, m_cy, m_spectral_domain_y, m_cz, IntVect(0), m_dtos_z2y);
             }
         }
 #endif
+
+        m_info.comm_strategy = detail::resolve_comm_strategy
+            (m_info.comm_strategy, std::max({detail::max_fab_bytes(m_cx),
+                                             detail::max_fab_bytes(m_cy),
+                                             detail::max_fab_bytes(m_cz)}),
+             detail::max_block_bytes({&m_cmd_x2y, &m_cmd_y2x, &m_cmd_y2z,
+                                      &m_cmd_z2y, &m_cmd_x2z, &m_cmd_z2x}),
+             detail::transposes_dense({&m_cmd_x2y, &m_cmd_y2x, &m_cmd_y2z,
+                                       &m_cmd_z2y, &m_cmd_x2z, &m_cmd_z2x}));
+        if (m_info.comm_strategy != CommStrategy::pointtopoint) {
+            m_comm_active = detail::make_active_comm(m_nprocs_active, m_owns_comm_active);
+        }
 
         //
         // make plans
@@ -768,6 +789,7 @@ R2C<T,D,C>::~R2C ()
         m_fft_bwd_x_half.destroy();
     }
     m_fft_fwd_x_half.destroy();
+    detail::free_active_comm(m_comm_active, m_owns_comm_active);
 }
 
 template <typename T, Direction D, bool C>
@@ -803,19 +825,30 @@ void R2C<T,D,C>::setLocalDomain (std::array<int,AMREX_SPACEDIM> const& local_sta
                                  std::array<int,AMREX_SPACEDIM> const& local_size)
 {
     auto const& [ba, dm] = make_layout_from_local_domain(local_start, local_size);
-    m_raw_mf = MF(ba, dm, m_rx.nComp(), 0, MFInfo().SetAlloc(false));
+    m_raw_mf = MF(ba, dm, m_info.batch_size, 0, MFInfo().SetAlloc(false));
 }
 
 template <typename T, Direction D, bool C>
 std::pair<std::array<int,AMREX_SPACEDIM>,std::array<int,AMREX_SPACEDIM>>
 R2C<T,D,C>::getLocalDomain () const
 {
-    m_raw_mf = MF(m_rx.boxArray(), m_rx.DistributionMap(), m_rx.nComp(), 0,
-                  MFInfo{}.SetAlloc(false));
+    auto const ncomp = m_info.batch_size;
+
+#if (AMREX_SPACEDIM > 1)
+    if (m_r2c_sub) {
+        m_raw_mf = MF(m_sub_helper.inverse_boxarray(m_r2c_sub->m_rx.boxArray()),
+                      m_r2c_sub->m_rx.DistributionMap(), ncomp, 0,
+                      MFInfo{}.SetAlloc(false));
+    } else
+#endif
+    {
+        m_raw_mf = MF(m_rx.boxArray(), m_rx.DistributionMap(), ncomp, 0,
+                      MFInfo{}.SetAlloc(false));
+    }
 
     auto const myproc = ParallelContext::MyProcSub();
-    if (myproc < m_rx.size()) {
-        Box const& box = m_rx.box(myproc);
+    if (myproc < m_raw_mf.size()) {
+        Box const& box = m_raw_mf.box(myproc);
         return std::make_pair(box.smallEnd().toArray(),
                               box.length().toArray());
     } else {
@@ -829,7 +862,7 @@ void R2C<T,D,C>::setLocalSpectralDomain (std::array<int,AMREX_SPACEDIM> const& l
                                          std::array<int,AMREX_SPACEDIM> const& local_size)
 {
     auto const& [ba, dm] = make_layout_from_local_domain(local_start, local_size);
-    m_raw_cmf = cMF(ba, dm, m_rx.nComp(), 0, MFInfo().SetAlloc(false));
+    m_raw_cmf = cMF(ba, dm, m_info.batch_size, 0, MFInfo().SetAlloc(false));
 }
 
 template <typename T, Direction D, bool C>
@@ -894,15 +927,15 @@ void R2C<T,D,C>::prepare_openbc ()
         // Note that z-direction's index is 0 because we z is the
         // unit-stride direction here.
         bottom_half.growHi(0,-m_spectral_domain_z.length(0)/2);
-        m_cmd_x2z_half = std::make_unique<MultiBlockCommMetaData>
-            (m_cz, bottom_half, m_cx, IntVect(0), m_dtos_x2z);
+        m_cmd_x2z_half = detail::make_transpose
+            (m_nprocs_active, m_cz, bottom_half, m_cx, IntVect(0), m_dtos_x2z);
     }
 
     if (m_cmd_z2x && ! m_cmd_z2x_half) {
         Box bottom_half = m_spectral_domain_x;
         bottom_half.growHi(2,-m_spectral_domain_x.length(2)/2);
-        m_cmd_z2x_half = std::make_unique<MultiBlockCommMetaData>
-            (m_cx, bottom_half, m_cz, IntVect(0), m_dtos_z2x);
+        m_cmd_z2x_half = detail::make_transpose
+            (m_nprocs_active, m_cx, bottom_half, m_cz, IntVect(0), m_dtos_z2x);
     }
 #endif
 }
@@ -996,32 +1029,25 @@ void R2C<T,D,C>::forward (MF const& inmf, int incomp)
     }
 
     if (                          m_cmd_x2y) {
-        ParallelCopy(m_cy, m_cx, *m_cmd_x2y, 0, 0, ncomp, m_dtos_x2y);
+        detail::transpose(m_cy, m_cx, *m_cmd_x2y, ncomp, m_dtos_x2y, m_info.comm_strategy, m_comm_active);
     }
     m_fft_fwd_y.template compute_c2c<Direction::forward>();
 
     if (                          m_cmd_y2z) {
-        ParallelCopy(m_cz, m_cy, *m_cmd_y2z, 0, 0, ncomp, m_dtos_y2z);
+        detail::transpose(m_cz, m_cy, *m_cmd_y2z, ncomp, m_dtos_y2z, m_info.comm_strategy, m_comm_active);
     }
 #if (AMREX_SPACEDIM == 3)
     else if (                     m_cmd_x2z) {
         if (m_openbc_half) {
-            NonLocalBC::PackComponents components{};
-            components.n_components = ncomp;
-            NonLocalBC::ApplyDtosAndProjectionOnReciever packing
-                {components, m_dtos_x2z};
-            auto handler = ParallelCopy_nowait(m_cz, m_cx, *m_cmd_x2z_half, packing);
-
+            // Only the lower half is received; zero the upper half.
             Box upper_half = m_spectral_domain_z;
             // Note that z-direction's index is 0 because we z is the
             // unit-stride direction here.
             upper_half.growLo (0,-m_spectral_domain_z.length(0)/2);
             m_cz.setVal(0, upper_half, 0, ncomp);
-
-            ParallelCopy_finish(m_cz, std::move(handler), *m_cmd_x2z_half, packing);
-        } else {
-            ParallelCopy(m_cz, m_cx, *m_cmd_x2z, 0, 0, ncomp, m_dtos_x2z);
         }
+        auto const& cmd = m_openbc_half ? m_cmd_x2z_half : m_cmd_x2z;
+        detail::transpose(m_cz, m_cx, *cmd, ncomp, m_dtos_x2z, m_info.comm_strategy, m_comm_active);
     }
 #endif
     m_fft_fwd_z.template compute_c2c<Direction::forward>();
@@ -1140,18 +1166,18 @@ void R2C<T,D,C>::backward_doit (MF& outmf, IntVect const& ngout,
 
     m_fft_bwd_z.template compute_c2c<Direction::backward>();
     if (                          m_cmd_z2y) {
-        ParallelCopy(m_cy, m_cz, *m_cmd_z2y, 0, 0, ncomp, m_dtos_z2y);
+        detail::transpose(m_cy, m_cz, *m_cmd_z2y, ncomp, m_dtos_z2y, m_info.comm_strategy, m_comm_active);
     }
 #if (AMREX_SPACEDIM == 3)
     else if (                     m_cmd_z2x) {
         auto const& cmd = m_openbc_half ? m_cmd_z2x_half : m_cmd_z2x;
-        ParallelCopy(m_cx, m_cz, *cmd, 0, 0, ncomp, m_dtos_z2x);
+        detail::transpose(m_cx, m_cz, *cmd, ncomp, m_dtos_z2x, m_info.comm_strategy, m_comm_active);
     }
 #endif
 
     m_fft_bwd_y.template compute_c2c<Direction::backward>();
     if (                          m_cmd_y2x) {
-        ParallelCopy(m_cx, m_cy, *m_cmd_y2x, 0, 0, ncomp, m_dtos_y2x);
+        detail::transpose(m_cx, m_cy, *m_cmd_y2x, ncomp, m_dtos_y2x, m_info.comm_strategy, m_comm_active);
     }
 
     auto& fft_x = m_openbc_half ? m_fft_bwd_x_half : m_fft_bwd_x;
@@ -1362,8 +1388,14 @@ void R2C<T,D,C>::post_forward_doit_1 (F const& post_forward)
 template <typename T, Direction D, bool C>
 T R2C<T,D,C>::scalingFactor () const
 {
+#if (AMREX_SPACEDIM > 1)
+    // The sub-object knows which axes are actually transformed.
+    if (m_r2c_sub) { return m_r2c_sub->scalingFactor(); }
+#endif
+
 #if (AMREX_SPACEDIM == 3)
-    if (m_info.oned_mode && !m_info.twod_mode) {
+    // oned_mode wins over twod_mode, like it does when the plans are made.
+    if (m_info.oned_mode) {
         return T(1)/T(Long(m_real_domain.length(0)));
     } else if (m_info.twod_mode) {
         return T(1)/T(Long(m_real_domain.length(0)) *

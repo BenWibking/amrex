@@ -2,7 +2,9 @@
 #define AMREX_HYPRE_ML_ABECLAP_H_
 #include <AMReX_Config.H>
 
+#include <AMReX_CompositeSystemUtil.H>
 #include <AMReX_Geometry.H>
+#include <AMReX_HypreIJIface.H>
 #include <AMReX_LO_BCTYPES.H>
 #include <AMReX_MLMGBndry.H>
 #include <AMReX_MultiFab.H>
@@ -11,6 +13,7 @@
 #include <HYPRE_sstruct_ls.h>
 
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
 /**
@@ -64,6 +67,28 @@ public:
     void setIsSingular (bool v) { m_is_singular = v; }
 
     /**
+     * \brief IJ mode only: let setup() be called again with new coefficients
+     * (same grids), updating the matrix values in place and keeping the
+     * solver/preconditioner setup, which then only approximates the new
+     * operator (see resetSolverSetup()).
+     */
+    void setReuseSolverSetup (bool v) { m_reuse_setup = v; }
+    //! IJ mode with setup reuse (hypre or AlgMG backend): redo the setup at
+    //! the next solve when a solve with a reused setup needs more than \p n
+    //! iterations (0: never; this is also `<prefix>.reuse_setup_max_iter`)
+    void setReuseSetupMaxIter (int n) noexcept { m_reuse_max_iter = n; }
+    //! IJ mode only: redo the solver/preconditioner setup at the next solve
+    void resetSolverSetup () {
+        if (m_ij_solver) { m_ij_solver->setNeedSetup(); }
+        m_algmg_reset = true;
+    }
+    //! Throw std::runtime_error instead of aborting when the solve fails
+    void setThrowException (bool t) noexcept { m_throw_exception = t; }
+    //! Iterations and final relative residual of the last solve
+    [[nodiscard]] int getNumIters () const noexcept { return m_num_iters; }
+    [[nodiscard]] Real getFinalResidualNorm () const noexcept { return m_final_res; }
+
+    /**
      * \brief Assemble the HYPRE operators/storage for the provided coefficients.
      *
      * \param a_ascalar   Scalar applied to the diagonal term.
@@ -72,7 +97,7 @@ public:
      * \param a_bcoefs    Level-by-level arrays of face-centered `b` coefficients.
      * \param a_lobc      Low-side boundary-condition types.
      * \param a_hibc      High-side boundary-condition types.
-     * \param a_levelbcdata BC data per level.
+     * \param a_levelbcdata BC data per level; a missing or null entry means zero.
      * \param a_coarse_bc Optional BC data from even coarser AMR level.
      */
     void setup (Real a_ascalar, Real a_bscalar,
@@ -115,9 +140,28 @@ public:
     void commBCoefs_local (int flev, Array<MultiFab const*,AMREX_SPACEDIM> const& a_bcoefs,
                            Vector<FabArrayBase::CopyComTag> const& tags);
 
+    //! Build the device maps of the IJ assembly; public for cuda
+    void buildIJMaps ();
+
+    //! Map the assembled triplets to the hypre matrix's value arrays
+    //! (m_ij_gather); public for cuda
+    void buildIJSlots (Gpu::DeviceVector<HYPRE_BigInt> const& rows,
+                       Gpu::DeviceVector<HYPRE_BigInt> const& cols);
+    //! Overwrite the hypre matrix's values with the triplet values
+    //! (m_ij_gather); public for cuda
+    void updateIJValues (Gpu::DeviceVector<Real> const& vals);
+
+    //! Solve with the IJ system (see m_use_ij); public for cuda
+    void solveIJ (Vector<MultiFab*> const& a_sol, Vector<MultiFab const*> const& a_rhs,
+                  Real a_reltol, Real a_abstol);
+
 private:
 
     void addNonStencilEntriesToGraph ();
+
+    //! Global row id of cell iv on level lev in the IJ system (-1 if the
+    //! cell is not on the level's grids); periodic images are wrapped.
+    [[nodiscard]] Long cellId (int lev, IntVect const& iv) const;
 
     int m_verbose = 0;
     int m_maxiter = 200;
@@ -182,6 +226,83 @@ private:
     HYPRE_SStructVector  m_ss_b = nullptr;
 
     HYPRE_Solver m_solver = nullptr;
+
+    //! Configurable ParCSR solver (e.g. FlexGMRES + BoomerAMG), used when
+    //! `<prefix>.hypre_solver` is given; otherwise the built-in BoomerAMG
+    std::unique_ptr<HypreIJIface> m_ij_solver;
+
+    //! IJ mode (`<prefix>.hypre_solver` given or `backend = algmg`): one
+    //! assembled matrix, no SStruct matrix or vectors
+    bool m_use_ij = false;
+    bool m_reuse_setup = false;
+    bool m_throw_exception = false;
+    //! The hypre vectors were assembled once; later solves write into them
+    bool m_ij_vectors_assembled = false;
+    bool m_ij_gather_failed = false; // hypre dropped an entry: no in-place updates
+    //! AlgMG backend: build a new hierarchy at the next setup or solve
+    bool m_algmg_reset = false;
+    //! AlgMG backend: the last setup kept the hierarchy
+    bool m_algmg_kept = false;
+    int m_reuse_max_iter = 0;
+    Vector<Vector<Long>> m_box_offset;  // first row id of each box, per level
+    Long m_ij_lower = 0;
+    Long m_ij_upper = -1;
+    //! Targets of the non-stencil entries of each local row (until buildIJMaps)
+    std::unordered_map<Long,Vector<Long>> m_ns_targets;
+    //! Device maps for the IJ assembly: row id of each cell (ghost cells:
+    //! same-level neighbours, -1 off the grids), and the targets of the
+    //! coarse-to-fine and fine-to-coarse entries aligned with their values
+    Vector<std::unique_ptr<FabArray<BaseFab<Long>>>> m_cell_id;
+    Vector<LayoutData<Gpu::DeviceVector<HYPRE_BigInt>>> m_c2f_targets;
+    Vector<Gpu::DeviceVector<HYPRE_BigInt>> m_f2c_rows;
+    Vector<Gpu::DeviceVector<HYPRE_BigInt>> m_f2c_cols;
+    Gpu::DeviceVector<HYPRE_BigInt> m_ij_rowids; // the local rows
+    //! With setup reuse, the triplets of later setups are summed directly
+    //! into a matrix's value array, each entry adding its triplets in
+    //! increasing triplet order so that the sums do not depend on thread
+    //! scheduling: the triplets of entry e are trip[offset[e]:offset[e+1]].
+    struct EntryGather
+    {
+        Gpu::DeviceVector<Long> offset;
+        Gpu::DeviceVector<Long> trip;
+        [[nodiscard]] bool empty () const { return offset.empty(); }
+        [[nodiscard]] Long numTriplets () const { return Long(trip.size()); }
+        void clear () { offset.clear(); trip.clear(); }
+    };
+    //! Hypre backend: entries of the assembled hypre matrix, diag values
+    //! first, then offd values; empty if not built
+    EntryGather m_ij_gather;
+
+    //! `<prefix>.backend = hypre` (default) or `algmg`: in IJ mode, solve the
+    //! assembled composite system with hypre or with AMReX's AlgMG
+    //! (`<prefix>.algmg.*`).  `backend = algmg` implies IJ mode.
+    enum class Backend { hypre, algmg };
+    Backend m_backend = Backend::hypre;
+    int m_num_iters = 0;                     // last solve (IJ mode)
+    Real m_final_res = 0.0;
+    Vector<Long> m_rank_offset;              // first row of each rank, plus the total
+    composite::OwnedCSR m_csr;               // owned rows (AlgMG backend, dumps)
+    std::unique_ptr<SpMatrix<Real>> m_spA;
+    std::unique_ptr<AlgMG<Real>> m_algmg;
+    //! AlgMG backend with setup reuse: the sorted CSR pattern of the local
+    //! rows and the triplets of each of its entries (empty if not built)
+    Gpu::DeviceVector<Long> m_alg_row_offset;
+    Gpu::DeviceVector<Long> m_alg_col_index;
+    EntryGather m_alg_gather;
+
+    //! `<prefix>.dump_matrix = N`: Matrix Market dumps of the first N solves
+    //! with this dump prefix, counted over all objects of the run: for solve
+    //! k, `<dump_prefix>_<k>_A.mtx`, `_b.mtx`, `_x.mtx` and `_rows.txt`
+    //! (level and cell of each row).  `<prefix>.dump_prefix` (default: the
+    //! ParmParse prefix).  Files with more than `<prefix>.dump_gather_max`
+    //! values (matrix entries, or vector and row-map values; default 5e7)
+    //! are written one per rank, as `<file>.<rank>`.
+    int m_dump_max = 0;
+    std::string m_dump_prefix;
+    Long m_dump_gather_max = 50000000;
+    void dumpSystem (int k, Gpu::DeviceVector<Real> const& v, bool solution);
+    //! Throw (setThrowException) or abort with \p msg
+    void fail (std::string const& msg) const;
 
     HypreSolverID m_hypre_solver_id = HypreSolverID::BoomerAMG;
     HYPRE_Int m_hypre_object_type = HYPRE_PARCSR;

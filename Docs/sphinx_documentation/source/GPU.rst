@@ -69,7 +69,9 @@ detailed throughout the rest of this chapter:
   loops, since in AMReX's approach to parallelism it is assumed that separate :cpp:`Box` objects
   can be processed independently. However, AMReX also provides a :cpp:`MultiFab` version
   of :cpp:`ParallelFor` that can process an entire level worth of :cpp:`Box` objects in
-  a single kernel launch when it is safe to do so.
+  a single kernel launch when it is safe to do so. :cpp:`ParallelForStrided` and
+  :cpp:`ParallelForRedBlack` do the same for a strided subset of points, e.g., one
+  color of a multi-color or red-black Gauss-Seidel sweep.
 
 - AMReX can utilize GPU managed memory to automatically handle memory
   movement for mesh and particle data.  Simple data structures, such
@@ -148,6 +150,13 @@ a different compiler.  One can change this by setting ``NVCC_HOST_COMP``.
 For example, ``COMP=pgi`` alone will compile C/C++ codes with NVCC/GCC
 and Fortran codes with PGI, and link with PGI.  Using ``COMP=pgi`` and
 ``NVCC_HOST_COMP=pgi`` will compile C/C++ codes with PGI and NVCC/PGI.
+
+With CUDA, ``GPU_MIN_BLOCKS=B`` (``-DAMReX_GPU_MIN_BLOCKS=B`` in CMake) limits
+the registers per thread in GPU code so that ``B`` blocks of
+``GPU_MAX_THREADS`` threads fit on a streaming multiprocessor. A larger ``B``
+gives higher occupancy but can cause register spilling. Keep ``B`` times
+``GPU_MAX_THREADS`` within the GPU's limit of resident threads per
+multiprocessor.
 
 You can use ``amrex-tutorials/ExampleCodes/Basic/HelloWorld_C/``
 to test your programming environment.  For example, building with:
@@ -264,6 +273,8 @@ check the :ref:`table <tab:cmakecudavar>` below.
    |                              |  (requires AMReX_GPU_RDC)                       |             |                 |
    +------------------------------+-------------------------------------------------+-------------+-----------------+
    | AMReX_CUDA_MAXREGCOUNT       |  Limits the number of CUDA registers available  | 255         | User-defined    |
+   +------------------------------+-------------------------------------------------+-------------+-----------------+
+   | AMReX_GPU_MIN_BLOCKS         |  Min resident blocks per SM (see above)         | None        | User-defined    |
    +------------------------------+-------------------------------------------------+-------------+-----------------+
    | AMReX_CUDA_PTX_VERBOSE       |  Verbose code generation statistics in ptxas    | NO          | YES, NO         |
    +------------------------------+-------------------------------------------------+-------------+-----------------+
@@ -630,8 +641,17 @@ to :cpp:`The_Arena()` to reduce memory fragmentation.
 
 In :cpp:`amrex::Initialize`, a large amount of GPU device memory is
 allocated and is kept in :cpp:`The_Arena()`.  The default is 3/4 of the
-total device memory, and it can be changed with a :cpp:`ParmParse`
-parameter, ``amrex.the_arena_init_size``, in the unit of bytes. The default
+total device memory divided by the number of MPI processes sharing the
+device.  On integrated GPUs (e.g., AMD MI300A) that share memory with the
+host, the default is 3/8 instead, leaving memory for the host.  SYCL
+devices are not detected as integrated.  The size can be changed with a
+:cpp:`ParmParse` parameter,
+``amrex.the_arena_init_size``, in the unit of bytes.  Note that only the
+processes in the communicator passed to :cpp:`amrex::Initialize` are
+counted.  In MPMD runs, or when an application splits the communicator and
+initializes AMReX on each part, processes from different communicators may
+share a device.  In that case, the default oversubscribes the device, and
+the size should be set explicitly.  The default
 can also be changed with an environment variable
 ``AMREX_THE_ARENA_INIT_SIZE=X``, where ``X`` is the number of bytes. When
 both the :cpp:`ParmParse` parameter and the environment variable are
@@ -662,6 +682,11 @@ a separate arena, the behavior of :cpp:`The_Device_Area()` or
 the parameter discussed above are bytes.  All these arenas also have a
 member function :cpp:`freeUnused()` that can be used to manually release
 unused memory back to the system.
+
+If an arena runs out of memory, it throws :cpp:`amrex::OutOfMemoryError`,
+which is derived from :cpp:`std::bad_alloc`, and its :cpp:`what()` describes
+the request and the current memory usage.  An uncaught exception terminates the
+run.
 
 If you want to print out the current memory usage
 of the Arenas, you can call :cpp:`amrex::Arena::PrintUsage()`.
@@ -733,15 +758,15 @@ can take initial values from the host and move them to the device.  It
 can copy the data from device back to host.  It can also be used as
 scratch space on device.
 
-The call to delete the memory is added to the GPU stream as a callback
-function in the destructor of :cpp:`AsyncArray`. This guarantees the
-memory allocated in :cpp:`AsyncArray` continues to exist after the
-:cpp:`AsyncArray` object is deleted when going out of scope until
-after all GPU kernels in the stream are completed without forcing the
-code to synchronize. The resulting :cpp:`AsyncArray` class is
-"async-safe", meaning it can be safely used in asynchronous code
-regions that contain both CPU work and GPU launches, including
-:cpp:`MFIter` loops.
+The destructor of :cpp:`AsyncArray` does not release the memory
+immediately. The memory is held until the next time the GPU stream is
+synchronized, so it continues to exist after the :cpp:`AsyncArray`
+object goes out of scope while GPU kernels already launched in the
+stream may still be using it. In case too much memory is being held,
+the stream is synchronized automatically. The resulting
+:cpp:`AsyncArray` class is "async-safe", meaning it can be safely used
+in asynchronous code regions that contain both CPU work and GPU
+launches, including :cpp:`MFIter` loops.
 
 :cpp:`AsyncArray` is also portable. When AMReX is compiled without
 GPU support, the object only stores and handles the CPU version of
@@ -1046,6 +1071,34 @@ As another example, the following function computes the max- and 1-norm of a
 It should be noted that the reduction result of :cpp:`ParReduce` is local
 and it is the user's responsibility if MPI communication is needed.
 
+:cpp:`ParReduce` with a number of components reduces over the components as
+well.  To get a separate result for each component, use
+:cpp:`ParReducePerComp`, which takes the same arguments and returns a
+:cpp:`Vector` with one result per component.  :cpp:`ParReducePerBoxComp`
+returns one result per local box and component, stored at index
+``box_no*ncomp+n``.  For example, the following function computes the
+minimum and maximum of every component of a :cpp:`MultiFab`.
+
+.. highlight:: c++
+
+::
+
+    Vector<GpuTuple<Real,Real>> compute_minmax (MultiFab const& mf)
+    {
+        auto const& ma = mf.const_arrays();
+        return ParReducePerComp(TypeList<ReduceOpMin,ReduceOpMax>{},
+                                TypeList<Real,Real>{},
+                                mf, IntVect(0), mf.nComp(),
+               [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k, int n)
+                   noexcept -> GpuTuple<Real,Real>
+               {
+                   Real a = ma[box_no](i,j,k,n);
+                   return { a, a };
+               });
+    }
+
+Like :cpp:`ParReduce`, these functions return local results.
+
 Box, IntVect and IndexType
 --------------------------
 
@@ -1247,6 +1300,83 @@ loops.  For example, on the GPU the spatial coordinate loops are reduced to a si
 loop and the component loop is moved to these innermost loops.  AMReX's launch functions
 apply the appropriate optimizations for compiling both with and without GPU support
 in a compact and readable format.
+
+.. _sec:gpu:compile-time-options:
+
+Compile-time options for ParallelFor
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a kernel has a small set of runtime choices, :cpp:`amrex::ParallelFor`
+can generate a specialized kernel for each choice using
+:cpp:`amrex::CompileTimeOptions`. The runtime value selects which specialization
+to launch. Inside the lambda, the selected option is a compile-time constant,
+so :cpp:`if constexpr` can discard branches that do not apply to that
+specialization. This interface works on both CPUs and GPUs.
+
+For example, the following code either assigns or adds to component zero of a
+:cpp:`MultiFab` named :cpp:`mf`:
+
+.. code-block:: c++
+
+    #include <AMReX_GpuLaunch.H>
+    #include <AMReX_MFIter.H>
+    #include <AMReX_MultiFab.H>
+
+    enum Update : int { Assign = 0, Add = 1 };
+    int update = Add; // May instead be selected from runtime input.
+
+    for (amrex::MFIter mfi(mf, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        auto const& box = mfi.tilebox();
+        auto const arr = mf.array(mfi);
+
+        amrex::ParallelFor(
+            amrex::TypeList<amrex::CompileTimeOptions<Assign, Add>>{},
+            {update}, box,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k, auto option)
+            {
+                // Reference the captured array before the constexpr branches.
+                auto const& a = arr;
+                if constexpr (option.value == Assign) {
+                    a(i,j,k,0) = 1.0;
+                } else {
+                    a(i,j,k,0) += 1.0;
+                }
+            });
+    }
+
+The :cpp:`TypeList` contains one :cpp:`CompileTimeOptions` set for each
+runtime parameter. Each set lists the allowed :cpp:`int` values; every runtime
+value must belong to its corresponding set. The next argument supplies the
+runtime values in the same order. After the usual loop indices, the lambda
+receives one :cpp:`auto` argument per option set, also in that order. Each
+argument is a :cpp:`std::integral_constant<int, value>` whose :cpp:`.value`
+can be used in a compile-time condition.
+
+For multiple parameters, use, for example,
+:cpp:`amrex::TypeList<amrex::CompileTimeOptions<0, 1>, amrex::CompileTimeOptions<0, 1, 2>>{}`
+with runtime values :cpp:`{first_option, second_option}` and trailing lambda
+arguments :cpp:`auto first, auto second`. All combinations are instantiated:
+this example produces six specializations, but each call launches only the
+matching one. Keep the option sets small, since their Cartesian product can
+increase compilation time and executable size.
+
+Compile-time options are supported for the 1D :cpp:`N`, :cpp:`Box`, and
+:cpp:`Box` plus component-count overloads. For the component-count overload,
+the option arguments follow the component index :cpp:`n`. The same interface
+is available for :cpp:`amrex::For`, which omits the CPU SIMD pragma as described
+above.
+
+.. note::
+
+    CUDA extended device lambdas have a restriction on first capturing a
+    variable inside an :cpp:`if constexpr` branch. If NVCC reports a capture
+    error, reference the captured variable before the branches, as shown with
+    :cpp:`arr` above. Alternatively, use a regular :cpp:`if`; its condition is
+    still known at compile time and can be optimized by the compiler.
+
+Loop launch examples
+^^^^^^^^^^^^^^^^^^^^
 
 AMReX also provides a variation of the launch function that is implemented as a
 C++ macro.  It behaves identically to the function, but hides the lambda function
@@ -1734,12 +1864,37 @@ One could also use :cpp:`Gpu::NoSyncRegion`, as shown below:
 
      // Gpu::streamSynchronize(); Explicit synchronization is allowed.
 
-     for (MFIter mfi(mf2); mfi.isValid9); ++mfi) { .... }
+     for (MFIter mfi(mf2); mfi.isValid(); ++mfi) { .... }
    }
 
 This approach suppresses implicit synchronization for all operations within
 the scoped region and restores the previous synchronization setting upon
-exiting.
+exiting.  A variant, :cpp:`Gpu::SyncAtExitOnly`, additionally synchronizes
+the GPU streams when the scope is exited, unless the enclosing code is
+already inside a :cpp:`Gpu::NoSyncRegion`.  This is convenient for functions
+that want to skip the implicit synchronizations internally but return with
+all their GPU work completed.  For example, :cpp:`MLMG::solve` uses it
+together with :cpp:`Gpu::SingleStreamRegion` when
+:cpp:`MLMG::setNoGpuSync(true)` has been called.
+
+Inside a no-sync region, all GPU work should be launched on a single stream
+(e.g., by also using :cpp:`Gpu::SingleStreamRegion`) unless the ordering
+between streams is managed explicitly.  Temporary :cpp:`MultiFab`\ s and
+:cpp:`FArrayBox`\ es that are created and destroyed inside the region should
+be allocated from :cpp:`The_Async_Arena()` (e.g., with
+:cpp:`MFInfo().SetArena(The_Async_Arena())`), which releases their device
+memory in a stream-ordered fashion.  Memory freed to an ordinary arena, such
+as :cpp:`The_Arena()`, may be returned to the system (e.g., when the arena
+is under pressure or :cpp:`amrex.the_arena_release_threshold` is small)
+while kernels using it are still queued on the stream.  Whether that is
+safe depends on the backend (CUDA and HIP synchronize the whole device
+before releasing memory, SYCL does not), so it must not be relied upon.
+The auxiliary pinned host buffers
+AMReX allocates for a :cpp:`FabArray` are always released in a
+stream-ordered fashion.  Host code that needs to read the results of GPU
+work must still synchronize explicitly (reductions such as
+:cpp:`MultiFab::sum` do this internally), and so must code that hands GPU
+data to a library that runs on its own stream (e.g., HYPRE).
 
 .. _sec:gpu:external-streams:
 
@@ -2074,31 +2229,112 @@ and recommendations for improving the code.  For more information on how to
 use ``nvprof``, see NVIDIA's User's Guide as well as the help web pages of
 your favorite supercomputing facility that uses NVIDIA GPUs.
 
-AMReX's internal profilers currently cannot hook into profiling information
-on the GPU and an efficient way to time and retrieve that information is
-being explored. In the meantime, AMReX's timers can be used to report some
-generic timers that are useful in categorizing an application.
+AMReX's internal profilers do not hook into backend profiling information,
+but TinyProfiler can measure selected GPU scopes by synchronizing the current
+AMReX GPU stream at their timer boundaries.
 
-Due to the asynchronous launching of GPU kernels, any AMReX timers inside of
-asynchronous regions or inside GPU kernels will not measure useful
-information.  However, since the :cpp:`MFIter` synchronizes when being
-destroyed, any timer wrapped around an :cpp:`MFIter` loop will yield a
-consistent timing of the entire set of GPU launches contained within. For
-example:
+Due to asynchronous GPU kernel launches, an ordinary host timer might finish
+before the work launched inside it. Use :cpp:`BL_PROFILE_GPU_SYNC` (or its
+variable and region variants) when a TinyProfiler timer must include work
+launched on the current stream. With the full profiler (``PROFILE=TRUE``),
+these macros are ordinary, unsynchronized timers. For example:
 
 .. highlight:: cpp
 
 ::
 
-    BL_PROFILE_VAR("A_NAME", blp);     // Profiling start
+    BL_PROFILE_VAR_GPU_SYNC("A_NAME", blp); // Synchronize, then start timing
     for (MFIter mfi(mf); mfi.isValid(); ++mfi)
     {
         // gpu works
     }
-    BL_PROFILE_STOP(blp);              // Profiling stop
+    BL_PROFILE_VAR_STOP(blp);           // Synchronize, then stop timing
 
-For now, this is the best way to profile GPU codes using ``TinyProfiler``.
-If you require further profiling detail, use ``nvprof``.
+The synchronized macros add synchronization points that are unnecessary for
+correctness and may affect application performance. Once one executes, the
+TinyProfiler report focuses on synchronized timers, synchronized regions, and
+the outermost timer; see :ref:`sec:tiny:gpu_sync` for the complete behavior.
+The runtime parameter ``tiny_profiler.device_synchronize_around_region``
+instead synchronizes every TinyProfiler timer boundary and keeps the complete
+report. For detailed kernel information, use a backend profiling tool.
+
+
+.. _sec:gpu:device_selection:
+
+Assigning GPUs to MPI Ranks
+===========================
+
+If each MPI rank sees only one GPU, AMReX uses it. If multiple GPUs are
+visible, AMReX picks one for each rank based on the rank's position within
+the node and, on some machines such as Perlmutter and Frontier, the machine's
+CPU/GPU affinity.
+
+Some GPU-aware MPI libraries, such as Cray MPICH and Open MPI, set up GPU
+communication on the current GPU during MPI initialization. A process that switches to another
+GPU afterwards may get much slower GPU-aware MPI communication. Recent Cray
+MPICH versions report this as "This process is not using the same device it
+did during gtl_init". To avoid it, the GPU must be selected before MPI is
+initialized.
+
+* If AMReX initializes MPI, it selects the GPU first, using the node-local
+  rank provided by the job launcher (e.g., ``SLURM_LOCALID`` for ``srun`` and
+  ``OMPI_COMM_WORLD_LOCAL_RANK`` for Open MPI's ``mpirun``). Nothing needs to
+  be done.
+
+* If the application initializes MPI itself, it should call
+  :cpp:`amrex::Gpu::SelectDeviceBeforeMPIInit()` before ``MPI_Init``.
+  :cpp:`amrex::Initialize` then uses the selected GPU.
+
+.. highlight:: c++
+
+::
+
+    int main (int argc, char* argv[])
+    {
+        amrex::Gpu::SelectDeviceBeforeMPIInit();
+        MPI_Init(&argc, &argv);
+        amrex::Initialize(argc, argv, true, MPI_COMM_WORLD);
+        ...
+    }
+
+* Alternatively, make only one GPU visible to each rank before the program
+  starts. Slurm's GPU binding options (e.g., ``--gpus-per-task=1`` and
+  ``--gpu-bind=closest``) do this and give each rank the GPU closest to its
+  CPU cores. This is the recommended way to launch jobs on Frontier, for
+  example. However, on systems where Slurm restricts device access with
+  cgroups, these options can prevent GPU-aware MPI from transferring data
+  directly between GPUs on the same node. On Perlmutter, this makes GPU-aware
+  MPI hang, or run very slowly if the direct transfers are disabled. On such
+  systems, use ``--gpu-bind=none`` and set ``CUDA_VISIBLE_DEVICES`` (CUDA) or
+  ``ROCR_VISIBLE_DEVICES`` (HIP) in a wrapper script instead. On Perlmutter,
+  with four ranks per node, the following wrapper script gives each rank the
+  GPU closest to its CPU cores.
+
+.. highlight:: bash
+
+::
+
+    #!/bin/bash
+    # Usage: srun ... --cpu-bind=cores --gpu-bind=none ./wrapper.sh ./main3d.ex inputs
+    export CUDA_VISIBLE_DEVICES=$((3-SLURM_LOCALID))
+    exec "$@"
+
+For HIP, set ``ROCR_VISIBLE_DEVICES`` instead. The order of the GPUs is
+machine dependent; check the system's documentation. For example, with eight
+ranks per node:
+
+::
+
+    #!/bin/bash
+    # Usage: srun ... --gpu-bind=none ./wrapper.sh ./main3d.ex inputs
+    gpu_order=(4 5 2 3 6 7 0 1)  # machine dependent
+    export ROCR_VISIBLE_DEVICES=${gpu_order[$SLURM_LOCALID]}
+    exec "$@"
+
+GPU-aware MPI communication is slower if a rank can see more than one AMD
+GPU, even when the GPU is selected before MPI initialization. On AMD systems,
+making only one GPU visible to each rank is therefore the preferred setup,
+whether or not AMReX initializes MPI.
 
 
 Performance Tips
@@ -2145,7 +2381,8 @@ AMReX for GPUs:
   AMReX will attempt to do the best job it can assigning MPI ranks to GPUs by
   doing round robin assignment. This may be suboptimal because this assignment
   scheme would not be aware of locality benefits that come from having an MPI
-  rank be on the same socket as the GPU it is managing.
+  rank be on the same socket as the GPU it is managing. See
+  :ref:`sec:gpu:device_selection` for how this interacts with GPU-aware MPI.
 
 
 .. ===================================================================
@@ -2168,8 +2405,9 @@ by "amrex" in your :cpp:`inputs` file.
 |                            | derivative implementations).                                          |             |                |
 +----------------------------+-----------------------------------------------------------------------+-------------+----------------+
 | abort_on_out_of_gpu_memory | If the size of free memory on the GPU is less than the size of a      | Bool        | 0              |
-|                            | requested allocation, AMReX will call AMReX::Abort() with an error    |             |                |
-|                            | describing how much free memory there is and what was requested.      |             |                |
+|                            | requested allocation, AMReX will throw amrex::OutOfMemoryError with   |             |                |
+|                            | an error describing how much free memory there is and what was        |             |                |
+|                            | requested.                                                            |             |                |
 +----------------------------+-----------------------------------------------------------------------+-------------+----------------+
 | the_arena_is_managed       | Whether :cpp:`The_Arena()` allocates managed memory.                  | Bool        | 0              |
 +----------------------------+-----------------------------------------------------------------------+-------------+----------------+

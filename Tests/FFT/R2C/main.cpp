@@ -5,8 +5,23 @@
 #include <AMReX_ParReduce.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
+#include <string>
 
 using namespace amrex;
+
+namespace {
+// Communication strategy for the transposes, from the input comm_strategy.
+FFT::Info test_info ()
+{
+    FFT::Info info{};
+    ParmParse pp;
+    std::string s;
+    if (pp.query("comm_strategy", s)) {
+        info.setCommStrategy(amrex::getEnumCaseInsensitive<FFT::CommStrategy>(s));
+    }
+    return info;
+}
+}
 
 int main (int argc, char* argv[])
 {
@@ -59,9 +74,9 @@ int main (int argc, char* argv[])
         auto const& ma = mf.arrays();
         ParallelFor(mf, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
         {
-            AMREX_D_TERM(Real x = (i+0.5_rt) * dx[0] - 0.5_rt;,
-                         Real y = (j+0.5_rt) * dx[1] - 0.5_rt;,
-                         Real z = (k+0.5_rt) * dx[2] - 0.5_rt);
+            AMREX_D_TERM(Real x = (Real(i)+0.5_rt) * dx[0] - 0.5_rt;,
+                         Real y = (Real(j)+0.5_rt) * dx[1] - 0.5_rt;,
+                         Real z = (Real(k)+0.5_rt) * dx[2] - 0.5_rt);
             ma[b](i,j,k) = std::exp(-10._rt*
                 (AMREX_D_TERM(x*x*1.05_rt, + y*y*0.90_rt, + z*z)));
         });
@@ -76,7 +91,7 @@ int main (int argc, char* argv[])
             // forward
             {
                 FFT::R2C<Real,FFT::Direction::forward> r2c
-                    (geom.Domain(), FFT::Info{}.setDomainStrategy(FFT::DomainStrategy::pencil));
+                    (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::pencil));
                 auto const& [cba, cdm] = r2c.getSpectralDataLayout();
                 cmf.define(cba, cdm, 1, 0);
                 r2c.forward(mf,cmf);
@@ -85,7 +100,7 @@ int main (int argc, char* argv[])
             // backward
             {
                 FFT::R2C<Real,FFT::Direction::backward> r2c
-                    (geom.Domain(), FFT::Info{}.setDomainStrategy(FFT::DomainStrategy::pencil));
+                    (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::pencil));
                 r2c.backward(cmf,mf2);
             }
 
@@ -98,7 +113,7 @@ int main (int argc, char* argv[])
             auto error = mf2.norminf();
             amrex::Print() << "  Expected to be close to zero: " << error << "\n";
 #ifdef AMREX_USE_FLOAT
-            auto eps = 1.e-6f;
+            auto eps = 1.e-6F;
 #else
             auto eps = 1.e-13;
 #endif
@@ -109,7 +124,7 @@ int main (int argc, char* argv[])
 
         { // forward and backward
             FFT::R2C<Real,FFT::Direction::both> r2c
-                (geom.Domain(), FFT::Info{}.setDomainStrategy(FFT::DomainStrategy::slab));
+                (geom.Domain(), test_info().setDomainStrategy(FFT::DomainStrategy::slab));
             r2c.forwardThenBackward(mf, mf2,
                                     [=] AMREX_GPU_DEVICE (int, int, int, auto& sp)
             {
@@ -121,7 +136,7 @@ int main (int argc, char* argv[])
             auto error = mf2.norminf();
             amrex::Print() << "  Expected to be close to zero: " << error << "\n";
 #ifdef AMREX_USE_FLOAT
-            auto eps = 1.e-6f;
+            auto eps = 1.e-6F;
 #else
             auto eps = 1.e-13;
 #endif
@@ -164,7 +179,7 @@ int main (int argc, char* argv[])
             ParallelDescriptor::ReduceRealMax(error);
             amrex::Print() << "  Expected to be close to zero: " << error << "\n";
 #ifdef AMREX_USE_FLOAT
-            auto eps = 1.e-6f;
+            auto eps = 1.e-6F;
 #else
             auto eps = 1.e-13;
 #endif
@@ -230,7 +245,7 @@ int main (int argc, char* argv[])
             auto error = mf2.norminf();
             amrex::Print() << "  Expected to be close to zero: " << error << "\n";
 #ifdef AMREX_USE_FLOAT
-            auto eps = 1.e-6f;
+            auto eps = 1.e-6F;
 #else
             auto eps = 1.e-13;
 #endif
@@ -281,13 +296,70 @@ int main (int argc, char* argv[])
                 amrex::Print() << "  Face MultiFab dir " << idim
                                << " expected to be close to zero: " << error << "\n";
 #ifdef AMREX_USE_FLOAT
-                auto eps = 1.e-6f;
+                auto eps = 1.e-6F;
 #else
                 auto eps = 1.e-13;
 #endif
                 AMREX_ALWAYS_ASSERT(error < eps);
             }
         }
+
+#if (AMREX_SPACEDIM > 1)
+        // Degenerate domains.  SubHelper reorders the axes, so scalingFactor
+        // must follow the directions that are actually transformed.
+        {
+            Vector<Box> domains
+#if (AMREX_SPACEDIM == 2)
+                {Box(IntVect(0),IntVect(0,31)),
+                 Box(IntVect(0),IntVect(31,0))};
+#else
+                {Box(IntVect(0),IntVect(0,31,15)),
+                 Box(IntVect(0),IntVect(31,0,15)),
+                 Box(IntVect(0),IntVect(31,15,0))};
+#endif
+            Vector<std::pair<std::string,FFT::Info>> modes;
+            modes.emplace_back("plain", test_info());
+            modes.emplace_back("oned_mode", test_info().setOneDMode(true));
+#if (AMREX_SPACEDIM == 3)
+            modes.emplace_back("twod_mode", test_info().setTwoDMode(true));
+            // Both flags, like FFT::PoissonHybrid sets for a degenerate domain.
+            modes.emplace_back("oned+twod_mode",
+                               test_info().setOneDMode(true).setTwoDMode(true));
+#endif
+
+            for (auto const& dom : domains) {
+            for (auto const& [tag, info] : modes) {
+                BoxArray dba(dom);
+                DistributionMapping ddm(dba);
+                MultiFab dmf(dba,ddm,1,0), dmf2(dba,ddm,1,0);
+                auto const& dma = dmf.arrays();
+                ParallelFor(dmf, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    dma[b](i,j,k) = std::sin(0.3_rt*Real(i) + 0.1_rt)
+                        * std::cos(0.7_rt*Real(j) + 0.2_rt)
+                        * std::sin(0.5_rt*Real(k) + 0.3_rt);
+                });
+
+                FFT::R2C<Real,FFT::Direction::both> r2c(dom, info);
+                auto const& [dcba, dcdm] = r2c.getSpectralDataLayout();
+                cMultiFab dcmf(dcba, dcdm, 1, 0);
+                r2c.forward(dmf, dcmf);
+                r2c.backward(dcmf, dmf2);
+
+                auto const dscaling = r2c.scalingFactor();
+                MultiFab::Saxpy(dmf, -dscaling, dmf2, 0, 0, 1, IntVect(0));
+                auto error = dmf.norminf();
+                amrex::Print() << "  Degenerate " << dom << " " << tag
+                               << ", expected to be close to zero: " << error << "\n";
+#ifdef AMREX_USE_FLOAT
+                auto eps = 1.e-6F;
+#else
+                auto eps = 1.e-13;
+#endif
+                AMREX_ALWAYS_ASSERT(error < eps);
+            }}
+        }
+#endif
     }
     amrex::Finalize();
 }

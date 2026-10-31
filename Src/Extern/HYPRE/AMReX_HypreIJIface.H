@@ -61,6 +61,21 @@ public:
      */
     void solve(HypreRealType rel_tol, HypreRealType abs_tol, HypreIntType max_iter);
 
+    //! Call after changing the matrix so the next solve redoes the setup
+    void setNeedSetup () noexcept { m_need_setup = true; }
+
+    //! Redo the setup on every solve (default true). Callers that call
+    //! setNeedSetup when the matrix changes can turn it off.
+    void setRecomputePreconditioner (bool b) noexcept { m_recompute_preconditioner = b; }
+
+    //! Will the next solve do the solver/preconditioner setup?
+    [[nodiscard]] bool setupPending () const noexcept
+    { return m_need_setup || m_recompute_preconditioner; }
+
+    //! Throw std::runtime_error instead of aborting on a hypre error or a
+    //! non-finite residual (with abort_on_hypre_error, the default)
+    void setThrowException (bool t) noexcept { m_throw_exception = t; }
+
     //! IJ matrix instance
     [[nodiscard]] HYPRE_IJMatrix A() { return m_mat; }
 
@@ -77,6 +92,8 @@ public:
     [[nodiscard]] HypreRealType getFinalResidualNorm() const { return m_final_res_norm; }
 
     [[nodiscard]] bool adjustSingularMatrix() const { return m_adjust_singular_matrix; }
+    //! Lowest global row id owned by this rank
+    [[nodiscard]] HypreIntType ilower() const { return m_ilower; }
 
 private:
     void init_preconditioner(const std::string& prefix, const std::string& name);
@@ -85,6 +102,8 @@ private:
     //! run_setup
     void run_hypre_setup();
     void run_hypre_solve();
+    //! Warn, throw or abort with \p msg (no-op if empty)
+    void report_failure (const std::string& msg) const;
 
     // Preconditioners
     void boomeramg_precond_configure(const std::string& prefix);
@@ -147,6 +166,8 @@ private:
     std::string m_solver_name{"BoomerAMG"};
     std::string m_preconditioner_name{"none"};
     std::string m_file_prefix{"IJ"};
+    //! HYPRE keeps a pointer to this, so it must outlive m_precond.
+    std::string m_euclid_file;
 
     //! Verbosity of the HYPRE solvers
     int m_verbose{0};
@@ -159,11 +180,18 @@ private:
     //! Flag indicating whether the solver/preconditioner has been setup
     bool m_need_setup{true};
 
-    //! Flag indicating whether user has requested recomputation of preconditioner
+    //! Redo the solver/preconditioner setup on every solve, even when the
+    //! matrix has not changed
     bool m_recompute_preconditioner{true};
 
     //! Should singular matrix be adjusted to fix solution on a node/cell?
     bool m_adjust_singular_matrix{false};
+
+    //! Abort (rather than warn) when hypre flags an error other than non-convergence
+    bool m_abort_on_hypre_error{true};
+
+    //! Throw instead of aborting (see setThrowException)
+    bool m_throw_exception{false};
 
     //! Flag indicating whether to dump matrix files
     bool m_write_files{false};
@@ -171,6 +199,10 @@ private:
     //! Flag indicating whether the files are overwritten on subsequent writes
     bool m_overwrite_files{true};
 };
+
+//! Message for a pending hypre error other than non-convergence (which the
+//! caller detects from the residual), or empty; clears hypre's error flag
+std::string hypreErrorMessage (const std::string& where);
 
 } // namespace amrex
 

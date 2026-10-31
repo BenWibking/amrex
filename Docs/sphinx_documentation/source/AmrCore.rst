@@ -246,11 +246,14 @@ These Interpolaters can be executed on CPU or GPU, with certain limitations:
 
 -  :cpp:`CellConservativeProtected` only works in 2D and 3D.
 
--  :cpp:`CellQuadratic` only works in 2D and 3D.
+-  :cpp:`CellQuadratic` does not support spherical coordinates in 2D.
 
 -  :cpp:`CellConservativeQuartic` only works with a refinement ratio of 2.
 
--  :cpp:`FaceDivFree` only works in 2D and 3D and with a refinement ratio of 2.
+-  :cpp:`FaceDivFree` only works in 2D and 3D, and the refinement ratio in
+   each direction must be 2 or 4. On GPUs, a refinement ratio other than 2
+   must be run on the device. In 2D RZ, only a refinement ratio of 2 is
+   supported.
 
 .. _sec:amrcore:fluxreg:
 

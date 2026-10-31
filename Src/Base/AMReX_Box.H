@@ -1293,6 +1293,8 @@ class BoxConverter { // NOLINT
 public:
     virtual Box doit (const Box& fine) const = 0; // NOLINT
     virtual BoxConverter* clone () const = 0; // NOLINT
+    //! Equal only if both produce the same box for every input.
+    [[nodiscard]] virtual bool equals (const BoxConverter& other) const = 0;
     virtual ~BoxConverter () = default;
 };
 
@@ -2560,7 +2562,7 @@ struct BoxIndexerND<1>
 {
     std::uint64_t npts;
 
-    int lo;
+    IntVectND<1> lo;
 
     /**
      * \brief Construct the 1D indexer; no fast divisors are needed because only one axis exists.
@@ -2581,7 +2583,7 @@ struct BoxIndexerND<1>
     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     IntVectND<1> intVect (std::uint64_t icell) const
     {
-        return IntVectND<1>{int(icell)+lo};
+        return IntVectND<1>{int(icell)+lo[0]};
     }
 
     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
@@ -2593,7 +2595,7 @@ struct BoxIndexerND<1>
      */
     Dim3 operator() (std::uint64_t icell) const
     {
-        return Dim3{.x = int(icell)+lo, .y = 0, .z = 0};
+        return Dim3{.x = int(icell)+lo[0], .y = 0, .z = 0};
     }
 
     /**
@@ -2606,6 +2608,24 @@ struct BoxIndexerND<1>
 };
 
 using BoxIndexer = BoxIndexerND<AMREX_SPACEDIM>;
+
+/// \cond DOXYGEN_IGNORE
+namespace detail {
+// The points of bx whose index equals offset modulo stride: lower corner is
+// the first such point, lengths are the numbers of such points.
+[[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+Box strided_box (Box const& bx, IntVect const& stride, IntVect const& offset)
+{
+    IntVect lo, hi;
+    for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+        const int s = stride[d];
+        lo[d] = bx.smallEnd(d) + ((offset[d]-bx.smallEnd(d))%s + s) % s;
+        hi[d] = lo[d] + (bx.bigEnd(d)-lo[d]+s)/s - 1;
+    }
+    return Box(lo, hi);
+}
+}
+/// \endcond
 
 }
 

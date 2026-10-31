@@ -131,6 +131,10 @@ namespace amrex {
      * \brief Multi-level redistribution interface that couples coarse and fine levels.
      *
      * Parameters mirror ApplyRedistribution but also include buffers for coarse/fine overlap.
+     *
+     * The caller must zero \p dm_as_fine before the call. Because it receives
+     * contributions from cells outside \p bx, it should be a temporary local to
+     * the MFIter iteration rather than shared between tiles.
      */
     void ApplyMLRedistribution (
         amrex::Box const& bx, int ncomp,
@@ -199,7 +203,7 @@ namespace amrex {
                              amrex::Array4<amrex::Real const> const& ccent,
                              amrex::BCRec  const* d_bcrec_ptr,
                              amrex::Array4<int const> const& itracker,
-                             amrex::Array4<amrex::Real const> const& nrs,
+                             amrex::Array4<int const> const& nrs,
                              amrex::Array4<amrex::Real const> const& alpha,
                              amrex::Array4<amrex::Real const> const& nbhd_vol,
                              amrex::Array4<amrex::Real const> const& cent_hat,
@@ -220,10 +224,12 @@ namespace amrex {
                                amrex::Array4<amrex::Real const> const& ccent,
                                amrex::BCRec  const* d_bcrec_ptr,
                                amrex::Array4<int const> const& itracker,
-                               amrex::Array4<amrex::Real const> const& nrs,
+                               amrex::Array4<int const> const& nrs,
                                amrex::Array4<amrex::Real const> const& alpha,
                                amrex::Array4<amrex::Real const> const& nbhd_vol,
                                amrex::Array4<amrex::Real const> const& cent_hat,
+                               amrex::Dim3 const* active_cells,
+                               int num_active_cells,
                                amrex::Geometry const& geom,
                                int as_crse,
                                Array4<Real            > const& drho_as_crse,
@@ -248,17 +254,38 @@ namespace amrex {
                         amrex::Real target_volfrac);
 
     /**
+     * \brief Build the SRD tracker and active-cell list, and initialize helper arrays.
+     * \return The number of active cells written to \p active_cells.
+     */
+    int MakeITracker ( amrex::Box const& bx,
+                        AMREX_D_DECL(amrex::Array4<amrex::Real const> const& apx,
+                                     amrex::Array4<amrex::Real const> const& apy,
+                                     amrex::Array4<amrex::Real const> const& apz),
+                        amrex::Array4<amrex::Real const> const& vfrac,
+                        amrex::Array4<int> const& itracker,
+                        amrex::Array4<amrex::EBCellFlag const> const& flag,
+                        amrex::Array4<amrex::Real const> const& ccent,
+                        amrex::Array4<int> const& nrs,
+                        amrex::Array4<amrex::Real> const& alpha,
+                        amrex::Array4<amrex::Real> const& cent_hat,
+                        amrex::Dim3* active_cells,
+                        amrex::Geometry const& geom,
+                        amrex::Real target_volfrac);
+
+    /**
      * \brief Construct helper arrays (normals, neighbor volumes, etc.) for SRD.
      */
     void MakeStateRedistUtils ( amrex::Box const& bx,
                                 amrex::Array4<amrex::EBCellFlag const> const& flag,
                                 amrex::Array4<amrex::Real const> const& vfrac,
                                 amrex::Array4<amrex::Real const> const& ccent,
-                                amrex::Array4<        int const> const& itracker,
-                                amrex::Array4<amrex::Real> const& nrs,
+                                amrex::Array4<int const> const& itracker,
+                                amrex::Array4<int> const& nrs,
                                 amrex::Array4<amrex::Real> const& alpha,
                                 amrex::Array4<amrex::Real> const& nbhd_vol,
                                 amrex::Array4<amrex::Real> const& cent_hat,
+                                amrex::Dim3 const* active_cells,
+                                int num_active_cells,
                                 amrex::Geometry const& geom,
                                 amrex::Real target_volfrac);
 

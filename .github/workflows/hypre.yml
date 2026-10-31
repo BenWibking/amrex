@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.ref }}-${{ github.head_ref }}-hypre
   cancel-in-progress: true
 
+permissions:
+  actions: read  # clang-tidy database artifacts
+  contents: read
+
 jobs:
   check_changes:
     uses: ./.github/workflows/check_changes.yml
@@ -22,14 +26,14 @@ jobs:
     env:
       AMREX_HYPRE_HOME: ${HOME}/.cache/hypre-3.1.0-cuda
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Dependencies
       run: |
         .github/workflows/dependencies/dependencies_nvcc.sh 12.2
         sudo apt-get install -y libcublas-dev-12.2
         .github/workflows/dependencies/dependencies_ccache.sh
     - name: Set Up Cache
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cache/ccache
@@ -74,14 +78,14 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.has_non_docs_changes == 'true'
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Dependencies
       run: |
         .github/workflows/dependencies/dependencies.sh
         .github/workflows/dependencies/dependencies_clang-tidy-apt-llvm.sh 21
         .github/workflows/dependencies/dependencies_ccache.sh
     - name: Set Up Cache
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/ccache
         key: ccache-${{ github.workflow }}-${{ github.job }}-git-${{ github.sha }}
@@ -92,16 +96,19 @@ jobs:
         wget -q https://github.com/hypre-space/hypre/archive/refs/tags/v2.21.0.tar.gz
         tar xfz v2.21.0.tar.gz
         cd hypre-2.21.0/src
-        ./configure --with-cxxstandard=20 --enable-bigint
+        ./configure CFLAGS="-O2 -std=gnu17" --with-cxxstandard=20 --enable-bigint
         make -j 4
         make install
         cd ../../
+    - name: Fetch clang-tidy databases
+      uses: ./.github/actions/clang-tidy-db/fetch
     - name: Build and Run Test
       run: |
         export CCACHE_COMPRESS=1
         export CCACHE_COMPRESSLEVEL=10
         export CCACHE_MAXSIZE=100M
-        export CCACHE_EXTRAFILES=${{ github.workspace }}/.clang-tidy
+        clang-tidy-21 --version > ${{ runner.temp }}/clang-tidy-version.txt
+        export CCACHE_EXTRAFILES=${{ github.workspace }}/.clang-tidy:${{ runner.temp }}/clang-tidy-version.txt
         export CCACHE_LOGFILE=${{ github.workspace }}/ccache.log.txt
         ccache -z
 
@@ -110,14 +117,45 @@ jobs:
         make -j4 USE_MPI=TRUE USE_HYPRE=TRUE DIM=3 \
             CCACHE=ccache CXXSTD=c++20
         mpiexec -n 2 ./main3d.gnu.MPI.ex inputs.hypre
-
-        ${{github.workspace}}/Tools/C_scripts/mmclt.py --input ${{github.workspace}}/ccache.log.txt
-        make -j4 -k -f clang-tidy-ccache-misses.mak \
-            CLANG_TIDY=clang-tidy-21 \
-            CLANG_TIDY_ARGS="--config-file=${{github.workspace}}/.clang-tidy --warnings-as-errors=*"
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-ij
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-algmg
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-algmg hypre_mlabeclap.reuse_setup_max_iter=12 \
+            mlhypre_resolve=1
+        # V-cycles alone diverge with the kept hierarchy: rebuilt, then converge
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-algmg hypre_mlabeclap.algmg.krylov=none
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-ij composite_solve=0
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-ij hypre_mlabeclap.reuse_setup_max_iter=1
+        mpiexec -n 2 ./main3d.gnu.MPI.ex inputs-mlhypre-ij hypre_mlabeclap.dump_matrix=1 \
+            hypre_mlabeclap.dump_gather_max=100
+        # Periodic in x with the fine level at the high-x boundary; one rank,
+        # so that the periodic coarse/fine coefficients are copied locally
+        for i in inputs-mlhypre inputs-mlhypre-ij inputs-mlhypre-algmg; do
+            mpiexec -n 1 ./main3d.gnu.MPI.ex $i prob_type=1 max_level=1 n_cell=16 \
+                max_grid_size=8 periodic_x=1 mlhypre_num_setups=1 max_error=0.03 do_plots=0
+        done
+        # Each half of the ranks solves on its own sub-communicator
+        for i in inputs-mlhypre inputs-mlhypre-ij inputs-mlhypre-algmg; do
+            mpiexec -n 2 ./main3d.gnu.MPI.ex $i split_comm=1
+        done
+        # A NaN right-hand side (1) or NaN coefficients (2) must throw
+        for m in 1 2; do
+            for i in "inputs-mlhypre prob_type=2" inputs-mlhypre-ij inputs-mlhypre-algmg; do
+                mpiexec -n 2 ./main3d.gnu.MPI.ex $i mlhypre_test_throw=$m max_error=-1 \
+                    amrex.fpe_trap_invalid=0 do_plots=0
+            done
+        done
 
         ccache -s
         du -hs ~/.cache/ccache
+    - name: Clang-tidy
+      run: |
+        ${{github.workspace}}/.github/workflows/clang-tidy/clang-tidy-ccache-misses.sh clang-tidy-21 \
+            "--config-file=${{github.workspace}}/.clang-tidy --warnings-as-errors=*"
+    - name: Save clang-tidy database
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/clang-tidy-db/save
+      with:
+        job-status: ${{ job.status }}
 
   test-hypre-solver-cpu-eb-2d:
     name: GCC EB 2D Hypre@2.32.0
@@ -125,14 +163,14 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.has_non_docs_changes == 'true'
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Dependencies
       run: |
         .github/workflows/dependencies/dependencies.sh
         .github/workflows/dependencies/dependencies_clang-tidy-apt-llvm.sh 21
         .github/workflows/dependencies/dependencies_ccache.sh
     - name: Set Up Cache
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/ccache
         key: ccache-${{ github.workflow }}-${{ github.job }}-git-${{ github.sha }}
@@ -143,16 +181,19 @@ jobs:
         wget -q https://github.com/hypre-space/hypre/archive/refs/tags/v2.32.0.tar.gz
         tar xfz v2.32.0.tar.gz
         cd hypre-2.32.0/src
-        ./configure --with-cxxstandard=20 --enable-bigint
+        ./configure CFLAGS="-O2 -std=gnu17" --with-cxxstandard=20 --enable-bigint
         make -j 4
         make install
         cd ../../
+    - name: Fetch clang-tidy databases
+      uses: ./.github/actions/clang-tidy-db/fetch
     - name: Build and Run Test
       run: |
         export CCACHE_COMPRESS=1
         export CCACHE_COMPRESSLEVEL=10
         export CCACHE_MAXSIZE=100M
-        export CCACHE_EXTRAFILES=${{ github.workspace }}/.clang-tidy
+        clang-tidy-21 --version > ${{ runner.temp }}/clang-tidy-version.txt
+        export CCACHE_EXTRAFILES=${{ github.workspace }}/.clang-tidy:${{ runner.temp }}/clang-tidy-version.txt
         export CCACHE_LOGFILE=${{ github.workspace }}/ccache.log.txt
         ccache -z
 
@@ -161,10 +202,91 @@ jobs:
         make -j4 USE_MPI=TRUE USE_HYPRE=TRUE DIM=2 CCACHE=ccache CXXSTD=c++20
         mpiexec -n 2 ./main2d.gnu.MPI.ex inputs.2d
 
-        ${{github.workspace}}/Tools/C_scripts/mmclt.py --input ${{github.workspace}}/ccache.log.txt
-        make -j4 -k -f clang-tidy-ccache-misses.mak \
-            CLANG_TIDY=clang-tidy-21 \
-            CLANG_TIDY_ARGS="--config-file=${{github.workspace}}/.clang-tidy --warnings-as-errors=*"
+        # Composite nodal solve (HypreMLNodeLap) with both backends against MLMG
+        cd ${{github.workspace}}/Tests/LinearSolvers/NodalPoisson
+        make -j4 USE_MPI=TRUE USE_HYPRE=TRUE DIM=2 CCACHE=ccache CXXSTD=c++20
+        mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre
+        mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=algmg
+        # singular: the manufactured right-hand side is consistent only to O(h^2)
+        mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre periodic=1 mlhypre_max_diff=1.e-5
+        # fine level on a Dirichlet face: against MLMG, and u = 1 must be
+        # reproduced exactly
+        for b in hypre algmg; do
+            mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=$b \
+                fine_at_boundary=1 do_plots=0
+            mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=$b \
+                fine_at_boundary=1 const_solution=1 mlhypre_max_diff=1.e-10 do_plots=0
+            # NaN rhs at Dirichlet nodes, which the solve does not use
+            mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=$b \
+                mlhypre_nan_dirichlet_rhs=1 do_plots=0
+        done
+        # sub-communicators, and failures that must throw (NaN rhs or initial guess)
+        for b in hypre algmg; do
+            mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=$b split_comm=1
+            for m in 1 2; do
+                mpiexec -n 2 ./main2d.gnu.MPI.ex inputs-mlhypre hypre_mlnodelap.backend=$b \
+                    mlhypre_test_throw=$m do_plots=0
+            done
+        done
+        # EB projection
+        cd ${{github.workspace}}/Tests/LinearSolvers/Nodal_Projection_EB
+        make -j4 USE_MPI=TRUE USE_HYPRE=TRUE USE_EB=TRUE DIM=2 CCACHE=ccache CXXSTD=c++20
+        mpiexec -n 2 ./main2d.gnu.MPI.ex inputs_3d n_cell=64 multigrid_types=geometric \
+            use_mlhypre=1 mlhypre_max_diff=1.e-7 \
+            hypre_mlnodelap.hypre_solver=FlexGMRES hypre_mlnodelap.hypre_preconditioner=BoomerAMG
+        mpiexec -n 2 ./main2d.gnu.MPI.ex inputs_3d n_cell=64 multigrid_types=geometric \
+            use_mlhypre=1 mlhypre_max_diff=1.e-7 hypre_mlnodelap.backend=algmg
+
+        ccache -s
+        du -hs ~/.cache/ccache
+    - name: Clang-tidy
+      run: |
+        ${{github.workspace}}/.github/workflows/clang-tidy/clang-tidy-ccache-misses.sh clang-tidy-21 \
+            "--config-file=${{github.workspace}}/.clang-tidy --warnings-as-errors=*"
+    - name: Save clang-tidy database
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/clang-tidy-db/save
+      with:
+        job-status: ${{ job.status }}
+
+  test-hypre-nodal-eb-fd-2d:
+    name: GCC Nodal EB FD 2D Hypre@2.32.0
+    runs-on: ubuntu-latest
+    needs: check_changes
+    if: needs.check_changes.outputs.has_non_docs_changes == 'true'
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Dependencies
+      run: |
+        .github/workflows/dependencies/dependencies.sh
+        .github/workflows/dependencies/dependencies_ccache.sh
+    - name: Set Up Cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-git-${{ github.sha }}
+        restore-keys: |
+             ccache-${{ github.workflow }}-${{ github.job }}-git-
+    - name: Build Hypre
+      run: |
+        wget -q https://github.com/hypre-space/hypre/archive/refs/tags/v2.32.0.tar.gz
+        tar xfz v2.32.0.tar.gz
+        cd hypre-2.32.0/src
+        ./configure CFLAGS="-O2 -std=gnu17" --with-cxxstandard=20 --enable-bigint
+        make -j 4
+        make install
+        cd ../../
+    - name: Build and Run Test
+      run: |
+        export CCACHE_COMPRESS=1
+        export CCACHE_COMPRESSLEVEL=10
+        export CCACHE_MAXSIZE=100M
+        ccache -z
+
+        export AMREX_HYPRE_HOME=${PWD}/hypre-2.32.0/src/hypre
+        cd Tests/LinearSolvers/NodeEBFDLap
+        make -j4 USE_MPI=TRUE USE_HYPRE=TRUE DIM=2 COMP=gnu CCACHE=ccache CXXSTD=c++20
+        mpiexec -n 2 ./main2d.gnu.TEST.MPI.ex inputs_2d
 
         ccache -s
         du -hs ~/.cache/ccache

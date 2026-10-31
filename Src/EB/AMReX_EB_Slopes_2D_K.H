@@ -23,9 +23,12 @@ calc_slopes_eb (Real A[N][AMREX_SPACEDIM], DU const& f, int nx, int ny)
         AtA[0][0] += A[lc][0] * A[lc][0];
         AtA[0][1] += A[lc][0] * A[lc][1];
         AtA[1][1] += A[lc][1] * A[lc][1];
-        auto du = f(ii,jj);
-        Atb[0] += A[lc][0]*du;
-        Atb[1] += A[lc][1]*du;
+        // Do not read state for excluded rows: zero times NaN is still NaN.
+        if (A[lc][0] != Real(0) || A[lc][1] != Real(0)) {
+            auto du = f(ii,jj);
+            Atb[0] += A[lc][0]*du;
+            Atb[1] += A[lc][1]*du;
+        }
         ++lc;
     }}
 
@@ -124,7 +127,6 @@ amrex_overwrite_with_regular_slopes(int i, int j, int k, int n,
     //
     // Here we over-write -- if possible -- with a stencil not using the EB stencil
     //
-    AMREX_ALWAYS_ASSERT( max_order == 0 || max_order == 2 || max_order == 4);
 
     // We have enough cells in the x-direction to do 4th order slopes
     // centered on (i,j,k) with all values at cell centers
@@ -354,6 +356,7 @@ amrex_overwrite_with_regular_slopes_extdir(int i, int j, int k, int n,
 //    going through the centroid of cell(i,j,k).  This does not assume that the cell centroids,
 //    where the data is assume to live, are the same as cell centers.
 //
+template <bool BoundaryOnly = false>
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 amrex::GpuArray<amrex::Real,AMREX_SPACEDIM>
 amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
@@ -369,27 +372,17 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
 {
     constexpr int dim_a = 9;
 
-    auto xslope = amrex::Real(0.0);
-    auto yslope = amrex::Real(0.0);
+    if constexpr (!BoundaryOnly) {
+        bool const needs_bdry_stencil =
+            (edlo_x && i <= domlo_x+1) || (edhi_x && i >= domhi_x-1) ||
+            (edlo_y && j <= domlo_y+1) || (edhi_y && j >= domhi_y-1);
 
-    // First get EB-aware slope that doesn't know about extdir
-    bool needs_bdry_stencil = (edlo_x && i <= domlo_x) || (edhi_x && i >= domhi_x) ||
-                              (edlo_y && j <= domlo_y) || (edhi_y && j >= domhi_y);
+        if (!needs_bdry_stencil) {
+            return amrex_calc_slopes_eb(i,j,k,n,state,ccent,vfrac,flag,max_order);
+        }
+    }
 
-    //
-    // This call does not have any knowledge of extdir / hoextrap boundary conditions
-    //
-    if (!needs_bdry_stencil)
-    {
-        // This returns slopes calculated with the regular 1-d approach if all cells in the stencil
-        //      are regular.  If not, it uses the EB-aware least squares approach to fit a linear profile
-        //      using the neighboring un-covered cells.
-        const auto& slopes = amrex_calc_slopes_eb (i,j,k,n,state,ccent,vfrac,flag,max_order);
-        return slopes;
-
-    } else {
-
-        amrex::Real A[dim_a][AMREX_SPACEDIM];
+    amrex::Real A[dim_a][AMREX_SPACEDIM];
 
         int lc=0;
         int kk = 0;
@@ -406,23 +399,20 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
                 bool jlo_test = ( edlo_y && (j == domlo_y) && jj == -1);
                 bool jhi_test = ( edhi_y && (j == domhi_y) && jj ==  1);
 
-                bool klo_test = false;
-                bool khi_test = false;
-
                 // These are the default values if no physical boundary
                 A[lc][0] = amrex::Real(ii) + ccent(i+ii,j+jj,k+kk,0);
                 A[lc][1] = amrex::Real(jj) + ccent(i+ii,j+jj,k+kk,1);
                 // Do corrections for entire x-face
                 if (ilo_test)
                 {
-                    if (!jlo_test && !jhi_test && !klo_test && !khi_test)
+                    if (!jlo_test && !jhi_test)
                     {
                         A[lc][1] = amrex::Real(jj) + fcx(i   ,j+jj,k+kk,0);
                     }
                     A[lc][0] = amrex::Real(-0.5)                      ;
                 } else if (ihi_test) {
 
-                    if (!jlo_test && !jhi_test && !klo_test && !khi_test)
+                    if (!jlo_test && !jhi_test)
                     {
                         A[lc][1] = amrex::Real(jj) + fcx(i+ii,j+jj,k+kk,0);
                     }
@@ -432,7 +422,7 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
                 // Do corrections for entire y-face
                 if (jlo_test)
                 {
-                    if (!ilo_test && !ihi_test && !klo_test && !khi_test)
+                    if (!ilo_test && !ihi_test)
                     {
                         A[lc][0] = amrex::Real(ii) + fcy(i+ii,j   ,k+kk,0);
                     }
@@ -440,7 +430,7 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
 
                 } else if (jhi_test) {
 
-                    if (!ilo_test && !ihi_test && !klo_test && !khi_test)
+                    if (!ilo_test && !ihi_test)
                     {
                         A[lc][0] = amrex::Real(ii) + fcy(i+ii,j+jj,k+kk,0);
                     }
@@ -457,14 +447,14 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
             lc++;
         }} // i,j
 
-        const auto& slopes = amrex_calc_slopes_eb_given_A (i,j,k,n,A,state,flag);
-        xslope = slopes[0];
-        yslope = slopes[1];
+    const auto& slopes = amrex_calc_slopes_eb_given_A (i,j,k,n,A,state,flag);
+    auto xslope = slopes[0];
+    auto yslope = slopes[1];
 
         // This will over-write the values of xslope and yslope if appropriate
-        amrex_overwrite_with_regular_slopes_extdir(i,j,k,n,xslope,yslope,state,vfrac,
-                                                   edlo_x,edlo_y,edhi_x,edhi_y,
-                                                   domlo_x,domlo_y,domhi_x,domhi_y,max_order);
+    amrex_overwrite_with_regular_slopes_extdir(i,j,k,n,xslope,yslope,state,vfrac,
+                                               edlo_x,edlo_y,edhi_x,edhi_y,
+                                               domlo_x,domlo_y,domhi_x,domhi_y,max_order);
 
         // Zero out slopes outside of an extdir (or hoextrap) boundary
         // TODO:  is this the right thing to do at a HOEXTRAP boundary??
@@ -474,8 +464,7 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
             xslope = 0.;
             yslope = 0.;
         }
-        return {xslope,yslope};
-    }
+    return {xslope,yslope};
 }
 
 // amrex_calc_slopes_extdir_eb_grown calculates the slope in each coordinate direction using a
@@ -486,6 +475,7 @@ amrex_calc_slopes_extdir_eb (int i, int j, int k, int n,
 //    going through the centroid of cell(i,j,k).  This does not assume that the cell centroids,
 //    where the data is assume to live, are the same as cell centers.
 //
+template <bool BoundaryOnly = false>
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 amrex::GpuArray<amrex::Real,AMREX_SPACEDIM>
 amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
@@ -501,27 +491,18 @@ amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
 {
     constexpr int dim_a = 25;
 
-    auto xslope = amrex::Real(0.0);
-    auto yslope = amrex::Real(0.0);
+    if constexpr (!BoundaryOnly) {
+        bool const needs_bdry_stencil =
+            (edlo_x && i <= domlo_x+1) || (edhi_x && i >= domhi_x-1) ||
+            (edlo_y && j <= domlo_y+1) || (edhi_y && j >= domhi_y-1);
 
-    // First get EB-aware slope that doesn't know about extdir
-    bool needs_bdry_stencil = (edlo_x && i <= domlo_x) || (edhi_x && i >= domhi_x) ||
-                              (edlo_y && j <= domlo_y) || (edhi_y && j >= domhi_y);
+        if (!needs_bdry_stencil) {
+            return amrex_calc_slopes_eb_grown(
+                i,j,k,n,nx,ny,state,ccent,vfrac,flag,max_order);
+        }
+    }
 
-    //
-    // This call does not have any knowledge of extdir / hoextrap boundary conditions
-    //
-    if (!needs_bdry_stencil)
-    {
-        // This returns slopes calculated with the regular 1-d approach if all cells in the stencil
-        //      are regular.  If not, it uses the EB-aware least squares approach to fit a linear profile
-        //      using the neighboring un-covered cells.
-        const auto& slopes = amrex_calc_slopes_eb_grown (i,j,k,n,nx,ny,state,ccent,vfrac,flag,max_order);
-        return slopes;
-
-    } else {
-
-        amrex::Real A[dim_a][AMREX_SPACEDIM];
+    amrex::Real A[dim_a][AMREX_SPACEDIM];
 
         int lc=0;
         int kk = 0;
@@ -529,16 +510,22 @@ amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
         for(int jj(-ny); jj<=ny; jj++) {
         for(int ii(-nx); ii<=nx; ii++)
         {
-            if ( !flag(i+ii,j+jj,k).isCovered() && !(ii==0 && jj==0 && kk==0) )
+            // Cells more than one cell outside an extdir/hoextrap boundary hold no usable data,
+            //    so we exclude them from the fit just as we exclude covered cells
+            bool outside = (edlo_x && i+ii < domlo_x-1) || (edhi_x && i+ii > domhi_x+1) ||
+                           (edlo_y && j+jj < domlo_y-1) || (edhi_y && j+jj > domhi_y+1);
+
+            if ( !outside && !flag(i+ii,j+jj,k).isCovered() && !(ii==0 && jj==0 && kk==0) )
             {
-                bool ilo_test = ( edlo_x && (i == domlo_x) && ii == -1);
-                bool ihi_test = ( edhi_x && (i == domhi_x) && ii ==  1);
+                // The value in the first ghost cell outside an extdir/hoextrap boundary lives on
+                //    the domain face, not at the cell centroid.  With the grown (n == 2) stencil
+                //    that ghost cell can be reached from a cell one in from the boundary, so we
+                //    key these tests on the neighbor index rather than on the offset alone.
+                bool ilo_test = ( edlo_x && (i+ii == domlo_x-1) );
+                bool ihi_test = ( edhi_x && (i+ii == domhi_x+1) );
 
-                bool jlo_test = ( edlo_y && (j == domlo_y) && jj == -1);
-                bool jhi_test = ( edhi_y && (j == domhi_y) && jj ==  1);
-
-                bool klo_test = false;
-                bool khi_test = false;
+                bool jlo_test = ( edlo_y && (j+jj == domlo_y-1) );
+                bool jhi_test = ( edhi_y && (j+jj == domhi_y+1) );
 
                 // These are the default values if no physical boundary
                 A[lc][0] = amrex::Real(ii) + ccent(i+ii,j+jj,k+kk,0);
@@ -546,36 +533,36 @@ amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
                 // Do corrections for entire x-face
                 if (ilo_test)
                 {
-                    if (!jlo_test && !jhi_test && !klo_test && !khi_test)
+                    if (!jlo_test && !jhi_test)
                     {
-                        A[lc][1] = amrex::Real(jj) + fcx(i   ,j+jj,k+kk,0);
+                        A[lc][1] = amrex::Real(jj) + fcx(domlo_x,j+jj,k+kk,0);
                     }
-                    A[lc][0] = amrex::Real(-0.5)                      ;
+                    A[lc][0] = amrex::Real(domlo_x-i) - amrex::Real(0.5);
                 } else if (ihi_test) {
 
-                    if (!jlo_test && !jhi_test && !klo_test && !khi_test)
+                    if (!jlo_test && !jhi_test)
                     {
-                        A[lc][1] = amrex::Real(jj) + fcx(i+ii,j+jj,k+kk,0);
+                        A[lc][1] = amrex::Real(jj) + fcx(domhi_x+1,j+jj,k+kk,0);
                     }
-                    A[lc][0] = amrex::Real(0.5)                       ;
+                    A[lc][0] = amrex::Real(domhi_x-i) + amrex::Real(0.5);
                 }
 
                 // Do corrections for entire y-face
                 if (jlo_test)
                 {
-                    if (!ilo_test && !ihi_test && !klo_test && !khi_test)
+                    if (!ilo_test && !ihi_test)
                     {
-                        A[lc][0] = amrex::Real(ii) + fcy(i+ii,j   ,k+kk,0);
+                        A[lc][0] = amrex::Real(ii) + fcy(i+ii,domlo_y,k+kk,0);
                     }
-                    A[lc][1] = amrex::Real(-0.5)                      ;
+                    A[lc][1] = amrex::Real(domlo_y-j) - amrex::Real(0.5);
 
                 } else if (jhi_test) {
 
-                    if (!ilo_test && !ihi_test && !klo_test && !khi_test)
+                    if (!ilo_test && !ihi_test)
                     {
-                        A[lc][0] = amrex::Real(ii) + fcy(i+ii,j+jj,k+kk,0);
+                        A[lc][0] = amrex::Real(ii) + fcy(i+ii,domhi_y+1,k+kk,0);
                     }
-                    A[lc][1] = amrex::Real(0.5)                       ;
+                    A[lc][1] = amrex::Real(domhi_y-j) + amrex::Real(0.5);
                 }
 
                 A[lc][0] -= ccent(i,j,k,0);
@@ -588,14 +575,14 @@ amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
             lc++;
         }} // i,j
 
-        const auto& slopes = amrex_calc_slopes_eb_given_A_grown (i,j,k,n,nx,ny,A,state,flag);
-        xslope = slopes[0];
-        yslope = slopes[1];
+    const auto& slopes = amrex_calc_slopes_eb_given_A_grown (i,j,k,n,nx,ny,A,state,flag);
+    auto xslope = slopes[0];
+    auto yslope = slopes[1];
 
         // This will over-write the values of xslope and yslope if appropriate
-        amrex_overwrite_with_regular_slopes_extdir(i,j,k,n,xslope,yslope,state,vfrac,
-                                                   edlo_x,edlo_y,edhi_x,edhi_y,
-                                                   domlo_x,domlo_y,domhi_x,domhi_y,max_order);
+    amrex_overwrite_with_regular_slopes_extdir(i,j,k,n,xslope,yslope,state,vfrac,
+                                               edlo_x,edlo_y,edhi_x,edhi_y,
+                                               domlo_x,domlo_y,domhi_x,domhi_y,max_order);
 
         // Zero out slopes outside of an extdir (or hoextrap) boundary
         // TODO:  is this the right thing to do at a HOEXTRAP boundary??
@@ -605,8 +592,7 @@ amrex_calc_slopes_extdir_eb_grown (int i, int j, int k, int n, int nx, int ny,
             xslope = 0.;
             yslope = 0.;
         }
-        return {xslope,yslope};
-    }
+    return {xslope,yslope};
 }
 
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
@@ -617,7 +603,11 @@ amrex_calc_alpha_stencil(amrex::Real q_hat, amrex::Real q_max,
     using namespace amrex::literals;
 
     auto alpha_temp = 0.0_rt;
+#ifdef AMREX_USE_FLOAT
+    auto sml  = 1.0e-5_rt;
+#else
     auto sml  = 1.0e-13_rt;
+#endif
 
     if ((q_hat-state) > sml) {
         alpha_temp = amrex::min(1.0_rt,(q_max-state)/(q_hat-state));

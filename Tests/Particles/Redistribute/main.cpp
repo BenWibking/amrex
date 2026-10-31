@@ -35,9 +35,9 @@ void get_position_unit_cell(Real* r, const IntVect& nppc, int i_part)
     int iy_part = (i_part % (ny * nz)) % ny;
     int iz_part = (i_part % (ny * nz)) / ny;
 
-    r[0] = (0.5+ix_part)/nx;
-    r[1] = (0.5+iy_part)/ny;
-    r[2] = (0.5+iz_part)/nz;
+    r[0] = (Real(0.5)+Real(ix_part))/Real(nx);
+    r[1] = (Real(0.5)+Real(iy_part))/Real(ny);
+    r[2] = (Real(0.5)+Real(iz_part))/Real(nz);
 }
 
 class TestParticleContainer
@@ -126,12 +126,12 @@ public:
                     ParticleType p;
                     p.id()  = ParticleType::NextID();
                     p.cpu() = ParallelDescriptor::MyProc();
-                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (iv[0] + r[0])*dx[0]);
+                    p.pos(0) = static_cast<ParticleReal> (plo[0] + (Real(iv[0]) + r[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (iv[1] + r[1])*dx[1]);
+                    p.pos(1) = static_cast<ParticleReal> (plo[1] + (Real(iv[1]) + r[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (iv[2] + r[2])*dx[2]);
+                    p.pos(2) = static_cast<ParticleReal> (plo[2] + (Real(iv[2]) + r[2])*dx[2]);
 #endif
 
                     for (int i = 0; i < NSR; ++i) { p.rdata(i) = ParticleReal(p.id()); }
@@ -227,12 +227,12 @@ public:
                     amrex::ParallelFor( np, [=] AMREX_GPU_DEVICE (int i) noexcept
                     {
                         ParticleType& p = pstruct[i];
-                        p.pos(0) += static_cast<ParticleReal> (move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> (Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> (move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> (Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> (move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> (Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -243,12 +243,12 @@ public:
                     {
                         ParticleType& p = pstruct[i];
 
-                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[0]*dx[0]);
+                        p.pos(0) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[0])*dx[0]);
 #if AMREX_SPACEDIM > 1
-                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[1]*dx[1]);
+                        p.pos(1) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[1])*dx[1]);
 #endif
 #if AMREX_SPACEDIM > 2
-                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*move_dir[2]*dx[2]);
+                        p.pos(2) += static_cast<ParticleReal> ((2*amrex::Random(engine)-1)*Real(move_dir[2])*dx[2]);
 #endif
                     });
                 }
@@ -312,7 +312,7 @@ public:
                 {
                     for (int j = 0; j < NSR; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_aos[i].rdata(j) == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < NSI; ++j)
                     {
@@ -321,7 +321,7 @@ public:
                     if constexpr (NAR > 0) {
                         for (int j = 0; j < NAR; ++j)
                         {
-                            AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ptd.m_aos[i].id());
+                            AMREX_ALWAYS_ASSERT(ptd.m_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                         }
                     }
                     if constexpr (NAI > 0) {
@@ -332,7 +332,7 @@ public:
                     }
                     for (int j = 0; j < num_rr; ++j)
                     {
-                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ptd.m_aos[i].id());
+                        AMREX_ALWAYS_ASSERT(ptd.m_runtime_rdata[j][i] == ParticleReal(ptd.m_aos[i].id()));
                     }
                     for (int j = 0; j < num_ii; ++j)
                     {
@@ -364,6 +364,7 @@ struct TestParams
 
 void testRedistribute();
 void testNeighborProcsCoarseToFine();
+void testAnisotropicRefRatioCtor();
 
 int main (int argc, char* argv[])
 {
@@ -371,6 +372,7 @@ int main (int argc, char* argv[])
 
     amrex::Print() << "Running redistribute test \n";
     testNeighborProcsCoarseToFine();
+    testAnisotropicRefRatioCtor();
     testRedistribute();
 
     amrex::Finalize();
@@ -460,6 +462,40 @@ void testNeighborProcsCoarseToFine ()
     amrex::Print() << "testNeighborProcsCoarseToFine: pass\n";
 }
 
+// Regression test for GH-5787: the ParticleContainer constructor taking a
+// Vector<IntVect> of refinement ratios must preserve per-direction
+// (anisotropic) ratios rather than collapsing them to the first component.
+void testAnisotropicRefRatioCtor ()
+{
+    BL_PROFILE("testAnisotropicRefRatioCtor");
+
+    const IntVect rr0(AMREX_D_DECL(4,2,1));
+    const Box domain0(IntVect(0), IntVect(AMREX_D_DECL(15,15,15)));
+    const Box domain1 = amrex::refine(domain0, rr0);
+
+    RealBox real_box(AMREX_D_DECL(0.0, 0.0, 0.0),
+                     AMREX_D_DECL(1.0, 1.0, 1.0));
+    int is_per[] = {AMREX_D_DECL(1,1,1)};
+
+    Vector<Geometry> geom(2);
+    geom[0].define(domain0, &real_box, CoordSys::cartesian, is_per);
+    geom[1].define(domain1, &real_box, CoordSys::cartesian, is_per);
+
+    Vector<BoxArray> ba{BoxArray(domain0), BoxArray(domain1)};
+    Vector<DistributionMapping> dmap{DistributionMapping(ba[0]),
+                                     DistributionMapping(ba[1])};
+    Vector<IntVect> rr{rr0};
+
+    amrex::ParticleContainer<NSR, NSI, NAR, NAI> pc(geom, dmap, ba, rr);
+
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(pc.GetParGDB()->refRatio(0) == rr0,
+        "ParticleContainer(geom, dmap, ba, Vector<IntVect>) did not preserve "
+        "the anisotropic refinement ratio (GH-5787).");
+    AMREX_ALWAYS_ASSERT(pc.GetParGDB()->refRatio(0) == pc.GetParGDB()->refRatio()[0]);
+
+    amrex::Print() << "testAnisotropicRefRatioCtor: pass\n";
+}
+
 void get_test_params(TestParams& params, const std::string& prefix)
 {
     ParmParse pp(prefix);
@@ -502,8 +538,8 @@ void testRedistribute ()
     RealBox real_box;
     for (int n = 0; n < BL_SPACEDIM; n++)
     {
-        real_box.setLo(n, 0.0);
-        real_box.setHi(n, params.size[n]);
+        real_box.setLo(n, Real(0.0));
+        real_box.setHi(n, Real(params.size[n]));
     }
 
     IntVect domain_lo(AMREX_D_DECL(0, 0, 0));

@@ -102,26 +102,40 @@ FillPatchSingleLevel (MF& mf, IntVect const& nghost, Real time,
     else if (smf.size() == 2)
     {
         BL_ASSERT(smf[0]->boxArray() == smf[1]->boxArray());
+        const Real t0 = stime[0];
+        const Real t1 = stime[1];
         MF raii;
         MF * dmf;
         int destcomp;
         bool sameba;
+        bool fill_dmf;
         if (mf.boxArray() == smf[0]->boxArray() &&
             mf.DistributionMap() == smf[0]->DistributionMap())
         {
             dmf = &mf;
             destcomp = dcomp;
             sameba = true;
-        } else {
+            fill_dmf = (&mf != smf[0] && &mf != smf[1]) || scomp != dcomp;
+        }
+        else if (time == t0 || time == t1 || amrex::almostEqual(t0,t1))
+        {
+            dmf = smf[(time != t0 && time == t1) ? 1 : 0];
+            destcomp = scomp;
+            sameba = false;
+            fill_dmf = false;
+        }
+        else
+        {
             raii.define(smf[0]->boxArray(), smf[0]->DistributionMap(), ncomp, src_ghost,
-                        MFInfo(), smf[0]->Factory());
+                        MFInfo().SetArena(The_Async_Arena()), smf[0]->Factory());
 
             dmf = &raii;
             destcomp = 0;
             sameba = false;
+            fill_dmf = true;
         }
 
-        if ((dmf != smf[0] && dmf != smf[1]) || scomp != dcomp)
+        if (fill_dmf)
         {
             IntVect interp_ghost(0);
             if constexpr (std::is_same_v<BC,PhysBCFunctUseCoarseGhost>) {
@@ -130,14 +144,41 @@ FillPatchSingleLevel (MF& mf, IntVect const& nghost, Real time,
                     interp_ghost.min(nghost);
                 }
             }
+
+            // Patch case: interpolate only the cells the ParallelCopy below reads,
+            // i.e. the hull of the local and send tags of each source FAB. Not with
+            // MPI teams, whose members work on each other's FABs but only have the
+            // send tags of their own.
+            const bool use_hull = !sameba && ParallelDescriptor::TeamSize() == 1;
+            Vector<Box> hull;
+            if (use_hull) {
+                hull.resize(raii.local_size());
+                if (!mf.empty() && !raii.empty()) {
+                    auto const& cpc = mf.getCPC(nghost, raii, src_ghost, geom.periodicity());
+                    for (auto const& tag : *cpc.m_LocTags) {
+                        Box& h = hull[raii.localindex(tag.srcIndex)];
+                        h = h.ok() ? amrex::minBox(h, tag.sbox) : tag.sbox;
+                    }
+                    for (auto const& kv : *cpc.m_SndTags) {
+                        for (auto const& tag : kv.second) {
+                            Box& h = hull[raii.localindex(tag.srcIndex)];
+                            h = h.ok() ? amrex::minBox(h, tag.sbox) : tag.sbox;
+                        }
+                    }
+                }
+            }
+
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (Gpu::notInLaunchRegion())
 #endif
             for (MFIter mfi(*dmf,TilingIfNotGPU()); mfi.isValid(); ++mfi)
             {
-                const Box& bx = mfi.growntilebox(interp_ghost);
-                const Real t0 = stime[0];
-                const Real t1 = stime[1];
+                Box bx = mfi.growntilebox(interp_ghost);
+                if (use_hull) {
+                    const Box& hbx = hull[mfi.LocalIndex()];
+                    if (!hbx.ok()) { continue; }
+                    bx &= hbx;
+                }
                 auto const sfab0 = smf[0]->array(mfi);
                 auto const sfab1 = smf[1]->array(mfi);
                 auto       dfab  = dmf->array(mfi);
@@ -184,7 +225,7 @@ FillPatchSingleLevel (MF& mf, IntVect const& nghost, Real time,
         }
         else
         {
-            mf.ParallelCopy(*dmf, 0, dcomp, ncomp, src_ghost, nghost, geom.periodicity());
+            mf.ParallelCopy(*dmf, destcomp, dcomp, ncomp, src_ghost, nghost, geom.periodicity());
         }
     }
     else {
@@ -467,8 +508,10 @@ namespace detail {
         {
             const InterpolaterBoxCoarsener& coarsener = mapper->BoxCoarsener(ratio);
 
-            // Test for Face-centered data
-            if ( AMREX_D_TERM(  mf.ixType().nodeCentered(0),
+            // Test for Face-centered data.  In 1D, face and nodal index types
+            // are the same, and we treat the data as nodal.
+            if ( mf.ixType() != IndexType::TheNodeType() &&
+                 AMREX_D_TERM(  mf.ixType().nodeCentered(0),
                               + mf.ixType().nodeCentered(1),
                               + mf.ixType().nodeCentered(2) ) == 1 )
             {
@@ -530,8 +573,8 @@ namespace detail {
                                                       mf_known, IntVect::TheZeroVector(),
                                                       cgeom.periodicity());
 
-                    solve_mask.setVal(1);                   // Values to solve.
-                    solve_mask.setVal(0, mask_cpc, 0, 1);   // Known values.
+                    solve_mask.setVal(1);                       // Values to solve.
+                    solve_mask.setVal(0, mask_cpc, 0, ncomp);   // Known values.
 
                     detail::call_interp_hook(pre_interp, mf_crse_patch, 0, ncomp);
 
@@ -708,8 +751,8 @@ namespace detail {
                                                       mf_known, IntVect::TheZeroVector(),
                                                       cgeom.periodicity() );
 
-                    solve_mask[d].setVal(1);                   // Values to solve.
-                    solve_mask[d].setVal(0, mask_cpc, 0, 1);   // Known values.
+                    solve_mask[d].setVal(1);                       // Values to solve.
+                    solve_mask[d].setVal(0, mask_cpc, 0, ncomp);   // Known values.
                 }
 
                 int idummy=0;
@@ -1252,7 +1295,9 @@ InterpFromCoarseLevel (Array<MF*, AMREX_SPACEDIM> const& mf, IntVect const& ngho
                                                              &(*mf_local[2])[mfi] )};
 
             const Box& sbx_cc = amrex::convert(sfab[0]->box(), IntVect::TheZeroVector());
-            Box dfab_cc = amrex::convert(dfab[0]->box(), IntVect::TheZeroVector());
+            // Interpolate only over the region the coarse patch was built from.
+            Box dfab_cc = amrex::convert(amrex::grow(ba[mfi.index()], nghost_adj),
+                                         IntVect::TheZeroVector());
             const Box& dbx_cc = dfab_cc & fdomain_g;
 
             for (int d=0; d<AMREX_SPACEDIM; ++d)
@@ -1269,17 +1314,17 @@ InterpFromCoarseLevel (Array<MF*, AMREX_SPACEDIM> const& mf, IntVect const& ngho
 
             pre_interp(sfab, sbx_cc, 0, ncomp);
 
-            mapper->interp_arr(sfab, 0, dfab, 0, ncomp, dbx_cc, ratio, mfab,
+            mapper->interp_arr(sfab, 0, dfab, dcomp_adj, ncomp, dbx_cc, ratio, mfab,
                                cgeom, fgeom, bcr, idummy1, idummy2, RunOn::Gpu);
 
-            post_interp(dfab, dbx_cc, 0, ncomp);
+            post_interp(dfab, dbx_cc, dcomp_adj, ncomp);
         }
     }
 
     for (int d=0; d<AMREX_SPACEDIM; ++d)
     {
         if (mf[d] != mf_local[d]) {
-            amrex::Copy(*mf[d], *mf_local[d], 0, dcomp_adj, ncomp, nghost);
+            amrex::Copy(*mf[d], *mf_local[d], 0, dcomp, ncomp, nghost);
         }
 
         fbc[d](*mf[d], dcomp, ncomp, nghost, time, fbccomp);

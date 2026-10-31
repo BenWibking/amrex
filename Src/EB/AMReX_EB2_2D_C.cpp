@@ -38,7 +38,8 @@ void set_eb_data (const int i, const int j,
     Real x_ym, x_yp, y_xm, y_xp;
     if (nx == 0.0_rt) {
         if (apx(i,j,0) == 1.0_rt && apx(i+1,j,0) == 1.0_rt) {
-            if (levset(i,j,0) > 0.0_rt || levset(i,j+1,0) > 0.0_rt) {
+            // body on the left; a zero level set is body
+            if (levset(i,j,0) >= 0.0_rt || levset(i,j+1,0) >= 0.0_rt) {
                 x_ym = 0.5_rt*dx[0] - aym;
                 x_yp = 0.5_rt*dx[0] - ayp;
             } else {
@@ -59,7 +60,8 @@ void set_eb_data (const int i, const int j,
 
     if (ny == 0.0_rt) {
         if (apy(i,j,0) == 1.0_rt && apy(i,j+1,0) == 1.0_rt) {
-            if (levset(i,j,0) > 0.0_rt || levset(i+1,j,0) > 0.0_rt) {
+            // body at the bottom; a zero level set is body
+            if (levset(i,j,0) >= 0.0_rt || levset(i+1,j,0) >= 0.0_rt) {
                 y_xm = 0.5_rt*dx[1] - axm;
                 y_xp = 0.5_rt*dx[1] - axp;
             } else {
@@ -228,11 +230,12 @@ int build_faces (Box const& bx, Array4<EBCellFlag> const& cell,
                 apx(i,j,0) = 0.0_rt;
                 fcx(i,j,0) = 0.0_rt;
             } else {
+                Real const cut = intercept_fraction(intery(i,j,0), problo[1], j, dx[1], dyinv);
                 if (levset(i,j,0) < 0.0_rt) {
-                    apx(i,j,0) = (intery(i,j,0)-(problo[1]+j*dx[1]))*dyinv;
+                    apx(i,j,0) = cut;
                     fcx(i,j,0) = 0.5_rt*apx(i,j,0) - 0.5_rt;
                 } else {
-                    apx(i,j,0) = 1.0_rt - (intery(i,j,0)-(problo[1]+j*dx[1]))*dyinv;
+                    apx(i,j,0) = 1.0_rt - cut;
                     fcx(i,j,0) = 0.5_rt - 0.5_rt*apx(i,j,0);
                 }
 
@@ -261,11 +264,12 @@ int build_faces (Box const& bx, Array4<EBCellFlag> const& cell,
                 apy(i,j,0) = 0.0_rt;
                 fcy(i,j,0) = 0.0_rt;
             } else {
+                Real const cut = intercept_fraction(interx(i,j,0), problo[0], i, dx[0], dxinv);
                 if (levset(i,j,0) < 0.0_rt) {
-                    apy(i,j,0) = (interx(i,j,0)-(problo[0]+i*dx[0]))*dxinv;
+                    apy(i,j,0) = cut;
                     fcy(i,j,0) = 0.5_rt*apy(i,j,0) - 0.5_rt;
                 } else {
-                    apy(i,j,0) = 1.0_rt - (interx(i,j,0)-(problo[0]+i*dx[0]))*dxinv;
+                    apy(i,j,0) = 1.0_rt - cut;
                     fcy(i,j,0) = 0.5_rt - 0.5_rt*apy(i,j,0);
                 }
 
@@ -310,6 +314,9 @@ int build_faces (Box const& bx, Array4<EBCellFlag> const& cell,
                 if (fy(i  ,j+1,0) == Type::irregular) { ++ncuts; }
                 if (ncuts > 2) {
                     Gpu::Atomic::Add(dp,1);
+                    if (cover_multiple_cuts) {
+                        cell(i,j,0).setCovered();
+                    }
                 }
             }
         }

@@ -37,7 +37,7 @@ namespace amrex {
         bool extend_domain_face = EB2::ExtendDomainFace();
         for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
             if (!extend_domain_face || geom.isPeriodic(idim)) {
-                bounding_box.grow(mf.nGrowVect()[idim]);
+                bounding_box.grow(idim, mf.nGrowVect()[idim]);
             }
         }
 
@@ -54,6 +54,9 @@ namespace amrex {
      *
      * This function fills the nodal MultiFab with signed distance.  Note
      * that the distance is valid only if it's within a few cells to the EB.
+     * The sign follows the EB2 convention for the implicit function: a node
+     * where it is negative is in the fluid, and a node where it is zero or
+     * positive is in the body.
      *
      * \param mf is a nodal MultiFab.
      * \param ls_lev is an EB2::Level object with an implicit function. This

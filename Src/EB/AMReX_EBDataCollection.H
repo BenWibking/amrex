@@ -67,7 +67,7 @@ public:
 
     //! Access the EBCellFlag data (always available at least for EBSupport::basic).
     [[nodiscard]] const FabArray<EBCellFlagFab>& getMultiEBCellFlagFab () const;
-    //! Level set field of the EB (basic support and above).
+    //! Level set field of the EB (basic support and above; cell-centered only).
     [[nodiscard]] const MultiFab& getLevelSet () const;
     //! Volume fraction (EBSupport::volume/full).
     [[nodiscard]] const MultiFab& getVolFrac () const;
@@ -77,7 +77,7 @@ public:
     [[nodiscard]] const MultiCutFab& getBndryCent () const;
     //! Boundary area MultiCutFab.
     [[nodiscard]] const MultiCutFab& getBndryArea () const;
-    //! Boundary normal MultiCutFab.
+    //! Boundary normal MultiCutFab: unit vector in physical space pointing toward the covered part.
     [[nodiscard]] const MultiCutFab& getBndryNormal () const;
     //! Area fractions for faces in each coordinate direction.
     [[nodiscard]] Array<const MultiCutFab*, AMREX_SPACEDIM> getAreaFrac () const;

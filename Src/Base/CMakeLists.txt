@@ -86,8 +86,11 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        AMReX_SArena.cpp
        AMReX_DataAllocator.H
        AMReX_BLProfiler.H
+       AMReX_ThirdPartyProfiling.H
        AMReX_BLBackTrace.H
        AMReX_BLBackTrace.cpp
+       AMReX_CrtReport.H
+       AMReX_CrtReport.cpp
        AMReX_BLFort.H
        AMReX_NFiles.H
        AMReX_NFiles.cpp
@@ -233,7 +236,6 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        AMReX_GpuUtility.H
        AMReX_GpuUtility.cpp
        AMReX_GpuAsyncArray.H
-       AMReX_GpuAsyncArray.cpp
        AMReX_GpuElixir.H
        AMReX_GpuElixir.cpp
        AMReX_GpuMemory.H
@@ -262,6 +264,7 @@ foreach(D IN LISTS AMReX_SPACEDIM)
        Parser/AMReX_Parser.H
        Parser/AMReX_Parser_Exe.cpp
        Parser/AMReX_Parser_Exe.H
+       Parser/AMReX_Parser_Exe_Body.H
        Parser/AMReX_Parser_Y.cpp
        Parser/AMReX_Parser_Y.H
        Parser/amrex_parser.lex.cpp

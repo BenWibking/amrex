@@ -225,8 +225,35 @@ unpack_recv_buffer_cpu (FabArray<FAB>& mf, int dcomp, int ncomp, Vector<char*> c
 
     using T = typename FAB::value_type;
 #ifdef AMREX_USE_OMP
-#pragma omp parallel for
+    if (omp_get_max_threads() > 1) {
+        // Threads share tags, not neighbor ranks, which are often fewer than threads.
+        Vector<std::pair<const char*,FabArrayBase::CopyComTag const*>> tags;
+        for (int ircv = 0; ircv < N_rcvs; ++ircv) {
+            const char* dptr = recv_data[ircv];
+            for (auto const& tag : *recv_cctc[ircv]) {
+                tags.emplace_back(dptr, &tag);
+                dptr += tag.sbox.numPts() * ncomp * sizeof(T);
+                AMREX_ASSERT(dptr <= recv_data[ircv] + recv_size[ircv]);
+            }
+        }
+
+        const auto N_tags = static_cast<int>(tags.size());
+        // Small chunks keep threads on nearby boxes, which share cache lines.
+        int const chunk = std::clamp(N_tags/omp_get_max_threads(), 1, 64);
+#pragma omp parallel for schedule(static,chunk)
+        for (int itag = 0; itag < N_tags; ++itag) {
+            auto const& tag = *tags[itag].second;
+            auto const& dfab = mf.array(tag.dstIndex);
+            auto const& sfab = amrex::makeArray4((T const*)(tags[itag].first), tag.sbox, ncomp);
+            amrex::LoopConcurrentOnCpu(tag.dbox, ncomp, [=](int i, int j, int k, int n) noexcept {
+                auto const si = dtos(Dim3{.x = i, .y = j, .z = k});
+                dfab(i, j, k, dcomp + n) = proj(sfab, si, n);
+            });
+        }
+        return;
+    }
 #endif
+
     for (int ircv = 0; ircv < N_rcvs; ++ircv) {
         const char* dptr = recv_data[ircv];
         auto const& cctc = *recv_cctc[ircv];
@@ -315,7 +342,7 @@ unpack_recv_buffer_gpu (FabArray<FAB>& mf, int scomp, int ncomp,
 
     for (int k = 0; k < N_rcvs; ++k)
     {
-        std::size_t offset = recv_data[k]-recv_data[0];
+        std::ptrdiff_t offset = recv_data[k]-recv_data[0];
         const char* dptr = pbuffer + offset;
         auto const& cctc = *recv_cctc[k];
         for (auto const& tag : cctc)
@@ -460,6 +487,7 @@ Comm_nowait (FabArray<FAB>& mf, int scomp, int ncomp, FabArrayBase::CommMetaData
         handler.send.the_data =
             FabArray<FAB>::PrepareSendBuffers(*cmd.m_SndTags, handler.send.data, handler.send.size,
                                   handler.send.rank, handler.send.request, handler.send.cctc, ncomp);
+        handler.send.id = FabArrayBase::getNextCommMetaDataId();
 
 #ifdef AMREX_USE_GPU
         if (Gpu::inLaunchRegion()) {
@@ -565,7 +593,7 @@ Rotate90 (FabArray<FAB>& mf, int scomp, int ncomp, IntVect const& nghost, Box co
             auto const& fab = mf.array(mfi);
             AMREX_HOST_DEVICE_PARALLEL_FOR_4D(bx,ncomp,i,j,k,n,
             {
-                fab(i,j,k,n) = fab(-i-1,-j-1,k,n);
+                fab(i,j,k,scomp+n) = fab(-i-1,-j-1,k,scomp+n);
             });
         }
     }

@@ -17,6 +17,8 @@
 #include <omp.h>
 #endif
 
+#include <cmath>
+#include <concepts>
 #include <iosfwd>
 #include <map>
 #include <numbers>
@@ -286,6 +288,15 @@ public:
             // Cartesian
 
             vol = dx[0];
+        }
+        else if (coord == CoordSys::RZ) {
+            // Cylindrical
+
+            Real rl = geomdata.ProbLo()[0] + static_cast<Real>(point[0]) * dx[0];
+            Real rr = rl + dx[0];
+
+            constexpr Real pi = std::numbers::pi_v<Real>;
+            vol = pi * (rl + rr) * dx[0];
         }
         else {
             // Spherical
@@ -601,6 +612,20 @@ refine (Geometry const& crse, IntVect const& rr) {
 inline
 Geometry
 refine (Geometry const& crse, int rr) { return refine(crse, IntVect(rr)); }
+
+/**
+ * \ingroup amrex_real_space
+ * \brief Coordinate of node \p i: problo + i*dx.
+ *
+ * The explicit fma makes the result the same in every kernel, so a point
+ * placed at a node by one code path equals the node recomputed by another.
+ */
+template <std::floating_point T>
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+T node_coord (T problo, int i, T dx) noexcept
+{
+    return std::fma(T(i), dx, problo);
+}
 
 /**
  * \ingroup amrex_real_space

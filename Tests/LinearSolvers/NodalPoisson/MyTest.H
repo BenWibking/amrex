@@ -22,6 +22,10 @@ public:
 
     [[nodiscard]] int getNumTrials () const { return num_trials; }
     [[nodiscard]] int getDoPlots () const { return do_plots; }
+    [[nodiscard]] amrex::Vector<std::string> const& getMultigridTypes () const {
+        return multigrid_types;
+    }
+    void setMultigridType (std::string const& name);
 
 private:
 
@@ -42,7 +46,7 @@ private:
     int bottom_verbose = 0;
     int max_iter = 100;
     int max_fmg_iter = 0;
-    amrex::Real reltol = 1.e-11;
+    amrex::Real reltol = amrex::Real(1.e-11);
     int gpu_regtest = 0;
 
 
@@ -54,6 +58,27 @@ private:
     //int smooth_num_sweeps = 4;
 
     bool use_hypre = false;
+    bool use_mlhypre = false;  // composite solve with HypreMLNodeLap, compared with MLMG
+    int periodic = 0;          // periodic domain (singular problem); composite solve only
+    std::string mlhypre_prefix = "hypre_mlnodelap";
+    // if positive: abort if max |HypreMLNodeLap - MLMG| exceeds it relative to max |MLMG|
+    amrex::Real mlhypre_max_diff = -1.0;
+    // mlhypre: the solve must throw with a NaN rhs (1) or a NaN initial
+    // guess, i.e. NaN Dirichlet values (2)
+    int mlhypre_test_throw = 0;
+    // the fine levels touch the low-x (Dirichlet) domain face, so that
+    // hanging nodes interpolate from coarse Dirichlet nodes
+    int fine_at_boundary = 0;
+    // mlhypre: solve for u = 1 (unit Dirichlet values, zero rhs) and compare
+    // with it instead of MLMG
+    int const_solution = 0;
+    // mlhypre: NaN rhs at the Dirichlet domain nodes, which must not be used
+    int mlhypre_nan_dirichlet_rhs = 0;
+    amrex::Vector<std::string> multigrid_types{"geometric"};
+    amrex::MultigridType multigrid_type = amrex::MultigridType::geometric;
+    //! Testing aid, not for normal use: a non-negative value overrides the
+    //! hybrid stall rate; 0 forces the switch to AlgMG.
+    amrex::Real hybrid_stall_rate = -1.0;
     bool do_plots = true;
     int num_trials = 1;
     bool test_sigma_update = false;
