@@ -216,6 +216,11 @@ void OpenBCSolver::define (const Vector<Geometry>& a_geom,
             Box const& cbx = cba[ibox];
             Box needed = amrex::grow(cbx,m_coarsen_ratio) & m_geom_all[clev].Domain();
             if (needed.ok()) {
+                // Round outward to the m_coarsen_ratio lattice. Otherwise the
+                // alignment of the support faces halves with each level of
+                // recursion, eventually giving boxes that are not coarsenable
+                // by the refinement ratio.
+                needed = amrex::refine(amrex::coarsen(needed, m_coarsen_ratio), m_coarsen_ratio);
                 BoxList const exterior = amrex::boxDiff(needed, original_domain);
                 for (Box const& bx : exterior) {
                     support.join(m_ba_all[clev].complementIn(bx));

@@ -8,9 +8,12 @@ using namespace amrex;
 
 namespace {
 
-void solve_fully_refined_hierarchy (int nlevels)
+void solve_hierarchy (int nlevels, bool corner_refined)
 {
-    constexpr int n_cell = 8;
+    // fully refined: every level covers its whole domain.
+    // corner refined: every fine level is a single 32^3 grid touching the
+    // low corner of the domain, so support grids recurse through many levels.
+    int const n_cell = corner_refined ? 32 : 8;
 
     Vector<Geometry> geom(nlevels);
     Vector<BoxArray> grids(nlevels);
@@ -26,7 +29,11 @@ void solve_fully_refined_hierarchy (int nlevels)
         Box const domain(IntVect(0), IntVect(nc-1));
         geom[lev].define(domain, real_box, CoordSys::cartesian, periodic);
 
-        grids[lev].define(domain);
+        if (corner_refined && lev > 0) {
+            grids[lev].define(Box(IntVect(0), IntVect(31)));
+        } else {
+            grids[lev].define(domain);
+        }
         grids[lev].maxSize(16);
         dmap[lev].define(grids[lev]);
 
@@ -69,10 +76,12 @@ int main (int argc, char* argv[])
 {
     amrex::Initialize(argc, argv);
     {
-        solve_fully_refined_hierarchy(2);
-        solve_fully_refined_hierarchy(3);
-        solve_fully_refined_hierarchy(4);
-        solve_fully_refined_hierarchy(5);
+        for (int nlevels = 2; nlevels <= 5; ++nlevels) {
+            solve_hierarchy(nlevels, false);
+        }
+        for (int nlevels = 2; nlevels <= 7; ++nlevels) {
+            solve_hierarchy(nlevels, true);
+        }
     }
     amrex::Finalize();
 }
